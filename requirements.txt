@@ -1,0 +1,14 @@
+# Provider Health Daemon
+# HTTP proxy with health-aware routing + prompt limiting
+# Requires: Python 3.10+
+
+# Core
+daemon.py>=1.0
+health_registry.py>=1.0
+error_parser.py>=1.0
+cooldown.py>=1.0
+proxy_handler.py>=1.0
+config.py>=1.0
+
+# Utilities
+run.sh>=1.0
