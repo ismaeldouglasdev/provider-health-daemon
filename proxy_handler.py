@@ -60,17 +60,20 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
     registry: HealthRegistry = None  # set by server
 
     def _forward(self, body=None):
-        """Forward to 9router, intercepting health info on errors."""
         path = self.path
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {NINEROUTER_KEY}",
-        }
+        headers = {"Content-Type": "application/json"}
+
+        # Pass through original Authorization if present, else use configured key
+        auth = self.headers.get("Authorization", "")
+        if auth:
+            headers["Authorization"] = auth
+        elif NINEROUTER_KEY:
+            headers["Authorization"] = f"Bearer {NINEROUTER_KEY}"
+
         data = json.dumps(body).encode() if body else None
         url = f"{NINEROUTER_URL}{path}"
 
         req = urllib.request.Request(url, data=data, headers=headers, method=self.command)
-        # Enable streaming for /chat/completions
         req.add_header("Accept", "text/event-stream, application/json")
 
         try:

@@ -10,12 +10,29 @@ ensure_dirs() {
 
 start() {
     ensure_dirs
-    echo "🛡️  Starting Provider Health Daemon on port ${HEALTH_PROXY_PORT:-20131}..."
-    python3 "$SCRIPT_DIR/daemon.py" &
+    if [ -f /tmp/health-daemon.pid ]; then
+        PID=$(cat /tmp/health-daemon.pid)
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "❌ Already running (PID $PID)"
+            exit 1
+        fi
+    fi
+    echo "🛡  Starting Provider Health Daemon on port ${HEALTH_PROXY_PORT:-20131}..."
+    cd "$SCRIPT_DIR"
+    nohup python3 daemon.py > /tmp/health-daemon.log 2>&1 &
     PID=$!
     echo "$PID" > /tmp/health-daemon.pid
-    echo "   PID: $PID"
-    echo "   To activate in OpenCode, update baseURL → http://127.0.0.1:${HEALTH_PROXY_PORT:-20131}/v1"
+    sleep 2
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "   PID: $PID"
+        echo "   Logs: /tmp/health-daemon.log"
+        echo "   Admin: http://127.0.0.1:${HEALTH_PROXY_PORT:-20131}/health"
+        echo "   To activate in OpenCode, update baseURL → http://127.0.0.1:${HEALTH_PROXY_PORT:-20131}/v1"
+    else
+        echo "❌ Failed to start. Check /tmp/health-daemon.log"
+        rm -f /tmp/health-daemon.pid
+        exit 1
+    fi
 }
 
 stop() {
