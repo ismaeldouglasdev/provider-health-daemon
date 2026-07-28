@@ -1,0 +1,2 @@
+OK: 3 routers, catalog=500, interval=30s, timeout=2.0s
+OK: all existing imports preserved

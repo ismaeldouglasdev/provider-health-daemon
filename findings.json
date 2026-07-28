@@ -1,0 +1,284 @@
+{
+  "findings": [
+    {
+      "type": "bug",
+      "severity": "critical",
+      "file": "health_registry.py",
+      "lines": "15-232",
+      "description": "No thread synchronization on shared registry state. Multiple threads (proxy handler threads from ThreadingHTTPServer, prober thread, log monitor thread, audit thread) concurrently read/write _data dict and call _save() without any locking.",
+      "impact": "Race conditions corrupting health.json, lost updates, inconsistent state, potential JSON corruption on concurrent writes.",
+      "suggestion": "Add threading.RLock() to protect all read/write operations. Wrap _load, _save, get_provider, get_model, mark_healthy, mark_error, cleanup_expired, status_summary with lock. Consider using a single writer thread with queue for persistence.",
+      "code_ref": "class HealthRegistry:\n    def __init__(self, filepath=None):\n        self._lock = threading.RLock()\n        ...\n    def mark_error(self, ...):\n        with self._lock:\n            ...\n            self._save()"
+    },
+    {
+      "type": "bug",
+      "severity": "critical",
+      "file": "health_registry.py",
+      "lines": "42-45",
+      "description": "_save() writes JSON file without atomic operation or file locking. Concurrent calls from multiple threads can interleave writes, corrupting the file.",
+      "impact": "Corrupted health.json requiring manual recovery, lost cooldown state on restart.",
+      "suggestion": "Use atomic write pattern: write to temp file + os.rename(). Add file locking (fcntl/flock) for cross-process safety if multiple daemon instances could run.",
+      "code_ref": "def _save(self) -> None:\n    self.filepath.parent.mkdir(parents=True, exist_ok=True)\n    text = json.dumps(self._data, indent=2, default=str)\n    tmp = self.filepath.with_suffix('.tmp')\n    tmp.write_text(text)\n    tmp.replace(self.filepath)"
+    },
+    {
+      "type": "bug",
+      "severity": "high",
+      "file": "proxy_handler.py",
+      "lines": "90-95",
+      "description": "On successful response, marks entire provider healthy without checking model-specific cooldowns. A successful request to one model resets cooldowns for all models under that provider.",
+      "impact": "Model-specific cooldowns (e.g., function_not_found, context_length) incorrectly cleared, allowing failing models to be retried immediately.",
+      "suggestion": "Only mark the specific model healthy if model_id present. For provider-wide health, check if any model is still in cooldown before promoting provider.",
+      "code_ref": "if self.registry and body and resp.status == 200:\n    model = body.get(\"model\", \"\")\n    if model:\n        provider = model.split(\"/\")[0]\n        self.registry.mark_healthy(provider)  # BUG: ignores model-specific state"
+    },
+    {
+      "type": "bug",
+      "severity": "high",
+      "file": "cooldown.py",
+      "lines": "62-68",
+      "description": "Exponential backoff calculation `2 ** capped_failures` with capped_failures up to 30 creates massive intermediate values (2^30 = 1,073,741,824). Though capped by max_cooldown, the multiplication `base_duration.total_seconds() * multiplier` can overflow or create huge timedelta before min().",
+      "impact": "Potential OverflowError or memory issues on extreme failure counts. Timedelta construction with huge seconds may fail.",
+      "suggestion": "Cap multiplier before multiplication: `multiplier = min(2 ** capped_failures, self.max_cooldown.total_seconds() / max(base_duration.total_seconds(), 1))`. Or use loop with early exit.",
+      "code_ref": "if failures > 1:\n    capped_failures = min(failures - 1, 30)\n    multiplier = 2 ** capped_failures\n    backoff_duration = timedelta(seconds=min(\n        base_duration.total_seconds() * multiplier,\n        self.max_cooldown.total_seconds(),\n    ))"
+    },
+    {
+      "type": "bug",
+      "severity": "high",
+      "file": "proxy_handler.py",
+      "lines": "79-95",
+      "description": "_forward() reads entire response body into memory with `resp.read()` and doesn't handle streaming/SSE responses. 9router returns SSE for chat completions.",
+      "impact": "Breaks streaming responses (chat completions with stream=true). Clients receive complete response at once instead of streaming chunks.",
+      "suggestion": "Detect streaming responses (Content-Type: text/event-stream or stream=true in request) and proxy chunk-by-chunk without buffering. Use iter(resp.read, b'') or similar streaming approach.",
+      "code_ref": "with urllib.request.urlopen(req, timeout=120) as resp:\n    resp_body = resp.read()  # BUFFERS ENTIRE STREAM\n    self.send_response(resp.status)\n    ...\n    self.wfile.write(resp_body)"
+    },
+    {
+      "type": "bug",
+      "severity": "medium",
+      "file": "daemon.py",
+      "lines": "134-214",
+      "description": "Log monitor imports parse_access_log_line but never uses it. Access log monitoring for combo success/failure events is completely missing.",
+      "impact": "Misses valuable health signals from 9router's combo routing (success/failed model selections). No auto-recovery on successful probes via access log.",
+      "suggestion": "Add second tailer for access.log in monitor_logs(). Parse COMBO lines and call registry.mark_healthy on success, or implement smarter probing based on actual traffic.",
+      "code_ref": "from error_parser import parse_log_line, parse_access_log_line\n# parse_access_log_line never used"
+    },
+    {
+      "type": "bug",
+      "severity": "medium",
+      "file": "proxy_handler.py",
+      "lines": "115-122",
+      "description": "Error handling fallback uses fake log line format `❌ unknown [status]: [status]: {body}` to parse provider from error body. This is fragile and may not match patterns.",
+      "impact": "Provider detection fails for errors without provider in JSON body, leading to 'unknown' provider and incorrect cooldown application.",
+      "suggestion": "Improve provider extraction from error response headers or body structure. Add explicit provider detection for common error formats.",
+      "code_ref": "parsed = parse_log_line(f\"❌ unknown [{status}]: [{status}]: {body_text}\")\nif parsed and parsed.get(\"provider_hint\"):\n    provider = parsed[\"provider_hint\"]"
+    },
+    {
+      "type": "bug",
+      "severity": "medium",
+      "file": "daemon.py",
+      "lines": "219-249",
+      "description": "Main thread runs server.serve_forever() blocking. No signal handlers for graceful shutdown (SIGTERM/SIGINT). Daemon threads are daemon=True so they die abruptly without saving state.",
+      "impact": "On container stop or systemd restart, health state not persisted. Cooldown state lost, providers may be incorrectly marked healthy on restart.",
+      "suggestion": "Add signal handlers to set shutdown flag, call registry._save(), stop server gracefully. Make threads non-daemon and join on shutdown.",
+      "code_ref": "def main():\n    ...\n    server = HealthProxyServer(port=HEALTH_PROXY_PORT)\n    server.registry = registry\n    server.run()  # BLOCKS FOREVER, NO SHUTDOWN HANDLING"
+    },
+    {
+      "type": "bug",
+      "severity": "medium",
+      "file": "health_registry.py",
+      "lines": "186-191",
+      "description": "force_healthy() removes provider AND model entries, then calls mark_healthy() which recreates them. But if model arg provided, it only removes that model, not provider.",
+      "impact": "Inconsistent admin behavior: force_healthy('groq') resets provider and all models. force_healthy('groq', 'groq/model') resets only model but provider stays in cooldown.",
+      "suggestion": "Clarify semantics: force_healthy(provider) should reset provider + all its models. force_healthy(provider, model) should reset only that model. Current code does provider pop then mark_healthy which re-adds provider.",
+      "code_ref": "def force_healthy(self, provider: str, model: Optional[str] = None) -> None:\n    if model:\n        self._data[self.MODELS].pop(model, None)\n    self._data[self.PROVIDERS].pop(provider, None)\n    self.mark_healthy(provider, model)"
+    },
+    {
+      "type": "bug",
+      "severity": "low",
+      "file": "proxy_handler.py",
+      "lines": "337-352",
+      "description": "HealthProxyServer.__init__ creates its own HealthRegistry instance, but daemon.py creates another and assigns to server.registry. Two registry instances exist with different state.",
+      "impact": "If HealthProxyServer used directly (not via daemon.py), it uses separate registry file. In daemon.py, the assignment works but is confusing and error-prone.",
+      "suggestion": "Remove registry creation from HealthProxyServer.__init__. Require registry passed in or created by caller.",
+      "code_ref": "class HealthProxyServer:\n    def __init__(self, port: int = HEALTH_PROXY_PORT):\n        self.port = port\n        self.registry = HealthRegistry()  # UNUSED IN DAEMON.PY"
+    },
+    {
+      "type": "improvement",
+      "severity": "high",
+      "file": "proxy_handler.py",
+      "lines": "228-280",
+      "description": "Admin endpoints limited to /health, /health/reset/, /health/summary. Missing: per-provider details, per-model details, metrics endpoint, Prometheus format, health check for 9router connectivity.",
+      "impact": "Poor observability. Hard to debug which models are in cooldown, why, and for how long. No integration with monitoring systems.",
+      "suggestion": "Add endpoints: GET /health/providers, GET /health/models, GET /health/providers/{name}, GET /health/models/{id}, GET /metrics (Prometheus), GET /ready (9router connectivity check).",
+      "code_ref": "def do_GET(self):\n    if self.path == \"/health\" or self.path == \"/v1/health\":\n        ...\n    if self.path.startswith(\"/health/reset/\"):\n        ...\n    if self.path == \"/health/summary\":\n        ..."
+    },
+    {
+      "type": "improvement",
+      "severity": "high",
+      "file": "daemon.py",
+      "lines": "56-70",
+      "description": "Logging setup only supports stdout JSON or human-readable. No file output, no log rotation, no structured log levels per module.",
+      "impact": "Logs lost on restart. No persistent audit trail. Hard to correlate events across restarts.",
+      "suggestion": "Add RotatingFileHandler for persistent logs. Support log file via env var. Add correlation IDs for request tracing.",
+      "code_ref": "def setup_logging(json_logs: bool = True, level: int = logging.INFO) -> None:\n    handler = logging.StreamHandler()\n    ..."
+    },
+    {
+      "type": "improvement",
+      "severity": "medium",
+      "file": "health_registry.py",
+      "lines": "94-163",
+      "description": "Every mark_healthy and mark_error calls _save() immediately. Under high load (many requests/errors), this causes excessive disk I/O and contention.",
+      "impact": "Performance degradation under load. Disk wear. Potential write contention with readers.",
+      "suggestion": "Debounce saves: batch writes with a timer (e.g., save every 5s or after N changes). Use dirty flag + background save thread.",
+      "code_ref": "def mark_error(self, ...):\n    ...\n    self._save()  # CALLED ON EVERY ERROR\n\ndef mark_healthy(self, ...):\n    ...\n    self._save()  # CALLED ON EVERY SUCCESS"
+    },
+    {
+      "type": "improvement",
+      "severity": "medium",
+      "file": "config.py",
+      "lines": "1-23",
+      "description": "No configuration validation. Missing checks for: port range, directory writability, prompt_limiter directory existence, 9router URL reachability.",
+      "impact": "Daemon starts with invalid config, fails later with cryptic errors. Hard to debug misconfiguration.",
+      "suggestion": "Add validate_config() function called at startup. Check port availability, directory permissions, prompt_limiter import, 9router connectivity.",
+      "code_ref": "HEALTH_PROXY_PORT = int(os.environ.get(\"HEALTH_PROXY_PORT\", \"20131\"))\nNINEROUTER_URL = os.environ.get(\"NINEROUTER_URL\", \"http://localhost:20128\")\n# NO VALIDATION"
+    },
+    {
+      "type": "improvement",
+      "severity": "medium",
+      "file": "proxy_handler.py",
+      "lines": "131-202",
+      "description": "Prompt limiting truncates from end (keeps most recent messages). System/developer messages only kept if they fit in 20% budget. No semantic preservation (e.g., keep tool calls, function results).",
+      "impact": "Important context (tool outputs, function results) may be dropped while keeping less relevant user messages. Reduces quality of truncated requests.",
+      "suggestion": "Implement priority-based truncation: 1) system/developer messages, 2) tool/function results, 3) recent user/assistant turns. Use prompt_limiter's truncate_prompt if available.",
+      "code_ref": "for msg in reversed(messages):\n    ...\n    if kept_tokens + msg_tokens > effective_limit:\n        if msg.get(\"role\") in (\"system\", \"developer\") and kept_tokens < effective_limit * 0.2:\n            kept.insert(0, msg)\n        break"
+    },
+    {
+      "type": "improvement",
+      "severity": "medium",
+      "file": "error_parser.py",
+      "lines": "14-80",
+      "description": "ERROR_PATTERNS list is hardcoded. No way to extend/customize without modifying source. Patterns ordered but no priority system.",
+      "impact": "Cannot add provider-specific error patterns. Hard to maintain. New error types require code change.",
+      "suggestion": "Make patterns loadable from config file (JSON/YAML). Support priority field. Allow runtime pattern registration via admin API.",
+      "code_ref": "ERROR_PATTERNS = [\n    (r\"Rate limit reached.*try again in (\\d+)h(\\d+)m\", ...),\n    ...\n]"
+    },
+    {
+      "type": "improvement",
+      "severity": "low",
+      "file": "run.sh",
+      "lines": "1-80",
+      "description": "Uses /tmp for PID and log files. Not persistent across reboots. No systemd service file. No log rotation. Single instance only (PID file conflict).",
+      "impact": "Not production-ready. Logs lost on reboot. Cannot run multiple instances on different ports. No standard service management.",
+      "suggestion": "Add systemd service template. Use $XDG_RUNTIME_DIR or /var/run for PID. Add logrotate config. Support multiple instances via config.",
+      "code_ref": "PID file: /tmp/health-daemon.pid\nLog file: /tmp/health-daemon.log"
+    },
+    {
+      "type": "ux",
+      "severity": "high",
+      "file": "daemon.py",
+      "lines": "219-249",
+      "description": "No startup health check for 9router connectivity. Daemon starts proxy even if 9router unreachable.",
+      "impact": "Users get 503/connection errors with no indication that 9router is down. Hard to distinguish daemon issues from 9router issues.",
+      "suggestion": "Add pre-flight check in main(): try connecting to 9router /health or /models endpoint. Log warning and optionally exit if unreachable. Add /ready endpoint for k8s/liveness probes.",
+      "code_ref": "def main():\n    ...\n    log.info(\"Provider Health Daemon starting\")\n    # NO CONNECTIVITY CHECK\n    registry = HealthRegistry()\n    ...\n    server.run()"
+    },
+    {
+      "type": "ux",
+      "severity": "medium",
+      "file": "proxy_handler.py",
+      "lines": "318-324",
+      "description": "503 response includes minimal error info. No retry-after header. No provider/model alternatives listed. No link to admin UI.",
+      "impact": "Clients (OpenCode) only see generic 'provider_unavailable'. No guidance on when to retry or which alternatives exist.",
+      "suggestion": "Add Retry-After header with seconds until cooldown expires. Include available alternative models in response. Link to /health/summary for details.",
+      "code_ref": "def _respond_unavailable(self, message: str):\n    self.send_response(503)\n    self.send_header(\"Content-Type\", \"application/json\")\n    self.end_headers()\n    payload = json.dumps({\"error\": {\"message\": message, \"type\": \"provider_unavailable\"}})"
+    },
+    {
+      "type": "ux",
+      "severity": "medium",
+      "file": "health_registry.py",
+      "lines": "220-231",
+      "description": "status_summary() only returns counts per status. No details on which providers/models, their cooldown expiry, or failure counts.",
+      "impact": "Admin must call /health (full dump) to see details. /health/summary is too minimal for debugging.",
+      "suggestion": "Enhance summary with: top 5 longest cooldowns, providers with most failures, expired-but-not-probing count, model-specific vs provider-wide breakdown.",
+      "code_ref": "def status_summary(self) -> dict:\n    statuses = {\"healthy\": 0, \"cooldown\": 0, \"probing\": 0, \"disabled\": 0}\n    ...\n    return {\"by_status\": statuses, \"expired_ready\": expired}"
+    },
+    {
+      "type": "feature",
+      "severity": "high",
+      "file": "health_registry.py",
+      "lines": "15-232",
+      "description": "No circuit breaker pattern. After N consecutive failures, provider stays in cooldown with exponential backoff but no fast-fail for obviously dead providers.",
+      "impact": "Wasted requests to permanently broken providers. Slow recovery for transient issues.",
+      "suggestion": "Add circuit breaker states: CLOSED (normal), OPEN (fast fail), HALF_OPEN (probe). Configurable failure threshold, timeout, success threshold. Integrate with cooldown logic.",
+      "code_ref": "# NEW: circuit breaker fields in registry entries\n\"circuit\": \"closed|open|half_open\",\n\"failure_count\": 0,\n\"last_failure\": \"...\",\n\"success_count\": 0"
+    },
+    {
+      "type": "feature",
+      "severity": "medium",
+      "file": "proxy_handler.py",
+      "lines": "204-225",
+      "description": "_find_healthy_alternative() returns None, deferring to 9router's combo fallback. No intelligent routing based on health, latency, or cost.",
+      "impact": "Missed opportunity for smart routing. 9router combo may not know about health daemon's state.",
+      "suggestion": "Implement health-aware model selection: return list of healthy alternatives sorted by priority (latency, cost, capability). Expose via /health/alternatives/{model}.",
+      "code_ref": "def _find_healthy_alternative(self, body: dict) -> str | None:\n    ...\n    return None  # LET 9ROUTER HANDLE IT"
+    },
+    {
+      "type": "feature",
+      "severity": "medium",
+      "file": "daemon.py",
+      "lines": "1-249",
+      "description": "No historical metrics persistence. AuditMetrics only in memory, lost on restart. No time-series data for uptime, error rates, cooldown frequency.",
+      "impact": "Cannot analyze trends. No capacity planning. No SLA reporting.",
+      "suggestion": "Add metrics persistence (SQLite or append-only JSONL). Export Prometheus metrics. Add /metrics endpoint. Track: requests_total, errors_total, cooldown_duration_seconds, provider_uptime_ratio.",
+      "code_ref": "METRICS = AuditMetrics()  # IN-MEMORY ONLY"
+    },
+    {
+      "type": "feature",
+      "severity": "low",
+      "file": "config.py",
+      "lines": "1-23",
+      "description": "No support for config file. All config via environment variables only.",
+      "impact": "Hard to manage in containers/k8s. No version-controlled config. Environment variable sprawl.",
+      "suggestion": "Add config file support (YAML/TOML/JSON) at ~/.config/provider-health-daemon/config.yaml. Merge with env vars (env wins). Document all options.",
+      "code_ref": "# ALL CONFIG VIA ENV VARS ONLY"
+    },
+    {
+      "type": "feature",
+      "severity": "low",
+      "file": "run.sh",
+      "lines": "1-80",
+      "description": "No CLI for admin operations. Only HTTP endpoints. No `health-daemon status`, `health-daemon reset groq`, `health-daemon list-cooldowns`.",
+      "impact": "Operators must use curl. No tab completion. Hard to script.",
+      "suggestion": "Add CLI subcommands to daemon.py or separate cli.py: status, reset, list, summary, metrics. Use argparse. Make run.sh delegate to python CLI.",
+      "code_ref": "case \"${1:-start}\" in\n    start) start ;;\n    stop) stop ;;\n    restart) stop; sleep 1; start ;;\n    status) status ;;\n    *) echo \"Usage: $0 {start|stop|restart|status}\""
+    },
+    {
+      "type": "bug",
+      "severity": "low",
+      "file": "proxy_handler.py",
+      "lines": "380-382",
+      "description": "server.serve_forever() catches only KeyboardInterrupt. Other exceptions (socket errors, OOM) crash daemon without cleanup.",
+      "impact": "Unclean shutdown on unexpected errors. Health state not saved.",
+      "suggestion": "Wrap serve_forever in broader try/except. Log exception. Ensure registry._save() called in finally block.",
+      "code_ref": "try:\n    server.serve_forever()\nexcept KeyboardInterrupt:\n    server.shutdown()\n    log.info(\"Health Proxy encerrado.\")"
+    },
+    {
+      "type": "improvement",
+      "severity": "low",
+      "file": "error_parser.py",
+      "lines": "161-184",
+      "description": "parse_log_line expects exact format '❌ provider [status]: [status]: body'. Fragile to 9router log format changes. No version detection.",
+      "impact": "Log monitoring silently fails if 9router changes log format. No alert on parse failures.",
+      "suggestion": "Add format version detection. Log parse failures with sample line. Make patterns configurable. Add test corpus of known log formats.",
+      "code_ref": "def parse_log_line(line: str) -> Optional[dict]:\n    stripped = line.strip()\n    if not stripped.startswith(\"❌\"):\n        return None\n    parts = stripped.split(\"[\", 2)"
+    },
+    {
+      "type": "feature",
+      "severity": "low",
+      "file": "health_registry.py",
+      "lines": "1-232",
+      "description": "No TTL/cleanup for stale entries. Providers/models never accessed stay in registry forever. No max entries limit.",
+      "impact": "Registry grows unbounded over time. Memory/disk usage increases. Stale entries clutter admin output.",
+      "suggestion": "Add TTL config (e.g., 30 days). Periodic cleanup in cleanup_expired() or separate janitor thread. Add max_entries limit with LRU eviction.",
+      "code_ref": "def cleanup_expired(self) -> int:\n    # ONLY PROMOTES COOLDOWN -> PROBING\n    # NO CLEANUP OF STALE HEALTHY ENTRIES"
+    }
+  ]
+}

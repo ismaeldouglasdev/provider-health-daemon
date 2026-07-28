@@ -35,7 +35,7 @@ class CooldownCalculator:
             }
         """
         # Support both flat and nested error_info formats
-        cd = error_info.get("cooldown", error_info)
+        cd = error_info.get("cooldown") or error_info
         base_hours = float(cd.get("hours", 0))
         base_minutes = float(cd.get("minutes", 0))
         error_type = str(cd.get("type", "unknown"))
@@ -57,30 +57,34 @@ class CooldownCalculator:
                 "recheck": False,
             }
 
-        # Base duration
         base_duration = timedelta(hours=base_hours, minutes=base_minutes)
 
-        # Exponential backoff: double each failure, up to max
         if failures > 1:
-            multiplier = 2 ** (failures - 1)
-            backoff_duration = base_duration * multiplier
-            if backoff_duration > self.max_cooldown:
-                backoff_duration = self.max_cooldown
+            capped_failures = min(failures - 1, 30)
+            multiplier = 2 ** capped_failures
+            backoff_duration = timedelta(seconds=min(
+                base_duration.total_seconds() * multiplier,
+                self.max_cooldown.total_seconds(),
+            ))
             backoff_applied = backoff_duration > base_duration
         else:
             backoff_duration = base_duration
             backoff_applied = False
 
-        # Ensure minimum 30s cooldown for anything non-zero
-        if backoff_duration.total_seconds() > 0 and backoff_duration.total_seconds() < 30:
+        if timedelta(seconds=0) < backoff_duration < timedelta(seconds=30):
             backoff_duration = timedelta(seconds=30)
 
         until = datetime.now(timezone.utc) + backoff_duration
 
         # If we already have a cooldown and this is a recheck scenario:
         # use the longer of the two
-        if current_cooldown_until and current_cooldown_until > until:
-            until = current_cooldown_until
+        if current_cooldown_until:
+            try:
+                existing = datetime.fromisoformat(current_cooldown_until)
+                if existing > until:
+                    until = existing
+            except (ValueError, TypeError):
+                pass  # malformed, ignore
 
         return {
             "until": until.isoformat(),
@@ -99,9 +103,13 @@ class CooldownCalculator:
             return False  # permanent = never expires
         try:
             until = datetime.fromisoformat(until_iso)
-        except ValueError:
+        except (ValueError, TypeError):
             return True  # malformed, assume expired
-        return datetime.now(timezone.utc) >= until
+        now = datetime.now(timezone.utc)
+        # Guard against extreme dates that cause timedelta overflow
+        if until.year < 1970 or until.year > 2100:
+            return True
+        return now >= until
 
     def time_remaining(self, until_iso: Optional[str]) -> timedelta:
         """Return time remaining until cooldown expires."""
@@ -109,7 +117,14 @@ class CooldownCalculator:
             return timedelta.max
         try:
             until = datetime.fromisoformat(until_iso)
-        except ValueError:
+        except (ValueError, TypeError):
             return timedelta(0)
-        remaining = until - datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        # Guard against extreme dates
+        if until.year < 1970 or until.year > 2100:
+            return timedelta(0)
+        remaining = until - now
+        # Clamp to reasonable bounds
+        if remaining.total_seconds() > 24 * 3600 * 365:  # > 1 year
+            return timedelta(0)
         return remaining if remaining.total_seconds() > 0 else timedelta(0)

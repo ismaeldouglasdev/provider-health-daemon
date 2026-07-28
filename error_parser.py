@@ -68,6 +68,15 @@ ERROR_PATTERNS = [
         r"Internal Server Error",
         lambda m: {"hours": 0, "minutes": 2, "type": "generic_500"},
     ),
+    # Worker local request limit
+    (
+        r"ResourceExhausted.*request limit reached",
+        lambda m: {"hours": 1, "minutes": 0, "type": "worker_request_limit", "recheck": True},
+    ),
+    (
+        r"Worker local total request limit",
+        lambda m: {"hours": 1, "minutes": 0, "type": "worker_request_limit", "recheck": True},
+    ),
 ]
 
 

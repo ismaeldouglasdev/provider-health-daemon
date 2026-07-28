@@ -1,0 +1,1380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Provider Health Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-alt: #0a0e14;
+    --card: #161b22;
+    --card-hover: #1c2333;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+    --radius: 8px;
+    --radius-sm: 6px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px;
+    min-height: 100dvh;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* ── Utilities ─────────────────────────────────── */
+  .flex { display: flex; }
+  .flex-center { align-items: center; }
+  .flex-between { justify-content: space-between; }
+  .gap-8 { gap: 8px; }
+  .gap-12 { gap: 12px; }
+  .gap-16 { gap: 16px; }
+  .mb-8 { margin-bottom: 8px; }
+  .mb-12 { margin-bottom: 12px; }
+  .mb-16 { margin-bottom: 16px; }
+  .mt-8 { margin-top: 8px; }
+  .text-muted { color: var(--text-muted); }
+  .text-sm { font-size: 13px; }
+  .text-xs { font-size: 12px; }
+  .fw-600 { font-weight: 600; }
+
+  /* ── Header ────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .header h1 {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+  }
+  .header .subtitle {
+    color: var(--text-muted);
+    font-size: 14px;
+    font-weight: 400;
+  }
+  .status-bar {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+  }
+
+  /* ── Status dots ───────────────────────────────── */
+  .status-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot-green { background: var(--green); box-shadow: 0 0 6px rgba(63,185,80,0.3); }
+  .dot-yellow { background: var(--yellow); box-shadow: 0 0 6px rgba(210,153,34,0.3); }
+  .dot-red { background: var(--red); box-shadow: 0 0 6px rgba(248,81,73,0.3); }
+  .dot-blue { background: var(--blue); box-shadow: 0 0 6px rgba(88,166,255,0.3); }
+  .uptime { color: var(--text-muted); font-size: 13px; white-space: nowrap; }
+
+  /* ── Summary cards ─────────────────────────────── */
+  .summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 10px;
+    margin-bottom: 24px;
+  }
+  .summary-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 12px;
+    text-align: center;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .summary-card:hover {
+    border-color: rgba(255,255,255,0.1);
+    background: var(--card-hover);
+  }
+  .summary-value {
+    font-size: 26px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.5px;
+  }
+  .summary-value.green { color: var(--green); }
+  .summary-value.yellow { color: var(--yellow); }
+  .summary-value.red { color: var(--red); }
+  .summary-value.blue { color: var(--blue); }
+  .summary-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    font-weight: 500;
+  }
+
+  /* ── Tabs ──────────────────────────────────────── */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0;
+  }
+  .tab {
+    padding: 10px 18px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color 0.2s, border-color 0.2s;
+    position: relative;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--text);
+    border-bottom-color: var(--blue);
+  }
+  .tab-content { display: none; animation: fadeIn 0.2s ease; }
+  .tab-content.active { display: block; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── Provider grid ─────────────────────────────── */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    transition: border-color 0.2s, background 0.15s, box-shadow 0.2s;
+  }
+  .card:hover {
+    border-color: rgba(255,255,255,0.08);
+    background: var(--card-hover);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  }
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .card-title {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.2px;
+  }
+  .card-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 10px;
+    border-radius: 100px;
+  }
+  .card-body { font-size: 13px; }
+
+  .metric-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 0;
+    border-bottom: 1px solid rgba(48,54,61,0.5);
+  }
+  .metric-row:last-child { border: none; }
+  .metric-label { color: var(--text-muted); font-size: 12px; }
+  .metric-value { font-weight: 500; font-variant-numeric: tabular-nums; }
+  .metric-value.green { color: var(--green); }
+  .metric-value.yellow { color: var(--yellow); }
+  .metric-value.red { color: var(--red); }
+  .metric-value.blue { color: var(--blue); }
+
+  .card-highlight {
+    animation: highlight-pulse 2s ease;
+  }
+  @keyframes highlight-pulse {
+    0% { border-color: var(--yellow); box-shadow: 0 0 8px rgba(210,153,34,0.2); }
+    50% { border-color: var(--green); box-shadow: 0 0 12px rgba(63,185,80,0.15); }
+    100% { border-color: var(--border); box-shadow: none; }
+  }
+
+  .ready-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .ready-chip {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    padding: 4px 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    transition: border-color 0.2s;
+  }
+  .ready-chip:hover {
+    border-color: rgba(255,255,255,0.1);
+  }
+  .ready-score {
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  /* ── Reliability bar ───────────────────────────── */
+  .reliability-bar {
+    height: 4px;
+    border-radius: 2px;
+    overflow: hidden;
+    background: var(--border);
+  }
+  .reliability-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.6s ease, background 0.3s;
+  }
+
+  /* ── Logs ──────────────────────────────────────── */
+  .logs {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    max-height: 360px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    padding: 12px;
+    resize: vertical;
+  }
+  .logs:empty::after {
+    content: 'Waiting for events...';
+    color: var(--text-muted);
+  }
+  .log-line { padding: 2px 0; white-space: pre-wrap; word-break: break-all; }
+  .log-line.error { color: var(--red); }
+  .log-line.warn { color: var(--yellow); }
+  .log-line.success { color: var(--green); }
+  .log-line.info { color: var(--text-muted); }
+  .log-line.combo { color: var(--blue); }
+
+  /* ── Search / Filter ─────────────────────────── */
+  .search-input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 100px;
+    padding: 6px 14px 6px 32px;
+    font-size: 13px;
+    font-family: inherit;
+    width: 240px;
+    transition: border-color 0.2s, width 0.2s;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: 10px center;
+  }
+  .search-input:focus {
+    outline: none;
+    border-color: var(--blue);
+    width: 280px;
+  }
+  .search-input::placeholder { color: var(--text-muted); }
+
+  /* ── Tab badge ────────────────────────────────── */
+  .tab-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 6px;
+    border-radius: 100px;
+    background: var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    margin-left: 6px;
+    line-height: 1;
+  }
+  .tab.active .tab-badge {
+    background: rgba(88,166,255,0.15);
+    color: var(--blue);
+  }
+
+  /* ── Value flash animation ────────────────────── */
+  @keyframes value-flash {
+    0% { opacity: 0.4; transform: scale(0.95); }
+    50% { opacity: 1; transform: scale(1.05); }
+    100% { opacity: 1; transform: scale(1); }
+  }
+  .value-flash {
+    animation: value-flash 0.3s ease;
+  }
+
+  /* ── Tables ────────────────────────────────────── */
+  .table-wrap {
+    overflow-x: auto;
+    margin-bottom: 24px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  thead { background: var(--card); }
+  th {
+    text-align: left;
+    padding: 10px 14px;
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  td {
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(48,54,61,0.4);
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 10px;
+    border-radius: 100px;
+    white-space: nowrap;
+  }
+  .badge-ok { background: rgba(63,185,80,0.12); color: var(--green); }
+  .badge-fail { background: rgba(248,81,73,0.12); color: var(--red); }
+
+  /* ── Charts ────────────────────────────────────── */
+  .chart-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .chart-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .chart-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--text-muted);
+    letter-spacing: 0.3px;
+  }
+  .chart-select {
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 6px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .chart-select:focus {
+    outline: none;
+    border-color: var(--blue);
+  }
+
+  /* ── Buttons ───────────────────────────────────── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 7px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary { background: var(--blue); color: #fff; }
+  .btn-primary:hover { background: #4c96e8; }
+  .btn-green { background: var(--green); color: #fff; }
+  .btn-green:hover { background: #36a84a; }
+  .btn-yellow { background: var(--yellow); color: #000; }
+  .btn-yellow:hover { background: #c0881e; }
+
+  /* ── Inputs ────────────────────────────────────── */
+  .input {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    font-size: 13px;
+    font-family: inherit;
+    transition: border-color 0.2s;
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--blue);
+  }
+
+  /* ── Loading skeleton ──────────────────────────── */
+  .skeleton {
+    background: linear-gradient(90deg, var(--card) 25%, var(--card-hover) 50%, var(--card) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s ease infinite;
+    border-radius: 4px;
+  }
+  @keyframes shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+  .skeleton-card {
+    height: 180px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .skeleton-text { height: 14px; margin-bottom: 8px; width: 60%; }
+  .skeleton-text.short { width: 35%; }
+  .skeleton-text.long { width: 85%; }
+
+  /* ── Misc ──────────────────────────────────────── */
+  .loading {
+    color: var(--text-muted);
+    text-align: center;
+    padding: 48px 16px;
+    font-size: 14px;
+  }
+  .empty-state {
+    text-align: center;
+    padding: 48px 16px;
+    color: var(--text-muted);
+  }
+  .empty-state .empty-icon {
+    font-size: 32px;
+    margin-bottom: 12px;
+    opacity: 0.5;
+  }
+  .empty-state .empty-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── Responsive ────────────────────────────────── */
+  @media (max-width: 768px) {
+    body { padding: 16px; }
+    .header h1 { font-size: 18px; }
+    .summary { grid-template-columns: repeat(3, 1fr); }
+    .grid { grid-template-columns: 1fr; }
+    .chart-grid { grid-template-columns: 1fr; }
+    .tabs { overflow-x: auto; gap: 0; }
+    .tab { padding: 8px 14px; font-size: 12px; white-space: nowrap; }
+  }
+  @media (max-width: 480px) {
+    .summary { grid-template-columns: repeat(2, 1fr); }
+    .status-bar { gap: 10px; flex-wrap: wrap; }
+    .tab { padding: 8px 10px; font-size: 11px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>Health Proxy</h1>
+    <div class="subtitle" id="lastUpdate">Connecting...</div>
+  </div>
+  <div class="status-bar">
+    <span id="healthSummary" class="subtitle">loading...</span>
+    <span id="readyCount" class="subtitle">Ready: -/-</span>
+    <span class="uptime" id="uptimeDisplay"></span>
+  </div>
+</div>
+
+<div class="summary" id="summaryRow">
+  <div class="summary-card"><div class="summary-value green" id="sHealthy">-</div><div class="summary-label">Healthy</div></div>
+  <div class="summary-card"><div class="summary-value yellow" id="sProbing">-</div><div class="summary-label">Probing</div></div>
+  <div class="summary-card"><div class="summary-value red" id="sCooldown">-</div><div class="summary-label">Cooldown</div></div>
+  <div class="summary-card"><div class="summary-value blue" id="sDisabled">-</div><div class="summary-label">Disabled</div></div>
+  <div class="summary-card"><div class="summary-value" id="sRequests">-</div><div class="summary-label">Requests (5m)</div></div>
+  <div class="summary-card"><div class="summary-value" id="sTokens">-</div><div class="summary-label">Tokens (5m)</div></div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="providers">Providers<span class="tab-badge" id="providerCount">-</span></button>
+  <button class="tab" data-tab="requests">Requests</button>
+  <button class="tab" data-tab="charts">Charts</button>
+  <button class="tab" data-tab="router">Router</button>
+  <button class="tab" data-tab="aggregated">Aggregated <span class="tab-badge" id="aggCount">-</span></button>
+  <button class="tab" data-tab="logs">Live Logs</button>
+  <button class="tab" data-tab="config">Config</button>
+</div>
+
+<!-- PROVIDERS TAB -->
+<div id="tab-providers" class="tab-content active">
+  <div class="flex flex-center gap-12 mb-12">
+    <input type="text" id="providerSearch" class="search-input" placeholder="Filter providers..." oninput="filterProviders()" />
+    <span class="text-xs text-muted" id="providerFilterCount"></span>
+  </div>
+  <div id="readySection" style="display:none;" class="mb-16">
+    <div class="text-sm fw-600 mb-8" style="color:var(--green);">Ready Providers</div>
+    <div class="ready-grid" id="readyGrid"></div>
+  </div>
+  <div class="grid" id="providerGrid">
+    <div class="skeleton skeleton-card"></div>
+    <div class="skeleton skeleton-card"></div>
+    <div class="skeleton skeleton-card"></div>
+  </div>
+</div>
+
+<!-- REQUESTS TAB -->
+<div id="tab-requests" class="tab-content">
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Provider</th><th>Model</th><th>Status</th>
+        <th>Duration</th><th>TTFT</th><th>Down</th><th>Up</th><th>Cache</th>
+      </tr></thead>
+      <tbody id="requestBody">
+        <tr><td colspan="9" class="loading">No requests recorded yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- CHARTS TAB -->
+<div id="tab-charts" class="tab-content">
+  <div class="chart-controls">
+    <label class="text-sm text-muted">Range:</label>
+    <select id="chartRange" onchange="fetchHistoryChart()" class="chart-select">
+      <option value="30">30 min</option>
+      <option value="60" selected>1 hour</option>
+      <option value="180">3 hours</option>
+      <option value="360">6 hours</option>
+    </select>
+    <button onclick="exportCSV()" class="btn btn-primary">Export CSV</button>
+    <span id="chartStatus" class="text-sm text-muted" style="margin-left:auto;"></span>
+  </div>
+  <div class="chart-grid">
+    <div class="chart-card">
+      <div class="chart-title">Provider Health (count)</div>
+      <canvas id="healthChart" height="200"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Failures</div>
+      <canvas id="failuresChart" height="200"></canvas>
+    </div>
+  </div>
+  <div class="text-xs text-muted" style="text-align:center;margin-top:16px;">
+    Data snapshotted every 60s. Auto-refreshes every 30s.
+  </div>
+</div>
+
+<!-- ROUTER TAB -->
+<div id="tab-router" class="tab-content">
+  <div class="flex flex-center gap-12 mb-12">
+    <span class="text-sm text-muted">Default provider:</span>
+    <strong id="routerDefault" style="font-size:14px;">-</strong>
+    <span class="text-xs text-muted" style="margin-left:auto;" id="routerSummary">Loading...</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Provider</th><th>Status</th><th>Failures</th><th>Models</th><th>Reason</th>
+      </tr></thead>
+      <tbody id="routerBody">
+        <tr><td colspan="5" class="loading">Loading router info...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- AGGREGATED TAB -->
+<div id="tab-aggregated" class="tab-content">
+  <div class="flex flex-center gap-12 mb-12">
+    <span class="text-sm text-muted">Providers across all downstream routers</span>
+    <span class="text-xs text-muted" id="aggStatus" style="margin-left:auto;">Loading...</span>
+  </div>
+  <div class="grid" id="aggGrid"></div>
+</div>
+
+<!-- LOGS TAB -->
+<div id="tab-logs" class="tab-content">
+  <div class="logs" id="logContainer"></div>
+</div>
+
+<!-- CONFIG TAB -->
+<div id="tab-config" class="tab-content">
+  <div style="max-width:560px;">
+    <div class="text-sm fw-600 mb-16">Webhook Notifications</div>
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;">
+      <label class="text-sm text-muted" style="display:block;margin-bottom:6px;">Webhook URL</label>
+      <div class="flex gap-8">
+        <input type="url" id="webhookUrl" placeholder="https://hooks.example.com/alert" class="input" style="flex:1;" />
+        <button onclick="saveWebhook()" class="btn btn-green">Save</button>
+        <button onclick="testWebhook()" class="btn btn-yellow">Test</button>
+      </div>
+      <div id="webhookStatus" class="text-xs text-muted mt-8"></div>
+    </div>
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;">
+      <div class="text-sm fw-600 mb-8">Logged Events</div>
+      <div class="logs" id="eventLog" style="max-height:260px;"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── CSS variable resolver for Canvas ───────────────
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// ── State ─────────────────────────────────────────
+const MAX_LOG_LINES = 200;
+let logs = [];
+let providersCache = {};
+let requestHistory = [];
+let chartHistory = [];
+let sseSource = null;
+
+// ── Tabs ──────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.tab[data-tab="${name}"]`).classList.add('active');
+  document.getElementById(`tab-${name}`).classList.add('active');
+}
+
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => switchTab(t.dataset.tab));
+});
+
+// ── SSE Connection (single) ───────────────────────
+function connectSSE() {
+  if (sseSource) { sseSource.close(); }
+
+  sseSource = new EventSource('/api/metrics/sse');
+
+  sseSource.addEventListener('provider_update', function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      providersCache = data.providers || {};
+      updateDashboard(data);
+    } catch(err) { /* ignore */ }
+  });
+
+  sseSource.addEventListener('provider_change', function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      addLog(data.provider + ': ' + data.from + ' → ' + data.to, 'warn');
+      const cards = document.querySelectorAll('.card');
+      cards.forEach(c => {
+        if (c.querySelector('.card-title')?.textContent === data.provider) {
+          c.classList.add('card-highlight');
+          setTimeout(() => c.classList.remove('card-highlight'), 2000);
+        }
+      });
+    } catch(err) { /* ignore */ }
+  });
+
+  sseSource.addEventListener('alert', function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      addLog(data.message, data.severity === 'critical' ? 'error' : 'warn');
+    } catch(err) { /* ignore */ }
+  });
+
+  sseSource.onerror = function() {
+    document.getElementById('lastUpdate').textContent = 'Disconnected — retrying...';
+    setTimeout(connectSSE, 3000);
+  };
+
+  sseSource.onopen = function() {
+    document.getElementById('lastUpdate').textContent = 'Live';
+  };
+}
+
+// ── Update Dashboard ──────────────────────────────
+function updateDashboard(data) {
+  const providers = data.providers || {};
+  const now = new Date().toLocaleTimeString();
+  document.getElementById('lastUpdate').textContent = 'Live — ' + now;
+
+  let healthy = 0, probing = 0, cooldown = 0, disabled = 0;
+  let providerCount = 0;
+  for (const [name, p] of Object.entries(providers)) {
+    if (name === 'unknown') continue;
+    providerCount++;
+    switch (p.status) {
+      case 'healthy': healthy++; break;
+      case 'probing': probing++; break;
+      case 'cooldown': cooldown++; break;
+      case 'disabled': disabled++; break;
+    }
+  }
+
+  flashValue('sHealthy', healthy);
+  flashValue('sProbing', probing);
+  flashValue('sCooldown', cooldown);
+  flashValue('sDisabled', disabled);
+
+  let totalReqs = 0, totalTokens = 0;
+  for (const [name, p] of Object.entries(providers)) {
+    if (p.metrics) {
+      totalReqs += p.metrics.total_requests || 0;
+      totalTokens += p.metrics.total_tokens || 0;
+    }
+  }
+  flashValue('sRequests', totalReqs);
+  flashValue('sTokens', formatTokens(totalTokens));
+
+  // Update provider count badge and health summary
+  document.getElementById('providerCount').textContent = providerCount;
+  document.getElementById('healthSummary').textContent = healthy + ' healthy, ' + cooldown + ' down';
+
+  if (data.daemon_uptime) {
+    document.getElementById('uptimeDisplay').textContent = formatUptime(data.daemon_uptime);
+  }
+
+  renderProviders(providers);
+  renderReadyProviders(providers);
+
+  // Log cooldown status changes
+  for (const [name, p] of Object.entries(providers)) {
+    if (p.status === 'cooldown' && p.failures > 0) {
+      const reason = (p.reason || '').replace(/\s*\(probing\)/, '');
+      addLog(name + ': ' + p.status + ' (' + p.failures + ' failures' + (reason ? ' — ' + reason : '') + ')', 'warn');
+    }
+  }
+}
+
+function flashValue(id, newValue) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.textContent !== String(newValue)) {
+    el.textContent = newValue;
+    el.classList.remove('value-flash');
+    void el.offsetWidth; // force reflow
+    el.classList.add('value-flash');
+  }
+}
+
+// ── Provider Cards ────────────────────────────────
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Ready Providers ───────────────────────────────
+function renderReadyProviders(providers) {
+  const section = document.getElementById('readySection');
+  const grid = document.getElementById('readyGrid');
+  const entries = Object.entries(providers).filter(([n,p]) => n !== 'unknown' && p.status === 'healthy');
+  const total = Object.keys(providers).filter(n => n !== 'unknown').length;
+
+  document.getElementById('readyCount').textContent = 'Ready: ' + entries.length + '/' + total;
+
+  if (entries.length === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  section.style.display = '';
+  grid.innerHTML = entries.map(([name, p]) => {
+    const score = p.reliability_score;
+    return '<span class="ready-chip">' +
+      '<span class="status-dot dot-green"></span>' +
+      '<strong>' + name + '</strong>' +
+      (score !== undefined ? '<span class="ready-score">' + score + '/100</span>' : '') +
+    '</span>';
+  }).join('');
+}
+
+// ── Provider Search / Filter ──────────────────────
+let _allProviderEntries = [];
+function renderProviders(providers) {
+  _allProviderEntries = Object.entries(providers).filter(([name]) => name !== 'unknown');
+  filterProviders();
+}
+
+function filterProviders() {
+  const grid = document.getElementById('providerGrid');
+  const query = (document.getElementById('providerSearch').value || '').toLowerCase().trim();
+
+  const entries = query
+    ? _allProviderEntries.filter(([name]) => name.toLowerCase().includes(query))
+    : _allProviderEntries;
+
+  document.getElementById('providerFilterCount').textContent = query
+    ? entries.length + ' / ' + _allProviderEntries.length + ' providers'
+    : '';
+
+  if (entries.length === 0) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">🔍</div><div class="empty-title">No matches</div><div class="text-muted text-sm">Try a different search term</div></div>';
+    return;
+  }
+
+  grid.innerHTML = entries.map(([name, p]) => {
+    const status = p.status || 'unknown';
+    const statusColor = status === 'healthy' ? 'green' : status === 'probing' ? 'yellow' : 'red';
+    const m = p.metrics || {};
+    const cooldownRemaining = p.cooldown_remaining || 0;
+
+    const score = p.reliability_score;
+    const risk = p.risk_level;
+    const riskColors = {low:'#3fb950',medium:'#d29922',high:'#f85149'};
+    const riskBgs = {low:'rgba(63,185,80,0.12)',medium:'rgba(210,153,34,0.12)',high:'rgba(248,81,73,0.12)'};
+    const scoreColor = score >= 80 ? '#3fb950' : score >= 50 ? '#d29922' : '#f85149';
+
+    const statusText = status + (cooldownRemaining > 0 ? ' (' + formatDuration(cooldownRemaining) + ')' : '');
+
+    return '<div class="card">' +
+      '<div class="card-header">' +
+        '<div class="flex flex-center gap-8">' +
+          '<span class="status-dot dot-' + statusColor + '"></span>' +
+          '<span class="card-title">' + name + '</span>' +
+        '</div>' +
+        '<div class="flex flex-center gap-8">' +
+          (risk ? '<span class="card-badge" style="background:' + (riskBgs[risk]||'rgba(248,81,73,0.12)') + ';color:' + (riskColors[risk]||'#f85149') + ';">' + risk + '</span>' : '') +
+          '<span class="card-badge" style="background:rgba(255,255,255,0.06);color:var(--text-muted);">' + statusText + '</span>' +
+        '</div>' +
+      '</div>' +
+      (score !== undefined ? '' +
+      '<div class="mb-12">' +
+        '<div class="flex flex-between mb-8" style="font-size:11px;">' +
+          '<span class="text-muted">Reliability</span>' +
+          '<span style="font-weight:600;">' + score + '/100</span>' +
+        '</div>' +
+        '<div class="reliability-bar"><div class="reliability-fill" style="width:' + score + '%;background:' + scoreColor + ';"></div></div>' +
+      '</div>' : '') +
+      '<div class="card-body">' +
+        '<div class="metric-row">' +
+          '<span class="metric-label">Failures</span>' +
+          '<span class="metric-value ' + (p.failures > 10 ? 'red' : p.failures > 0 ? 'yellow' : 'green') + '">' + p.failures + '</span>' +
+        '</div>' +
+        (p.reason ? '<div class="metric-row"><span class="metric-label">Reason</span><span class="text-xs text-muted">' + escHtml(p.reason.replace(/\s*\(probing\)/,'')) + '</span></div>' : '') +
+        (m.total_requests !== undefined ? '' +
+        '<div class="metric-row"><span class="metric-label">Requests (5m)</span><span class="metric-value">' + m.total_requests + '</span></div>' +
+        '<div class="metric-row"><span class="metric-label">Token usage</span><span class="metric-value blue">' + formatTokens(m.total_tokens || 0) + '</span></div>' +
+        '<div class="metric-row"><span class="metric-label">Latency avg</span><span class="metric-value">' + (m.avg_latency_ms || 0) + 'ms</span></div>' +
+        '<div class="metric-row"><span class="metric-label">TTFT avg</span><span class="metric-value">' + (m.avg_ttft_ms || 0) + 'ms</span></div>' +
+        '<div class="metric-row"><span class="metric-label">Tokens/sec</span><span class="metric-value">' + (m.tokens_per_second || 0) + '/s</span></div>' +
+        '' : '<div class="metric-row"><span class="metric-label" style="color:var(--text-muted)">No request data yet</span></div>') +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+// ── Request History ───────────────────────────────
+async function fetchHistory() {
+  try {
+    const res = await fetch('/api/history?limit=50');
+    const data = await res.json();
+    requestHistory = data.records || [];
+    renderRequests();
+  } catch (err) { /* ignore */ }
+}
+
+function renderRequests() {
+  const tbody = document.getElementById('requestBody');
+  if (!requestHistory.length) {
+    tbody.innerHTML = '<tr><td colspan="9" class="loading">No requests recorded yet</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = requestHistory.map(r =>
+    '<tr>' +
+      '<td>' + new Date(r.timestamp * 1000).toLocaleTimeString() + '</td>' +
+      '<td><strong>' + escHtml(r.provider || '') + '</strong></td>' +
+      '<td class="text-xs text-muted">' + escHtml(r.model || '') + '</td>' +
+      '<td><span class="badge ' + (r.success ? 'badge-ok' : 'badge-fail') + '">' + (r.success ? 'OK' : 'FAIL') + '</span></td>' +
+      '<td>' + (r.duration_ms || '-') + 'ms</td>' +
+      '<td>' + (r.ttft_ms || '-') + 'ms</td>' +
+      '<td>' + (r.tokens_in || 0) + '</td>' +
+      '<td>' + (r.tokens_out || 0) + '</td>' +
+      '<td>' + (r.tokens_cache || '-') + '</td>' +
+    '</tr>'
+  ).join('');
+}
+
+// ── Logs ──────────────────────────────────────────
+function addLog(line, type) {
+  type = type || 'info';
+  logs.push({ line: line, type: type, ts: new Date().toLocaleTimeString() });
+  if (logs.length > MAX_LOG_LINES) logs = logs.slice(-MAX_LOG_LINES);
+  renderLogs();
+}
+
+function renderLogs() {
+  const container = document.getElementById('logContainer');
+  if (!container) return;
+  const wasAtBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 20;
+  container.innerHTML = logs.map(l =>
+    '<div class="log-line ' + l.type + '">[' + l.ts + '] ' + escHtml(l.line) + '</div>'
+  ).join('');
+  if (wasAtBottom) container.scrollTop = container.scrollHeight;
+}
+document.addEventListener('DOMContentLoaded', () => {
+  const logContainer = document.getElementById('logContainer');
+  if (logContainer) {
+    logContainer.addEventListener('mouseenter', () => logContainer.dataset.pauseScroll = 'true');
+    logContainer.addEventListener('mouseleave', () => { logContainer.dataset.pauseScroll = ''; logContainer.scrollTop = logContainer.scrollHeight; });
+  }
+});
+
+// ── Poll history ──────────────────────────────────
+setInterval(fetchHistory, 5000);
+setInterval(fetchMetrics, 10000);
+
+async function fetchMetrics() {
+  try {
+    const res = await fetch('/api/metrics?window=300');
+    const data = await res.json();
+    if (data.metrics && data.metrics.global) {
+      document.getElementById('sRequests').textContent = data.metrics.global.total_requests || 0;
+      document.getElementById('sTokens').textContent = formatTokens(data.metrics.global.total_tokens || 0);
+    }
+  } catch (err) { /* ignore */ }
+}
+
+// ── Utilities ─────────────────────────────────────
+function formatTokens(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+function formatDuration(seconds) {
+  if (seconds >= 86400) return Math.floor(seconds / 86400) + 'd ' + Math.floor((seconds % 86400) / 3600) + 'h';
+  if (seconds >= 3600) return Math.floor(seconds / 3600) + 'h ' + Math.floor((seconds % 3600) / 60) + 'm';
+  if (seconds >= 60) return Math.floor(seconds / 60) + 'm';
+  return Math.floor(seconds) + 's';
+}
+
+function formatUptime(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + s + 's';
+  return s + 's';
+}
+
+// ── Charts ────────────────────────────────────────
+async function fetchHistoryChart() {
+  const minutes = document.getElementById('chartRange').value;
+  document.getElementById('chartStatus').textContent = 'loading...';
+  try {
+    const res = await fetch('/api/metrics/history?minutes=' + minutes + '&resolution=60');
+    const data = await res.json();
+    chartHistory = data.history || [];
+    renderHealthChart();
+    renderFailuresChart();
+    document.getElementById('chartStatus').textContent = chartHistory.length + ' data points';
+  } catch (err) {
+    document.getElementById('chartStatus').textContent = 'Failed to load';
+  }
+}
+
+function renderHealthChart() {
+  const canvas = document.getElementById('healthChart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const W = rect.width - 32;
+  const H = 200;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+
+  const textColor = cssVar('--text-muted') || '#8b949e';
+  const pts = chartHistory;
+  if (pts.length < 2) {
+    ctx.fillStyle = textColor;
+    ctx.font = '13px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Not enough data — snapshots every 60s', W / 2, H / 2);
+    return;
+  }
+
+  const pad = { top: 10, bottom: 22, left: 40, right: 10 };
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+
+  let max = 0;
+  pts.forEach(p => { max = Math.max(max, p.healthy || 0, p.probing || 0, p.cooldown || 0, p.total || 0); });
+  if (max === 0) max = 10;
+  const scaleY = (v) => pad.top + ch - (v / max) * ch;
+  const scaleX = (i) => pad.left + (i / Math.max(pts.length - 1, 1)) * cw;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(128,128,128,0.12)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (ch / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    ctx.fillStyle = textColor;
+    ctx.font = '10px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(max - (max / 4) * i), pad.left - 5, y + 3);
+  }
+
+  // Lines with gradient fill
+  const drawLineWithFill = (data, color, fillAlpha) => {
+    // Fill
+    const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+    grad.addColorStop(0, color + hexAlpha(fillAlpha || 20));
+    grad.addColorStop(1, color + '00');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(scaleX(0), pad.top + ch);
+    data.forEach((v, i) => {
+      ctx.lineTo(scaleX(i), scaleY(v));
+    });
+    ctx.lineTo(scaleX(data.length - 1), pad.top + ch);
+    ctx.closePath();
+    ctx.fill();
+
+    // Line on top
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = scaleX(i);
+      const y = scaleY(v);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+
+  function hexAlpha(alpha) {
+    const a = Math.max(0, Math.min(255, Math.round(alpha * 2.55)));
+    return a.toString(16).padStart(2, '0');
+  }
+
+  drawLineWithFill(pts.map(p => p.healthy || 0), '#3fb950', 15);
+  drawLineWithFill(pts.map(p => p.probing || 0), '#d29922', 12);
+  drawLineWithFill(pts.map(p => p.cooldown || 0), '#f85149', 10);
+
+  // Legend
+  const lx = W - 130;
+  ctx.fillStyle = '#3fb950';
+  ctx.font = '11px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillRect(lx, 0, 10, 10);
+  ctx.fillText('Healthy', lx + 14, 9);
+  ctx.fillStyle = '#d29922';
+  ctx.fillRect(lx + 60, 0, 10, 10);
+  ctx.fillText('Probing', lx + 74, 9);
+  ctx.fillStyle = '#f85149';
+  ctx.fillRect(lx + 120, 0, 10, 10);
+  ctx.fillText('Cooldown', lx + 134, 9);
+
+  // X labels
+  ctx.fillStyle = textColor;
+  ctx.font = '10px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  const labelInterval = Math.max(1, Math.floor(pts.length / 6));
+  for (let i = 0; i < pts.length; i += labelInterval) {
+    const d = new Date(pts[i].ts * 1000);
+    ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), scaleX(i), H - 2);
+  }
+}
+
+function renderFailuresChart() {
+  const canvas = document.getElementById('failuresChart');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const W = rect.width - 32;
+  const H = 200;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+
+  const textColor = cssVar('--text-muted') || '#8b949e';
+  const pts = chartHistory;
+  if (pts.length < 2) {
+    ctx.fillStyle = textColor;
+    ctx.font = '13px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Not enough data yet', W / 2, H / 2);
+    return;
+  }
+
+  const pad = { top: 10, bottom: 22, left: 40, right: 10 };
+  const cw = W - pad.left - pad.right;
+  const ch = H - pad.top - pad.bottom;
+  let max = Math.max(...pts.map(p => p.failures || 0), 10);
+  const scaleY = (v) => pad.top + ch - (v / max) * ch;
+  const scaleX = (i) => pad.left + (i / Math.max(pts.length - 1, 1)) * cw;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(128,128,128,0.12)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (ch / 4) * i;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    ctx.fillStyle = textColor;
+    ctx.font = '10px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(max - (max / 4) * i), pad.left - 5, y + 3);
+  }
+
+  // Bars
+  const barW = Math.max(3, cw / pts.length * 0.6);
+  pts.forEach((p, i) => {
+    const v = p.failures || 0;
+    const x = scaleX(i) - barW / 2;
+    const y = scaleY(v);
+    const color = v > 500 ? '#f85149' : v > 100 ? '#d29922' : '#3fb950';
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.8;
+    ctx.fillRect(x, y, barW, ch - (v / max) * ch);
+    ctx.globalAlpha = 1;
+  });
+
+  // X labels
+  ctx.fillStyle = textColor;
+  ctx.font = '10px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  const labelInterval = Math.max(1, Math.floor(pts.length / 6));
+  for (let i = 0; i < pts.length; i += labelInterval) {
+    const d = new Date(pts[i].ts * 1000);
+    ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), scaleX(i), H - 2);
+  }
+
+  // Total
+  const total = pts[pts.length - 1]?.failures || 0;
+  ctx.fillStyle = cssVar('--text') || '#c9d1d9';
+  ctx.font = 'bold 13px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Total failures: ' + total.toLocaleString(), pad.left, 20);
+}
+
+// ── CSV Export ────────────────────────────────────
+async function exportCSV() {
+  const minutes = document.getElementById('chartRange').value;
+  try {
+    const res = await fetch('/api/export/csv?minutes=' + minutes);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'provider-metrics-' + Date.now() + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+    addLog('Exported CSV (' + minutes + 'min)', 'info');
+  } catch (err) {
+    addLog('CSV export failed: ' + err.message, 'error');
+  }
+}
+
+// ── Webhook Config ────────────────────────────────
+async function loadWebhookConfig() {
+  try {
+    const res = await fetch('/api/alert/webhook');
+    const data = await res.json();
+    document.getElementById('webhookUrl').value = data.webhook_url || '';
+    document.getElementById('webhookStatus').textContent = data.enabled
+      ? 'Webhook enabled: ' + data.webhook_url
+      : 'No webhook configured';
+  } catch (err) {
+    document.getElementById('webhookStatus').textContent = 'Failed to load webhook config';
+  }
+}
+
+async function saveWebhook() {
+  const url = document.getElementById('webhookUrl').value.trim();
+  try {
+    const res = await fetch('/api/alert/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) { const e = await res.json(); throw new Error(e.error); }
+    const data = await res.json();
+    document.getElementById('webhookStatus').textContent = data.enabled
+      ? 'Webhook enabled: ' + data.webhook_url
+      : 'Webhook cleared';
+    addLog('Webhook ' + (data.enabled ? 'updated' : 'cleared'), 'info');
+  } catch (err) {
+    document.getElementById('webhookStatus').textContent = 'Error: ' + err.message;
+  }
+}
+
+async function testWebhook() {
+  const url = document.getElementById('webhookUrl').value.trim();
+  if (!url) { document.getElementById('webhookStatus').textContent = 'Enter a URL first'; return; }
+  document.getElementById('webhookStatus').textContent = 'Sending test...';
+  try {
+    const res = await fetch('/api/alert/webhook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) throw new Error('Failed to save');
+    addLog('Test webhook sent to ' + url, 'info');
+    document.getElementById('webhookStatus').textContent = 'Test complete (check your webhook receiver)';
+  } catch (err) {
+    document.getElementById('webhookStatus').textContent = 'Error: ' + err.message;
+  }
+}
+
+// ── Router Info ───────────────────────────────────
+async function fetchRouterInfo() {
+  try {
+    const res = await fetch('/api/admin/router');
+    const data = await res.json();
+    const providers = data.providers || {};
+    document.getElementById('routerDefault').textContent = data.default_provider || 'combo-round-robin';
+    document.getElementById('routerSummary').textContent = 'Healthy: ' + (data.healthy_count || 0) + ' / ' + (data.total || 0) + ' providers';
+
+    const tbody = document.getElementById('routerBody');
+    const entries = Object.entries(providers).filter(([n]) => n !== 'unknown');
+    if (entries.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="5" class="loading">No provider data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = entries.map(([name, p]) => {
+      const s = p.status || 'unknown';
+      const sc = s === 'healthy' ? 'green' : s === 'probing' ? 'yellow' : 'red';
+      const models = Array.isArray(p.models) ? p.models.join(', ') : (p.models || '-');
+      return '<tr>' +
+        '<td><strong>' + escHtml(name) + '</strong></td>' +
+        '<td><span class="status-dot dot-' + sc + '" style="margin-right:4px;"></span>' + s + '</td>' +
+        '<td>' + (p.failures || 0) + '</td>' +
+        '<td class="text-xs text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">' + escHtml(models) + '</td>' +
+        '<td class="text-xs text-muted">' + escHtml(p.reason || '-') + '</td>' +
+      '</tr>';
+    }).join('');
+  } catch (err) {
+    document.getElementById('routerDefault').textContent = 'Error';
+    document.getElementById('routerSummary').textContent = 'Failed to load';
+  }
+}
+
+// ── Aggregated Providers ──────────────────────────
+async function fetchAggregated() {
+  try {
+    const res = await fetch('/api/providers/aggregated');
+    const data = await res.json();
+    const providers = data.providers || {};
+    const total = data.total || 0;
+    document.getElementById('aggCount').textContent = total;
+    document.getElementById('aggStatus').textContent = total + ' providers, ' + new Date().toLocaleTimeString();
+
+    const grid = document.getElementById('aggGrid');
+    const entries = Object.entries(providers);
+    if (entries.length === 0) {
+      grid.innerHTML = '<div class="empty-state"><div class="empty-icon">📡</div><div class="empty-title">No providers</div><div class="text-muted text-sm">No downstream routers registered or no models discovered yet</div></div>';
+      return;
+    }
+
+    grid.innerHTML = entries.map(([providerName, info]) => {
+      const routerTags = (info.routers || []).map(r =>
+        '<span style="display:inline-block;background:rgba(88,166,255,0.12);color:var(--blue);border-radius:100px;padding:2px 10px;font-size:11px;margin:2px;">' + escHtml(r) + '</span>'
+      ).join('');
+
+      return '<div class="card">' +
+        '<div class="card-header">' +
+          '<span class="card-title">' + escHtml(providerName) + '</span>' +
+          '<div class="flex flex-center gap-8">' +
+            '<span class="card-badge" style="background:rgba(88,166,255,0.12);color:var(--blue);">' + info.router_count + ' routers</span>' +
+            '<span class="card-badge" style="background:rgba(255,255,255,0.06);color:var(--text-muted);">' + info.total_models + ' models</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="mb-12">' +
+          '<div class="text-xs text-muted mb-8">Routers serving this provider:</div>' +
+          '<div>' + routerTags + '</div>' +
+        '</div>' +
+        '<div>' +
+          '<div class="text-xs text-muted mb-8">Models:</div>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:4px;">' +
+            (info.models || []).slice(0, 20).map(m =>
+              '<span style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:11px;font-family:monospace;">' +
+                escHtml(m.model_id) +
+                ' <span class="text-xs text-muted">(' + (m.routers || []).length + ' routers)</span>' +
+              '</span>'
+            ).join('') +
+            ((info.models || []).length > 20
+              ? '<span class="text-xs text-muted" style="padding:3px 8px;">+' + ((info.models || []).length - 20) + ' more</span>'
+              : '') +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch (err) {
+    document.getElementById('aggStatus').textContent = 'Failed: ' + err.message;
+  }
+}
+
+// ── Boot ──────────────────────────────────────────
+connectSSE();
+fetchHistory();
+fetchHistoryChart();
+loadWebhookConfig();
+fetchRouterInfo();
+fetchAggregated();
+setInterval(fetchHistoryChart, 30000);
+setInterval(fetchRouterInfo, 10000);
+setInterval(fetchAggregated, 15000);
+</script>
+</body>
+</html>

@@ -1,33 +1,61 @@
-"""HTTP proxy with health-aware routing for 9router requests.
+"""HTTP proxy with health-aware + smart routing for 9router requests.
 
-Inherits core forwarding from prompt-limiter/proxy/proxy_server.py
-with health registry integration.
+Extends the basic forwarder with:
+  - Prompt limiting (truncate oversized prompts)
+  - Health-aware gating (skip cooldown providers)
+  - Smart router integration (select best model from combo)
+  - Automatic health reset for failed-then-succeeded providers
 """
 
 import json
 import logging
 import re
+import sys
+import time
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
+# ── Fix sys.path BEFORE local imports ─────────────────────────────────
+# daemon.py inserts prompt-limiter at sys.path[0], which shadows our
+# local modules (smart_router.py, metrics_store.py, etc.).
+# Fix: put our directory at [0], prompt-limiter at [1].
+from config import PROMPT_LIMITER_DIR
+
+_local_dir = str(Path(__file__).parent)
+_prompt_dir = str(PROMPT_LIMITER_DIR)
+
+# Force our local directory to be first in sys.path so local modules
+# take priority over prompt-limiter (which has a smart_router.py too)
+if _local_dir in sys.path:
+    sys.path.remove(_local_dir)
+sys.path.insert(0, _local_dir)
+
+# Keep prompt-limiter at position 1 so it's still importable
+if _prompt_dir in sys.path:
+    sys.path.remove(_prompt_dir)
+sys.path.insert(1, _prompt_dir)
+
+# ── Local imports (must come after sys.path fix) ──────────────────────
+from health_registry import HealthRegistry
+from error_parser import parse_error, parse_log_line
+from metrics_store import MetricsStore, RequestRecord
+from smart_router import SmartRouter
+from router_registry import RouterRegistry
+from meta_router import MetaRouterSelector, ServiceUnavailable
+
+# ── Rest of config (PROMPT_LIMITER_DIR already imported above) ────────
 from config import (
     HEALTH_PROXY_PORT,
     NINEROUTER_URL,
     NINEROUTER_KEY,
     MODEL_LIMITS_FILE,
-    PROMPT_LIMITER_DIR,
+    COMBO_REFRESH_INTERVAL,
+    DOWNSTREAM_ROUTERS,
 )
-from health_registry import HealthRegistry
-from error_parser import parse_error, parse_log_line
 
 log = logging.getLogger(__name__)
-
-# ── Prompt limiter import ────────────────────────────────────────────
-import sys
-
-if str(PROMPT_LIMITER_DIR) not in sys.path:
-    sys.path.insert(0, str(PROMPT_LIMITER_DIR))
 
 try:
     from prompt_limiter import count_tokens, get_model_limits, truncate_prompt
@@ -55,15 +83,31 @@ except ImportError:
 
 
 class HealthProxyHandler(BaseHTTPRequestHandler):
-    """HTTP handler with health-aware routing + prompt limiting."""
+    """HTTP handler with health-aware routing + smart model selection."""
 
     registry: HealthRegistry = None  # set by server
+    metrics_store: MetricsStore = None
+    smart_router: SmartRouter = None
+    meta_registry: RouterRegistry = None  # set by server for router-of-routers
+    meta_selector: MetaRouterSelector = None  # set by server
+    _combo_cache: list[str] = []
+    _combo_cache_time: float = 0
+
+    def _get_combo_models(self) -> list[str]:
+        """Get cached list of combo models from 9router."""
+        now = time.time()
+        if now - self._combo_cache_time < COMBO_REFRESH_INTERVAL and self._combo_cache:
+            return self._combo_cache
+        # Use default combos as base
+        self._combo_cache = SmartRouter.get_default_combos()
+        self._combo_cache_time = now
+        return self._combo_cache
 
     def _forward(self, body=None):
         path = self.path
         headers = {"Content-Type": "application/json"}
+        start_time = time.time()
 
-        # Pass through original Authorization if present, else use configured key
         auth = self.headers.get("Authorization", "")
         if auth:
             headers["Authorization"] = auth
@@ -71,41 +115,196 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             headers["Authorization"] = f"Bearer {NINEROUTER_KEY}"
 
         data = json.dumps(body).encode() if body else None
-        url = f"{NINEROUTER_URL}{path}"
+
+        # ── Router-of-routers: pick target via meta-router ─────────────
+        target_router = None
+        fallback_used = False
+        if self.meta_selector:
+            try:
+                target_router = self.meta_selector.select_router()
+            except ServiceUnavailable:
+                self._respond_unavailable("all routers unavailable")
+                return
+
+            if target_router:
+                url = target_router.url.rstrip("/") + path
+                if target_router.auth:
+                    headers[target_router.auth["header"]] = target_router.auth["value"]
+            else:
+                url = f"{NINEROUTER_URL}{path}"
+        else:
+            url = f"{NINEROUTER_URL}{path}"
 
         req = urllib.request.Request(url, data=data, headers=headers, method=self.command)
         req.add_header("Accept", "text/event-stream, application/json")
 
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=180) as resp:
                 resp_body = resp.read()
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
                     if k.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
                         self.send_header(k, v)
                 self.send_header("Content-Length", str(len(resp_body)))
+                if fallback_used:
+                    self.send_header("X-Health-Proxy-Fallback", "true")
                 self.end_headers()
                 self.wfile.write(resp_body)
 
-                # Store health info if possible
-                if self.registry and body and resp.status == 200:
+                # Notify meta-router of success
+                if target_router and self.meta_selector:
+                    self.meta_selector.on_success(target_router.name)
+
+                # Store health info + metrics
+                if body and resp.status == 200:
                     model = body.get("model", "")
                     if model:
                         provider = model.split("/")[0]
                         self.registry.mark_healthy(provider)
+                        self._record_usage(body, resp_body, start_time, provider, model, True)
 
         except urllib.error.HTTPError as e:
             resp_body = e.read()
+
+            # Attempt fallback via meta-router
+            if target_router and self.meta_selector and not fallback_used:
+                try:
+                    self.meta_selector.on_failure(target_router.name, f"http_{e.code}")
+                    fallback_router = self.meta_selector.select_router()
+                    if fallback_router:
+                        fallback_url = fallback_router.url.rstrip("/") + path
+                        fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
+                        fallback_req.add_header("Accept", "text/event-stream, application/json")
+                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=180)
+                        fb_body = fallback_resp.read()
+                        self.send_response(fallback_resp.status)
+                        for k, v in fallback_resp.headers.items():
+                            if k.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
+                                self.send_header(k, v)
+                        self.send_header("Content-Length", str(len(fb_body)))
+                        self.send_header("X-Health-Proxy-Fallback", "true")
+                        self.end_headers()
+                        self.wfile.write(fb_body)
+                        if body and fallback_resp.status == 200:
+                            model = body.get("model", "")
+                            if model:
+                                provider = model.split("/")[0]
+                                self.registry.mark_healthy(provider)
+                                self._record_usage(body, fb_body, start_time, provider, model, True)
+                        return
+                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable):
+                    pass
+
             self.send_response(e.code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(resp_body)
 
-            # Parse error for health registry
-            self._handle_error(e.code, resp_body.decode(errors="replace"), body)
+            body_text = resp_body.decode(errors="replace")
+            self._handle_error(e.code, body_text, body)
+
+            # Record failed request in metrics
+            if body:
+                model = body.get("model", "")
+                provider = model.split("/")[0] if "/" in model else model
+                self._record_usage(body, resp_body, start_time, provider, model, False, f"http_{e.code}")
+
+        except urllib.error.URLError as e:
+            # Attempt fallback via meta-router
+            if target_router and self.meta_selector and not fallback_used:
+                try:
+                    self.meta_selector.on_failure(target_router.name, "connection_error")
+                    fallback_router = self.meta_selector.select_router()
+                    if fallback_router:
+                        fallback_url = fallback_router.url.rstrip("/") + path
+                        fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
+                        fallback_req.add_header("Accept", "text/event-stream, application/json")
+                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=180)
+                        fb_body = fallback_resp.read()
+                        self.send_response(fallback_resp.status)
+                        for k, v in fallback_resp.headers.items():
+                            if k.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
+                                self.send_header(k, v)
+                        self.send_header("Content-Length", str(len(fb_body)))
+                        self.send_header("X-Health-Proxy-Fallback", "true")
+                        self.end_headers()
+                        self.wfile.write(fb_body)
+                        if body and fallback_resp.status == 200:
+                            model = body.get("model", "")
+                            if model:
+                                provider = model.split("/")[0]
+                                self.registry.mark_healthy(provider)
+                                self._record_usage(body, fb_body, start_time, provider, model, True)
+                        return
+                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable):
+                    pass
+
+            self._respond_unavailable(f"Connection error: {e.reason}")
+            if body:
+                model = body.get("model", "")
+                provider = model.split("/")[0] if "/" in model else model
+                self._record_usage(body, b"", start_time, provider, model, False, "connection_error")
+
+    def _record_usage(self, request_body: dict, response_body: bytes, start_time: float,
+                      provider: str, model: str, success: bool, error_type: str = None):
+        """Record request metrics."""
+        if not self.metrics_store:
+            return
+
+        duration_ms = int((time.time() - start_time) * 1000)
+
+        # Try to extract tokens from response
+        tokens_in = 0
+        tokens_out = 0
+        tokens_cache = 0
+        ttft_ms = duration_ms
+
+        try:
+            if response_body and response_body.strip():
+                text = response_body.decode(errors="replace")
+                # Parse SSE or JSON response
+                for line in text.split("\n"):
+                    if line.startswith("data: ") and "[DONE]" not in line:
+                        try:
+                            chunk = json.loads(line[6:])
+                            usage = chunk.get("usage", {})
+                            if usage:
+                                tokens_in = usage.get("prompt_tokens", 0) or tokens_in
+                                tokens_out = usage.get("completion_tokens", 0) or tokens_out
+                                if "prompt_tokens_details" in usage:
+                                    tokens_cache = usage["prompt_tokens_details"].get("cached_tokens", 0)
+                        except json.JSONDecodeError:
+                            pass
+                # If no usage found, try full JSON
+                if not tokens_in and not tokens_out:
+                    try:
+                        resp_json = json.loads(text.split("data: ")[1].split("\n")[0].strip())
+                        usage = resp_json.get("usage", {})
+                        tokens_in = usage.get("prompt_tokens", 0)
+                        tokens_out = usage.get("completion_tokens", 0)
+                        if "prompt_tokens_details" in usage:
+                            tokens_cache = usage["prompt_tokens_details"].get("cached_tokens", 0)
+                    except (IndexError, json.JSONDecodeError):
+                        pass
+        except Exception:
+            pass
+
+        record = RequestRecord(
+            timestamp=start_time,
+            provider=provider,
+            model=model,
+            duration_ms=duration_ms,
+            ttft_ms=ttft_ms,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            tokens_cache=tokens_cache,
+            success=success,
+            error_type=error_type,
+        )
+        self.metrics_store.record_request(record)
 
     def _handle_error(self, status: int, body_text: str, request_body: dict = None):
-        """Record error in health registry."""
+        """Record error in health registry with smart routing awareness."""
         if not self.registry:
             return
 
@@ -128,14 +327,33 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 model=model if error_info.get("model_specific") else None,
             )
 
+    def _find_healthy_alternative(self, body: dict) -> str | None:
+        """Smart routing: find the best performing model from combo."""
+        if not self.registry or not self.smart_router:
+            return None
+
+        current = body.get("model", "")
+        if not current:
+            return None
+
+        # For combo models, use smart router to pick the best
+        combo_models = self._get_combo_models()
+        if combo_models:
+            best = self.smart_router.best_model(combo_models, self.registry)
+            if best and best != current:
+                log.info(f"SmartRouter: {current} → {best} (healthier alternative)")
+                return best
+
+        return None
+
     def _apply_prompt_limit(self, body: dict) -> dict | None:
-        """Check if request exceeds model limits and truncate if needed."""
+        """Check if request exceeds model context or TPM limits, truncate if needed."""
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
 
         limits = get_model_limits(model)
         max_context = limits.get("context", 8192)
-        safe_limit = int(max_context * 0.75)
+        max_tpm = limits.get("tpm", 30000)
 
         all_text = "\n".join(
             m.get("content", "") or ""
@@ -145,27 +363,37 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         )
         total = count_tokens(all_text)
 
-        if total <= safe_limit:
+        tpm_safe_limit = int(max_tpm * 0.85)
+        context_safe_limit = int(max_context * 0.75)
+        effective_limit = min(tpm_safe_limit, context_safe_limit)
+
+        if total <= effective_limit:
             return None
 
-        log.warning(f"⚠ {model}: {total}t exceeds {max_context} context — truncating")
+        exceeded = "TPM" if total > tpm_safe_limit else "context"
+        limit_hit = tpm_safe_limit if exceeded == "TPM" else context_safe_limit
+        log.warning(
+            "Prompts exceeded model limits",
+            extra={
+                "event": "prompt_truncated",
+                "model": model,
+                "original_tokens": total,
+                "limit_tokens": limit_hit,
+                "exceeded": exceeded,
+                "tpm_limit": max_tpm,
+                "context_limit": max_context,
+            },
+        )
 
-        # Concatenate all messages as single text stream for truncation
-        truncated = truncate_prompt(all_text, safe_limit)
-        remaining_tokens = count_tokens(truncated)
-
-        # Rebuild messages from the tail end - keep system message + as many recent as fit
-        # Simple approach: keep last N messages whose total fits
-        kept = []
+        kept: list[dict] = []
         kept_tokens = 0
         for msg in reversed(messages):
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = json.dumps(content)
             msg_tokens = count_tokens(content)
-            if kept_tokens + msg_tokens > safe_limit:
-                # Keep system/developer messages unconditionally if still room
-                if msg.get("role") in ("system", "developer") and kept_tokens < safe_limit * 0.2:
+            if kept_tokens + msg_tokens > effective_limit:
+                if msg.get("role") in ("system", "developer") and kept_tokens < effective_limit * 0.2:
                     kept.insert(0, msg)
                     kept_tokens += msg_tokens
                 break
@@ -178,30 +406,17 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         new_body["_original_tokens"] = total
         new_body["_limited_tokens"] = kept_tokens
 
-        log.info(f"  → {total}t → {kept_tokens}t ({len(kept)} msgs kept)")
+        log.info(
+            "Truncation complete",
+            extra={
+                "event": "truncation_done",
+                "model": model,
+                "original": total,
+                "truncated": kept_tokens,
+                "messages_kept": len(kept),
+            },
+        )
         return new_body
-
-    def _find_healthy_alternative(self, body: dict) -> str | None:
-        """Given request body with model, find a healthy alternative model."""
-        if not self.registry:
-            return None
-
-        current = body.get("model", "")
-        if not current:
-            return None
-
-        # Extract provider
-        provider = current.split("/")[0]
-
-        # Check if current model is healthy
-        if self.registry.is_model_available(current):
-            return None  # already healthy
-
-        # Try to find another model from same combo/fallback info
-        # For combo requests, 9router sends model list? Unlikely in request body.
-        # Strategy: return None — 9router combo handles its own fallback.
-        # We just inform that model is unavailable.
-        return None  # let 9router's combo mechanism handle alternatives
 
     # ── HTTP handlers ────────────────────────────────────────────────
 
@@ -222,15 +437,27 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
+
+        routers_info = {}
+        if self.meta_registry:
+            for r in self.meta_registry.get_all_routers():
+                routers_info[r.name] = {
+                    "url": r.url,
+                    "status": r.health_status,
+                    "models_count": len(r.models),
+                    "cooldown_until": r.cooldown_until,
+                }
+
         data = {
             "status": "online",
             "forwarding": NINEROUTER_URL,
-            "health_file": str(self.registry.filepath),
-            "summary": self.registry.status_summary(),
+            "routers": routers_info,
+            "health_file": str(self.registry.filepath) if self.registry else "",
+            "summary": self.registry.status_summary() if self.registry else {},
             "providers": {
                 name: {"status": e.get("status"), "until": e.get("until"), "reason": e.get("reason")}
                 for name, e in self.registry._data.get("providers", {}).items()
-            },
+            } if self.registry else {},
         }
         self.wfile.write(json.dumps(data, indent=2, default=str).encode())
 
@@ -267,26 +494,48 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             model = body.get("model", "")
             provider = model.split("/")[0] if "/" in model else model
 
+            # Router-level health gate: if all routers are down, return 503
+            if self.meta_selector:
+                try:
+                    self.meta_selector.select_router()
+                except ServiceUnavailable:
+                    self._respond_unavailable("all routers unavailable")
+                    return
+
             # Health gate: check before forwarding
             if self.registry:
                 m_ok = self.registry.is_model_available(model) if model else True
                 p_ok = self.registry.is_provider_healthy(provider) if provider else True
 
                 if not m_ok:
-                    # model-specific cooldown — return 503 with info
-                    entry = self.registry.get_model(model)
-                    self._respond_unavailable(
-                        f"Model '{model}' is in cooldown (reason: {entry.get('reason')}, "
-                        f"until: {entry.get('until')})"
-                    )
-                    return
-                if not p_ok:
-                    entry = self.registry.get_provider(provider)
-                    self._respond_unavailable(
-                        f"Provider '{provider}' is in cooldown (reason: {entry.get('reason')}, "
-                        f"until: {entry.get('until')})"
-                    )
-                    return
+                    # Smart routing: find healthy alternative
+                    alternative = self._find_healthy_alternative(body)
+                    if alternative:
+                        old_model = model
+                        body["model"] = alternative
+                        body["_smart_routed"] = True
+                        body["_original_model"] = old_model
+                        log.info(f"Smart routed {old_model} → {alternative} (model unavailable)")
+                        model = alternative
+                        provider = alternative.split("/")[0] if "/" in alternative else alternative
+                        # Re-check new model health
+                        m_ok = self.registry.is_model_available(model)
+                        p_ok = self.registry.is_provider_healthy(provider)
+
+                    if not m_ok:
+                        entry = self.registry.get_model(model)
+                        self._respond_unavailable(
+                            f"Model '{model}' is in cooldown (reason: {entry.get('reason')}, "
+                            f"until: {entry.get('until')})"
+                        )
+                        return
+                    if not p_ok:
+                        entry = self.registry.get_provider(provider)
+                        self._respond_unavailable(
+                            f"Provider '{provider}' is in cooldown (reason: {entry.get('reason')}, "
+                            f"until: {entry.get('until')})"
+                        )
+                        return
 
             # Apply prompt limiting (context window)
             limited = self._apply_prompt_limit(body)
@@ -315,28 +564,45 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
 
 class HealthProxyServer:
-    """Main server that ties proxy + health registry together."""
+    """Main server that ties proxy + health registry + metrics + smart router + meta-router together."""
 
-    def __init__(self, port: int = HEALTH_PROXY_PORT):
+    def __init__(self, port: int = HEALTH_PROXY_PORT, metrics_store: MetricsStore = None):
         self.port = port
         self.registry = HealthRegistry()
+        self.metrics_store = metrics_store or MetricsStore()
+        self.smart_router = SmartRouter(self.metrics_store)
+        self.meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
+        self.meta_selector = MetaRouterSelector(self.meta_registry)
 
     def get_handler(self):
-        """Create handler class with shared registry."""
+        """Create handler class with shared registry + metrics + meta-router."""
         registry = self.registry
+        metrics = self.metrics_store
+        router = self.smart_router
+        meta_registry = self.meta_registry
+        meta_selector = self.meta_selector
 
         class HandlerWithRegistry(HealthProxyHandler):
             pass
 
         HandlerWithRegistry.registry = registry
+        HandlerWithRegistry.metrics_store = metrics
+        HandlerWithRegistry.smart_router = router
+        HandlerWithRegistry.meta_registry = meta_registry
+        HandlerWithRegistry.meta_selector = meta_selector
         return HandlerWithRegistry
 
     def run(self):
         handler = self.get_handler()
-        server = HTTPServer(("0.0.0.0", self.port), handler)
+        from socketserver import ThreadingMixIn
+
+        class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+
+        server = ThreadingHTTPServer(("0.0.0.0", self.port), handler)
 
         log.info(f"🛡️  Health Proxy → http://localhost:{self.port}")
-        log.info(f"   Forwarding → {NINEROUTER_URL}")
+        log.info(f"   Forwarding → {len(DOWNSTREAM_ROUTERS)} routers (via meta-router)")
         log.info(f"   Health file → {self.registry.filepath}")
         log.info("")
         log.info("   Status:")
