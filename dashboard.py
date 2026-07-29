@@ -201,7 +201,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok"})
             return
 
-        # Admin: get router info (current routing state)
+        if path == "/api/routers":
+            routers_data = []
+            if self.router_registry:
+                for router in self.router_registry.get_all_routers():
+                    routers_data.append({
+                        "name": router.name,
+                        "url": router.url,
+                        "status": router.health_status,
+                        "models_count": len(router.models),
+                        "last_success": router.last_success,
+                        "last_failure": router.last_failure,
+                        "cooldown_until": router.cooldown_until,
+                        "failure_count": router.failure_count,
+                        "priority": router.priority,
+                        "weight": router.weight,
+                    })
+            self._send_json(routers_data)
+            return
+
         if path == "/api/admin/router":
             providers = {}
             if self.health_registry:

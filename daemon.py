@@ -5,9 +5,11 @@ Runs in parallel:
 2. Access log listener (parse 9router access.log for real-time metrics)
 3. Health cleanup (promote expired cooldowns to probing)
 4. Dashboard server (real-time web UI)
-5. Self-audit / observability (structured logs, metrics, health summaries)
+5. Router health probes (downstream router health checks)
+6. Self-audit / observability (structured logs, metrics, health summaries)
 """
 
+import atexit
 import json
 import logging
 import os
@@ -23,8 +25,15 @@ PROMPT_LIMITER_DIR = Path.home() / "Desktop" / "code_study" / "MeusProjetos" / "
 if str(PROMPT_LIMITER_DIR) not in sys.path:
     sys.path.insert(0, str(PROMPT_LIMITER_DIR))
 
-from config import HEALTH_PROXY_PORT, PROBER_INTERVAL_MINUTES, ACCESS_LOG_PATH, DASHBOARD_PORT
+from config import (
+    HEALTH_PROXY_PORT, PROBER_INTERVAL_MINUTES, ACCESS_LOG_PATH, DASHBOARD_PORT,
+    DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE
+)
 from health_registry import HealthRegistry
+from router_registry import RouterRegistry
+from router_probe import RouterProbe
+from meta_router import MetaRouterSelector
+from model_catalog import ModelCatalog
 from error_parser import parse_log_line
 from proxy_handler import HealthProxyServer
 from access_parser import parse_line as parse_access_line
@@ -356,6 +365,32 @@ def main():
 
     registry = HealthRegistry()
 
+    # ── Router-of-routers infrastructure (Wave 2) ─────────────────────
+    meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
+    meta_registry.load_state()  # Restore previous router health states
+    meta_selector = MetaRouterSelector(meta_registry)
+    model_catalog = ModelCatalog(meta_registry)
+    
+    # Start router health probe loop in background
+    router_probe = RouterProbe(meta_registry)
+    probe_thread = threading.Thread(
+        target=router_probe.probe_loop,
+        kwargs={"callback": lambda r: log.debug(f"Router probe: {r}", extra={"event": "router_probe", "results": r})},
+        daemon=True,
+        name="router-probe",
+    )
+    probe_thread.start()
+    log.info("Router probe started", extra={"event": "probe_start"})
+    
+    # Register atexit handler to persist router state on shutdown
+    def persist_router_state():
+        try:
+            meta_registry.save_state()
+            log.info("Router state persisted", extra={"event": "persist_router_state"})
+        except Exception as e:
+            log.error(f"Failed to persist router state: {e}")
+    atexit.register(persist_router_state)
+
     # ── Shared metrics store ──────────────────────────────────────────
     # Used by proxy handler, access log monitor, and dashboard
     shared_metrics = MetricsStore()
@@ -405,16 +440,20 @@ def main():
             name="alerter",
         ).start()
 
-    # ── Start dashboard server (web UI) ──────────────────────────────
+    # Start dashboard server (web UI)
     dashboard = DashboardServer(port=DASHBOARD_PORT)
     dashboard.metrics_store = shared_metrics
     dashboard.health_registry = registry
     dashboard.metrics_persistence = metrics_persist
+    dashboard.meta_registry = meta_registry
+    dashboard.model_catalog = model_catalog
     dashboard.start()
 
-    # ── Start HTTP proxy (blocking) ──────────────────────────────────
+    # Start HTTP proxy (blocking)
     server = HealthProxyServer(port=HEALTH_PROXY_PORT, metrics_store=shared_metrics)
     server.registry = registry
+    server.meta_registry = meta_registry
+    server.meta_selector = meta_selector
     server.run()
 
 

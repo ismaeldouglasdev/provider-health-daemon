@@ -44,6 +44,7 @@ from metrics_store import MetricsStore, RequestRecord
 from smart_router import SmartRouter
 from router_registry import RouterRegistry
 from meta_router import MetaRouterSelector, ServiceUnavailable
+from response_normalizer import normalize_response, normalize_error, normalize_streaming_body
 
 # ── Rest of config (PROMPT_LIMITER_DIR already imported above) ────────
 from config import (
@@ -93,12 +94,22 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
     _combo_cache: list[str] = []
     _combo_cache_time: float = 0
 
+    def _normalize_response_body(self, resp_body: bytes, content_type: str) -> bytes:
+        if not ('application/json' in content_type or 'text/event-stream' in content_type):
+            return resp_body
+        try:
+            if 'event-stream' in content_type:
+                return normalize_streaming_body(resp_body).encode()
+            return json.dumps(normalize_response(resp_body)).encode()
+        except Exception as e:
+            log.warning(f"Response normalization failed: {e}", extra={"event": "normalize_error"})
+            return resp_body
+
     def _get_combo_models(self) -> list[str]:
         """Get cached list of combo models from 9router."""
         now = time.time()
         if now - self._combo_cache_time < COMBO_REFRESH_INTERVAL and self._combo_cache:
             return self._combo_cache
-        # Use default combos as base
         self._combo_cache = SmartRouter.get_default_combos()
         self._combo_cache_time = now
         return self._combo_cache
@@ -141,6 +152,8 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 resp_body = resp.read()
+                resp_body = self._normalize_response_body(resp_body, resp.headers.get('Content-Type', ''))
+                
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
                     if k.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
@@ -151,11 +164,9 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(resp_body)
 
-                # Notify meta-router of success
                 if target_router and self.meta_selector:
                     self.meta_selector.on_success(target_router.name)
 
-                # Store health info + metrics
                 if body and resp.status == 200:
                     model = body.get("model", "")
                     if model:
@@ -177,6 +188,8 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
                         fallback_resp = urllib.request.urlopen(fallback_req, timeout=180)
                         fb_body = fallback_resp.read()
+                        fb_body = self._normalize_response_body(fb_body, fallback_resp.headers.get('Content-Type', ''))
+                        
                         self.send_response(fallback_resp.status)
                         for k, v in fallback_resp.headers.items():
                             if k.lower() not in ("transfer-encoding", "content-encoding", "content-length"):
@@ -198,6 +211,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             self.send_response(e.code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
+            try:
+                err_normalized = normalize_error(resp_body)
+                resp_body = json.dumps(err_normalized).encode()
+            except Exception as norm_err:
+                log.warning(f"Error normalization failed: {norm_err}", extra={"event": "normalize_error_failed"})
             self.wfile.write(resp_body)
 
             body_text = resp_body.decode(errors="replace")

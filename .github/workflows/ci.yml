@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system pytest pytest-cov ruff mypy
+
+      - name: Lint with ruff
+        run: ruff check . --ignore E501,F403,F401,E402
+
+      - name: Type check with mypy
+        run: mypy . --ignore-missing-imports --exclude tests/ || true
+
+      - name: Test with pytest
+        run: pytest tests/ --cov=. --cov-report=term-missing --cov-report=xml -v
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
