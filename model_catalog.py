@@ -1,4 +1,5 @@
 from config import MAX_MODEL_CATALOG
+from sanitizer import sanitize_model_id
 
 
 class ModelCatalog:
@@ -10,7 +11,16 @@ class ModelCatalog:
         if MAX_MODEL_CATALOG and len(catalog) > MAX_MODEL_CATALOG:
             keys = sorted(catalog.keys())[:MAX_MODEL_CATALOG]
             catalog = {k: catalog[k] for k in keys}
-        return catalog
+        
+        sanitized = {}
+        for model_id, entry in catalog.items():
+            clean_id = sanitize_model_id(model_id)
+            if clean_id:
+                sanitized[clean_id] = {
+                    "model_id": clean_id,
+                    "router_origins": entry.get("router_origins", []),
+                }
+        return sanitized
 
     def get_models_list(self):
         catalog = self.get_catalog()
