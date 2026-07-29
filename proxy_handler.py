@@ -152,7 +152,9 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
                 resp_body = resp.read()
-                resp_body = self._normalize_response_body(resp_body, resp.headers.get('Content-Type', ''))
+                is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
+                if is_chat:
+                    resp_body = self._normalize_response_body(resp_body, resp.headers.get('Content-Type', ''))
                 
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
@@ -177,12 +179,13 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as e:
             resp_body = e.read()
 
-            # Attempt fallback via meta-router
+            # Router responded — upstream provider failed, NOT a router issue.
+            # Do NOT mark router unhealthy; only penalize for connection errors (URLError below).
+            # Still attempt fallback to a different router if available.
             if target_router and self.meta_selector and not fallback_used:
                 try:
-                    self.meta_selector.on_failure(target_router.name, f"http_{e.code}")
                     fallback_router = self.meta_selector.select_router()
-                    if fallback_router:
+                    if fallback_router and fallback_router.name != target_router.name:
                         fallback_url = fallback_router.url.rstrip("/") + path
                         fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
@@ -420,9 +423,6 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         new_body = dict(body)
         new_body["messages"] = kept
-        new_body["_health_proxy_truncated"] = True
-        new_body["_original_tokens"] = total
-        new_body["_limited_tokens"] = kept_tokens
 
         log.info(
             "Truncation complete",
@@ -449,6 +449,12 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if self.path == "/health/summary":
             self._respond_summary()
             return
+        
+        x_router = self.headers.get("X-Router", "").lower()
+        if x_router == "combo-round-robin" and self.path in ["/v1/models", "/models"]:
+            self._respond_combo_models()
+            return
+        
         self._forward()
 
     def _respond_status(self):
@@ -484,6 +490,40 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(self.registry.status_summary(), default=str).encode())
+
+    def _respond_combo_models(self):
+        if not self.meta_registry:
+            self._respond_unavailable("meta-registry not available")
+            return
+        
+        healthy_routers = self.meta_registry.get_healthy_routers()
+        if not healthy_routers:
+            self._respond_unavailable("no healthy routers available")
+            return
+        
+        all_models = []
+        seen_ids = set()
+        
+        for router in healthy_routers:
+            for model_id in router.models:
+                if model_id not in seen_ids:
+                    all_models.append({
+                        "id": model_id,
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": router.name
+                    })
+                    seen_ids.add(model_id)
+        
+        response = {
+            "object": "list",
+            "data": all_models
+        }
+        
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
 
     def _handle_reset(self, target: str):
         provider_reg = self.registry.get_provider(target)

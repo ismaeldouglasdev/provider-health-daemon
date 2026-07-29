@@ -120,11 +120,12 @@ class TestFullStackMocked:
     def test_model_catalog_across_routers(self, registry_with_healthy_routers):
         """Model catalog aggregates models from all routers with dedup."""
         catalog = registry_with_healthy_routers.get_model_catalog()
-        # "llama-3.3-70b" appears in both 9router and OmniRoute
+        # "llama-3.3-70b" appears in both OmniRoute and Kiro (if both have it)
+        # 9router was removed from downstream (it's now the meta-router itself on :20131)
         llama_key = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
         assert llama_key in catalog
-        assert "9router" in catalog[llama_key]["router_origins"]
-        assert "OmniRoute" in catalog[llama_key]["router_origins"]
+        # At minimum OmniRoute must have it
+        assert any("OmniRoute" in catalog[llama_key]["router_origins"] for _ in [1])
 
     def test_provider_aggregation(self, registry_with_healthy_routers):
         """Provider aggregation groups models by provider prefix."""
@@ -132,7 +133,8 @@ class TestFullStackMocked:
         assert "@cf" in agg
         assert "nvidia" in agg or "groq" in agg
         cf = agg["@cf"]
-        assert cf["router_count"] >= 2  # both 9router and OmniRoute have @cf models
+        # 9router removed from downstream (meta-router now runs on :20131)
+        assert cf["router_count"] >= 1
         assert cf["total_models"] >= 1
 
 
@@ -161,13 +163,15 @@ class TestRouterStatePersistence:
             assert r.failure_count >= 0
 
     def test_save_and_load_failure_count(self, registry):
-        r = registry.get_router("9router")
-        registry.mark_unhealthy("9router", "timeout")
-        registry.mark_unhealthy("9router", "timeout")
+        router_name = DOWNSTREAM_ROUTERS[0]["name"]
+        r = registry.get_router(router_name)
+        registry.mark_unhealthy(router_name, "timeout")
+        registry.mark_unhealthy(router_name, "timeout")
         assert r.failure_count == 2
         registry.save_state()
 
         fresh = RouterRegistry(DOWNSTREAM_ROUTERS)
         fresh.load_state()
-        restored = fresh.get_router("9router")
+        restored = fresh.get_router(router_name)
+        assert restored is not None
         assert restored.failure_count == 2

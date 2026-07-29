@@ -57,7 +57,7 @@ def test_mark_error_model_specific(tmp_registry: HealthRegistry):
         "type": "rate_limit",
         "status": 429,
         "model_specific": True,
-        "cooldown": {"type": "rate_limit", "duration_hours": 1},
+        "cooldown": {"type": "rate_limit", "hours": 1},
     }, model="test-provider/some-model")
     assert tmp_registry.is_provider_healthy("test-provider")  # provider still healthy
     assert not tmp_registry.is_model_available("test-provider/some-model")  # model in cooldown
@@ -68,7 +68,7 @@ def test_force_healthy(tmp_registry: HealthRegistry):
         "type": "rate_limit",
         "status": 429,
         "model_specific": False,
-        "cooldown": {"type": "rate_limit", "duration_hours": 24},
+        "cooldown": {"type": "rate_limit", "hours": 24},
     })
     tmp_registry.force_healthy("test-provider")
     assert tmp_registry.is_provider_healthy("test-provider")
@@ -106,7 +106,7 @@ def test_persistence(tmp_path: Path):
     r2 = HealthRegistry(filepath=fp)
     assert r2.is_provider_healthy("provider-a")
     assert r2.is_provider_healthy("provider-b")
-    assert not r2.is_provider_healthy("nonexistent")
+    assert r2.is_provider_healthy("nonexistent")  # unknown = assume healthy
 
 
 def test_load_corrupted_file(tmp_path: Path):

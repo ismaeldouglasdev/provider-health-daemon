@@ -27,6 +27,10 @@ ERROR_PATTERNS = [
     ),
     # Auth / subscription
     (
+        r"HTTP 402|402 Payment Required",
+        lambda m: {"hours": 0, "minutes": 0, "type": "payment_required", "permanent": True},
+    ),
+    (
         r'InvalidSubscription.*does not have a v',
         lambda m: {"hours": 1, "minutes": 0, "type": "invalid_subscription", "recheck": True},
     ),

@@ -7,8 +7,9 @@ from typing import Optional
 class CooldownCalculator:
     """Calculate cooldown duration based on error type and failure history."""
 
-    def __init__(self, max_hours: int = 24):
+    def __init__(self, max_hours: int = 24, max_failures: int = 30):
         self.max_cooldown = timedelta(hours=max_hours)
+        self.max_failures = max_failures
 
     def calculate(
         self,
@@ -44,6 +45,18 @@ class CooldownCalculator:
         recheck = bool(error_info.get("recheck", False))
 
         failures = current_failures + 1
+
+        if failures >= self.max_failures:
+            return {
+                "until": None,
+                "duration_hours": float("inf"),
+                "type": f"{error_type} (max_failures)",
+                "permanent": True,
+                "model_specific": model_specific,
+                "backoff_applied": False,
+                "failures": failures,
+                "recheck": False,
+            }
 
         if permanent:
             return {

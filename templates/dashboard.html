@@ -522,6 +522,48 @@
     .status-bar { gap: 10px; flex-wrap: wrap; }
     .tab { padding: 8px 10px; font-size: 11px; }
   }
+
+  .connection-dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; margin-right: 4px; flex-shrink: 0;
+  }
+  .connection-dot.live { background: var(--green); box-shadow: 0 0 6px rgba(63,185,80,0.4); }
+  .connection-dot.dead { background: var(--red); box-shadow: 0 0 6px rgba(248,81,73,0.4); }
+
+  .filter-chips {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
+  .filter-chip {
+    font-size: 12px; font-weight: 500; padding: 4px 14px;
+    border-radius: 100px; cursor: pointer;
+    background: var(--card); color: var(--text-muted);
+    border: 1px solid var(--border);
+    transition: all 0.15s ease; user-select: none;
+  }
+  .filter-chip:hover { border-color: rgba(255,255,255,0.15); color: var(--text); }
+  .filter-chip.active { background: rgba(88,166,255,0.15); color: var(--blue); border-color: var(--blue); }
+
+  .btn-reactivate {
+    font-size: 11px; padding: 2px 10px; border-radius: 100px;
+    border: 1px solid var(--yellow); background: transparent;
+    color: var(--yellow); cursor: pointer; font-family: inherit;
+    font-weight: 500; transition: all 0.15s ease;
+  }
+  .btn-reactivate:hover { background: rgba(210,153,34,0.15); }
+
+  .card.compact .metric-row { padding: 2px 0; font-size: 12px; }
+  .card.compact .reliability-bar { display: none; }
+  .card.compact .card-body { margin-top: 4px; }
+  .card.compact .card-title,
+  .card.compact .card-badge { font-size: 12px; }
+  .compact-toggle {
+    font-size: 12px; display: inline-flex; align-items: center; gap: 4px;
+    cursor: pointer; color: var(--text-muted); user-select: none;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 100px; padding: 4px 14px; font-family: inherit;
+    font-weight: 500; transition: all 0.15s ease;
+  }
+  .compact-toggle.active { color: var(--blue); border-color: var(--blue); background: rgba(88,166,255,0.08); }
 </style>
 </head>
 <body>
@@ -532,6 +574,10 @@
     <div class="subtitle" id="lastUpdate">Connecting...</div>
   </div>
   <div class="status-bar">
+    <span id="connectionStatus" class="flex flex-center gap-8" style="font-size:13px;color:var(--text-muted);">
+      <span class="connection-dot dead" id="connectionDot"></span>
+      <span id="connectionLabel">Connecting...</span>
+    </span>
     <span id="healthSummary" class="subtitle">loading...</span>
     <span id="readyCount" class="subtitle">Ready: -/-</span>
     <span class="uptime" id="uptimeDisplay"></span>
@@ -559,9 +605,16 @@
 
 <!-- PROVIDERS TAB -->
 <div id="tab-providers" class="tab-content active">
-  <div class="flex flex-center gap-12 mb-12">
+  <div class="flex flex-center gap-12 mb-12" style="flex-wrap:wrap;">
     <input type="text" id="providerSearch" class="search-input" placeholder="Filter providers..." oninput="filterProviders()" />
     <span class="text-xs text-muted" id="providerFilterCount"></span>
+    <div class="filter-chips">
+      <span class="filter-chip active" data-status="all" onclick="setFilter('all')">All</span>
+      <span class="filter-chip" data-status="healthy" onclick="setFilter('healthy')">Healthy</span>
+      <span class="filter-chip" data-status="cooldown" onclick="setFilter('cooldown')">Cooldown</span>
+      <span class="filter-chip" data-status="probing" onclick="setFilter('probing')">Probing</span>
+    </div>
+    <span class="compact-toggle" id="compactToggle" onclick="toggleCompact()">Condensed</span>
   </div>
   <div id="readySection" style="display:none;" class="mb-16">
     <div class="text-sm fw-600 mb-8" style="color:var(--green);">Ready Providers</div>
@@ -683,6 +736,10 @@ let providersCache = {};
 let requestHistory = [];
 let chartHistory = [];
 let sseSource = null;
+let _sseRetryDelay = 1000;
+let _compactView = false;
+let _filterStatus = 'all';
+let _cooldownLogTimestamps = {};
 
 // ── Tabs ──────────────────────────────────────────
 function switchTab(name) {
@@ -696,7 +753,7 @@ document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => switchTab(t.dataset.tab));
 });
 
-// ── SSE Connection (single) ───────────────────────
+// ── SSE Connection ────────────────────────────────
 function connectSSE() {
   if (sseSource) { sseSource.close(); }
 
@@ -732,13 +789,31 @@ function connectSSE() {
   });
 
   sseSource.onerror = function() {
-    document.getElementById('lastUpdate').textContent = 'Disconnected — retrying...';
-    setTimeout(connectSSE, 3000);
+    setConnectionStatus(false);
+    const delay = _sseRetryDelay;
+    _sseRetryDelay = Math.min(_sseRetryDelay * 2, 30000);
+    setTimeout(connectSSE, delay);
   };
 
   sseSource.onopen = function() {
+    _sseRetryDelay = 1000;
+    setConnectionStatus(true);
     document.getElementById('lastUpdate').textContent = 'Live';
   };
+}
+
+function setConnectionStatus(connected) {
+  const dot = document.getElementById('connectionDot');
+  const label = document.getElementById('connectionLabel');
+  const upd = document.getElementById('lastUpdate');
+  if (connected) {
+    dot.className = 'connection-dot live';
+    label.textContent = 'Live';
+    upd.textContent = upd.textContent === 'Connecting...' ? 'Live' : upd.textContent;
+  } else {
+    dot.className = 'connection-dot dead';
+    label.textContent = 'Disconnected';
+  }
 }
 
 // ── Update Dashboard ──────────────────────────────
@@ -786,11 +861,16 @@ function updateDashboard(data) {
   renderProviders(providers);
   renderReadyProviders(providers);
 
-  // Log cooldown status changes
+  // Log cooldown status changes (throttled: max once per 60s per provider)
+  const now = Date.now();
   for (const [name, p] of Object.entries(providers)) {
     if (p.status === 'cooldown' && p.failures > 0) {
-      const reason = (p.reason || '').replace(/\s*\(probing\)/, '');
-      addLog(name + ': ' + p.status + ' (' + p.failures + ' failures' + (reason ? ' — ' + reason : '') + ')', 'warn');
+      const lastLog = _cooldownLogTimestamps[name] || 0;
+      if (now - lastLog > 60000) {
+        _cooldownLogTimestamps[name] = now;
+        const reason = (p.reason || '').replace(/\s*\(probing\)/, '');
+        addLog(name + ': ' + p.status + ' (' + p.failures + ' failures' + (reason ? ' — ' + reason : '') + ')', 'warn');
+      }
     }
   }
 }
@@ -849,9 +929,17 @@ function filterProviders() {
   const grid = document.getElementById('providerGrid');
   const query = (document.getElementById('providerSearch').value || '').toLowerCase().trim();
 
-  const entries = query
-    ? _allProviderEntries.filter(([name]) => name.toLowerCase().includes(query))
-    : _allProviderEntries;
+  let entries = _allProviderEntries;
+
+  // Apply status filter
+  if (_filterStatus !== 'all') {
+    entries = entries.filter(([name, p]) => p.status === _filterStatus);
+  }
+
+  // Apply search query
+  if (query) {
+    entries = entries.filter(([name]) => name.toLowerCase().includes(query));
+  }
 
   document.getElementById('providerFilterCount').textContent = query
     ? entries.length + ' / ' + _allProviderEntries.length + ' providers'
@@ -875,8 +963,9 @@ function filterProviders() {
     const scoreColor = score >= 80 ? '#3fb950' : score >= 50 ? '#d29922' : '#f85149';
 
     const statusText = status + (cooldownRemaining > 0 ? ' (' + formatDuration(cooldownRemaining) + ')' : '');
+    const canReactivate = status === 'cooldown' || status === 'disabled';
 
-    return '<div class="card">' +
+    return '<div class="card' + (_compactView ? ' compact' : '') + '">' +
       '<div class="card-header">' +
         '<div class="flex flex-center gap-8">' +
           '<span class="status-dot dot-' + statusColor + '"></span>' +
@@ -884,6 +973,7 @@ function filterProviders() {
         '</div>' +
         '<div class="flex flex-center gap-8">' +
           (risk ? '<span class="card-badge" style="background:' + (riskBgs[risk]||'rgba(248,81,73,0.12)') + ';color:' + (riskColors[risk]||'#f85149') + ';">' + risk + '</span>' : '') +
+          (canReactivate ? '<button class="btn-reactivate" onclick="reactivateProvider(\'' + name.replace(/'/g, "\\'") + '\', this)">Reactivate</button>' : '') +
           '<span class="card-badge" style="background:rgba(255,255,255,0.06);color:var(--text-muted);">' + statusText + '</span>' +
         '</div>' +
       '</div>' +
@@ -911,6 +1001,43 @@ function filterProviders() {
       '</div>' +
     '</div>';
   }).join('');
+}
+
+// ── Status Filter ───────────────────────────────
+function setFilter(status) {
+  _filterStatus = status;
+  document.querySelectorAll('.filter-chip').forEach(c => {
+    c.classList.toggle('active', c.dataset.status === status);
+  });
+  filterProviders();
+}
+
+// ── Compact Toggle ──────────────────────────────
+function toggleCompact() {
+  _compactView = !_compactView;
+  document.getElementById('compactToggle').classList.toggle('active', _compactView);
+  filterProviders();
+}
+
+// ── Reactivate Provider ─────────────────────────
+async function reactivateProvider(name, btn) {
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const res = await fetch('/api/admin/reactivate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: name }),
+    });
+    if (!res.ok) { const err = await res.json(); throw new Error(err.error); }
+    addLog(name + ' reactivated by admin', 'success');
+    btn.textContent = 'Done';
+    setTimeout(() => { btn.textContent = 'Reactivated'; btn.style.borderColor = 'var(--green)'; btn.style.color = 'var(--green)'; }, 500);
+  } catch (err) {
+    addLog('Reactivate ' + name + ' failed: ' + err.message, 'error');
+    btn.textContent = 'Failed';
+    btn.disabled = false;
+  }
 }
 
 // ── Request History ───────────────────────────────
@@ -1261,17 +1388,14 @@ async function saveWebhook() {
 
 async function testWebhook() {
   const url = document.getElementById('webhookUrl').value.trim();
-  if (!url) { document.getElementById('webhookStatus').textContent = 'Enter a URL first'; return; }
+  if (!url) { document.getElementById('webhookStatus').textContent = 'Enter and save a URL first'; return; }
   document.getElementById('webhookStatus').textContent = 'Sending test...';
   try {
-    const res = await fetch('/api/alert/webhook', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
-    });
-    if (!res.ok) throw new Error('Failed to save');
-    addLog('Test webhook sent to ' + url, 'info');
-    document.getElementById('webhookStatus').textContent = 'Test complete (check your webhook receiver)';
+    const res = await fetch('/api/alert/webhook/test', { method: 'POST' });
+    if (!res.ok) { const e = await res.json(); throw new Error(e.error || 'Failed'); }
+    const data = await res.json();
+    addLog('Test webhook result: ' + data.status, 'info');
+    document.getElementById('webhookStatus').textContent = 'Test sent (status ' + data.code + ')';
   } catch (err) {
     document.getElementById('webhookStatus').textContent = 'Error: ' + err.message;
   }

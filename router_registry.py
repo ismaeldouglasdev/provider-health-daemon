@@ -62,16 +62,14 @@ class RouterRegistry:
         now = time.time()
         r.last_success = now
         r.cooldown_until = None
-        if r.health_status == "unknown" or r.health_status == "cooldown":
-            r.health_status = "probing"
-            r.consecutive_probes_ok = 1
-        elif r.health_status == "probing":
-            r.consecutive_probes_ok += 1
-            if r.consecutive_probes_ok >= 2:
-                r.health_status = "healthy"
-                r.consecutive_probes_ok = 0
-        elif r.health_status == "healthy":
+        if r.health_status == "healthy":
             r.consecutive_probes_ok = 0
+        elif r.health_status == "probing":
+            r.consecutive_probes_ok = 0
+            r.health_status = "healthy"
+        else:
+            r.consecutive_probes_ok = 0
+            r.health_status = "healthy"
 
     def mark_unhealthy(self, name, error_type=None):
         r = self._routers.get(name)
@@ -80,7 +78,8 @@ class RouterRegistry:
         r.health_status = "cooldown"
         r.last_failure = time.time()
         r.failure_count += 1
-        backoff = min(60 * (2 ** (r.failure_count - 1)), 86400)
+        capped = min(r.failure_count, 10)
+        backoff = min(60 * (2 ** (capped - 1)), 86400)
         r.cooldown_until = r.last_failure + backoff
 
     def mark_probing(self, name):
@@ -193,3 +192,7 @@ class RouterRegistry:
                 r.health_status = saved.get("health_status", "unknown")
                 r.cooldown_until = saved.get("cooldown_until")
                 r.failure_count = saved.get("failure_count", 0)
+                r.consecutive_probes_ok = saved.get("consecutive_probes_ok", 0)
+                r.last_success = saved.get("last_success")
+                r.last_failure = saved.get("last_failure")
+                r.models = saved.get("models", [])

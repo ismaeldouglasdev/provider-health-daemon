@@ -18,9 +18,11 @@ class HealthRegistry:
     PROVIDERS = "providers"
     MODELS = "models"
 
+    MAX_FAILURES = 30  # after this many consecutive failures, permanently disable
+
     def __init__(self, filepath=None):
         self.filepath = Path(filepath) if filepath else HEALTH_FILE
-        self.cooldown = CooldownCalculator()
+        self.cooldown = CooldownCalculator(max_failures=self.MAX_FAILURES)
         self._data = self._load()
 
     def _empty_state(self) -> dict:
@@ -190,28 +192,56 @@ class HealthRegistry:
         self._data[self.PROVIDERS].pop(provider, None)
         self.mark_healthy(provider, model)
 
+    def _garbage_entry(self, entry: dict) -> bool:
+        """Check if entry is garbage (missing required fields)."""
+        if entry.get("until") is None and entry.get("status") not in ("healthy", "disabled"):
+            return True
+        return False
+
     def cleanup_expired(self) -> int:
         """Promote expired cooldowns to probing. Returns count of promotions."""
         count = 0
         now = datetime.now(timezone.utc)
 
         for provider, entry in list(self._data[self.PROVIDERS].items()):
+            if self._garbage_entry(entry):
+                del self._data[self.PROVIDERS][provider]
+                log.info(f"🗑️ Removed garbage entry for {provider}")
+                continue
             if entry.get("status") == "cooldown" and self.cooldown.is_expired(
                 entry.get("until")
             ):
-                entry["status"] = "probing"
-                entry["reason"] = f"{entry.get('reason')} (probing)"
+                failures = entry.get("failures", 0)
+                if failures >= self.MAX_FAILURES:
+                    entry["status"] = "disabled"
+                    entry["reason"] = f"{entry.get('reason')} (max_failures)"
+                    entry["until"] = None
+                    log.info(f"🔒 {provider} cooldown expired → disabled ({failures} failures)")
+                else:
+                    entry["status"] = "probing"
+                    entry["reason"] = f"{entry.get('reason')} (probing)"
+                    log.info(f"🔄 {provider} cooldown expired → probing")
                 count += 1
-                log.info(f"🔄 {provider} cooldown expired → probing")
 
         for model_id, entry in list(self._data[self.MODELS].items()):
+            if self._garbage_entry(entry):
+                del self._data[self.MODELS][model_id]
+                log.info(f"🗑️ Removed garbage entry for {model_id}")
+                continue
             if entry.get("status") == "cooldown" and self.cooldown.is_expired(
                 entry.get("until")
             ):
-                entry["status"] = "probing"
-                entry["reason"] = f"{entry.get('reason')} (probing)"
+                failures = entry.get("failures", 0)
+                if failures >= self.MAX_FAILURES:
+                    entry["status"] = "disabled"
+                    entry["reason"] = f"{entry.get('reason')} (max_failures)"
+                    entry["until"] = None
+                    log.info(f"🔒 {model_id} cooldown expired → disabled ({failures} failures)")
+                else:
+                    entry["status"] = "probing"
+                    entry["reason"] = f"{entry.get('reason')} (probing)"
+                    log.info(f"🔄 {model_id} cooldown expired → probing")
                 count += 1
-                log.info(f"🔄 {model_id} cooldown expired → probing")
 
         if count > 0:
             self._save()

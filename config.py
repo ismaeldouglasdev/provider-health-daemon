@@ -36,15 +36,6 @@ COMBO_REFRESH_INTERVAL = 60  # seconds between combo list refresh
 # auth format: {"header": "X-API-Key", "value": "..."}
 _RAW_DOWNSTREAM_ROUTERS = [
     {
-        "name": "9router",
-        "url": "http://localhost:20131",
-        "priority": 1,
-        "weight": 2,
-        "health_check_path": "/v1/models",
-        "timeout": 2.0,
-        "auth": None,
-    },
-    {
         "name": "OmniRoute",
         "url": "http://localhost:20128",
         "priority": 1,

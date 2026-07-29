@@ -192,6 +192,9 @@ class TestRealHTTPIntegration:
 
     def test_model_not_available_on_any_router(self, proxy_server):
         url, proxy, _ = proxy_server
+        # Disable all routers so meta-router has no healthy target → 503
+        for r in proxy.meta_registry.get_all_routers():
+            proxy.meta_registry.mark_unhealthy(r.name, "admin_disable")
         req_body = json.dumps({
             "model": "unknown-model/v1",
             "messages": [{"role": "user", "content": "test"}],

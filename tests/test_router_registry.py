@@ -20,14 +20,10 @@ def test_get_router_missing(mock_registry):
     assert mock_registry.get_router("nonexistent") is None
 
 
-def test_mark_healthy_flapping_guard(mock_registry):
+def test_mark_healthy_single_probe_becomes_healthy(mock_registry):
     r = mock_registry.get_router("router-a")
     assert r.health_status == "unknown"
     mock_registry.mark_healthy("router-a", ["gpt-4"])
-    assert r.health_status == "probing"
-    assert r.consecutive_probes_ok == 1
-    assert mock_registry.get_healthy_routers() == []
-    mock_registry.mark_healthy("router-a", ["gpt-4", "claude-3"])
     assert r.health_status == "healthy"
     assert len(mock_registry.get_healthy_routers()) == 1
 

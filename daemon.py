@@ -445,7 +445,7 @@ def main():
     dashboard.metrics_store = shared_metrics
     dashboard.health_registry = registry
     dashboard.metrics_persistence = metrics_persist
-    dashboard.meta_registry = meta_registry
+    dashboard.router_registry = meta_registry  # RouterRegistry for /api/routers + /api/providers/aggregated
     dashboard.model_catalog = model_catalog
     dashboard.start()
 

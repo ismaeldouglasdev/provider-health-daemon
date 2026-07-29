@@ -47,7 +47,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
     router_registry = None  # for aggregated providers view
     metrics_persistence = None
     webhook_url = ""
-    sse_clients: list = []  # class-level shared list
+    sse_clients: list = []
+    _sse_lock = threading.Lock()
+
+    @classmethod
+    def _clean_stale_sse(cls):
+        now = time.time()
+        stale = [c for c in cls.sse_clients if isinstance(c, str) and c.startswith("client_")]
+        cls.sse_clients.clear()
+        cls.sse_clients.extend(stale[-50:])
 
     # Silence default logging
     def log_message(self, fmt, *args):
@@ -196,9 +204,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # Health check
         if path == "/api/health":
-            self._send_json({"status": "ok"})
+            checks = {"server": "ok"}
+            if self.health_registry:
+                try:
+                    self.health_registry.status_summary()
+                    checks["registry"] = "ok"
+                except Exception:
+                    checks["registry"] = "error"
+            if self.metrics_store:
+                checks["metrics"] = "ok"
+            if self.router_registry:
+                checks["routers"] = "ok"
+            overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+            self._send_json({"status": overall, "checks": checks})
+            return
+
+        if path == "/api/config":
+            import config as cfg
+            sanitized = {}
+            for key in dir(cfg):
+                if key.isupper() and not key.startswith("_"):
+                    val = getattr(cfg, key)
+                    if isinstance(val, (str, int, float, bool, list)):
+                        sanitized[key] = val
+            self._send_json({"config": sanitized})
             return
 
         if path == "/api/routers":
@@ -337,7 +367,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return 0.0
 
     def _handle_sse(self):
-        """Server-Sent Events: push real-time metrics updates."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -347,6 +376,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         client_id = f"client_{time.time()}"
         DashboardHandler.sse_clients.append(client_id)
+        DashboardHandler._clean_stale_sse()
         prev_state: dict[str, str] = {}
 
         try:
@@ -413,32 +443,60 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "empty body"}, 400)
             return
 
+        if path == "/api/alert/webhook/test":
+            url = DashboardHandler.webhook_url
+            if not url:
+                self._send_json({"error": "no webhook configured"}, 400)
+                return
+            import urllib.request
+            test_payload = json.dumps({
+                "event": "test",
+                "message": "This is a test webhook from provider-health-daemon",
+                "timestamp": time.time(),
+            }).encode()
+            try:
+                req = urllib.request.Request(url, data=test_payload, headers={"Content-Type": "application/json"})
+                resp = urllib.request.urlopen(req, timeout=10)
+                self._send_json({"status": "sent", "code": resp.getcode()})
+                log.info("Test webhook sent to %s (status %d)", url, resp.getcode())
+            except Exception as e:
+                log.warning("Test webhook to %s failed: %s", url, e)
+                self._send_json({"status": "failed", "error": str(e)}, 502)
+            return
+
         # Admin: manually reactivate a provider from cooldown
         if path == "/api/admin/reactivate":
+            provider_name = ""
+            
             content_len = int(self.headers.get("Content-Length", 0))
-            if content_len < 1:
-                self._send_json({"error": "empty body"}, 400)
+            if content_len > 0:
+                body = self.rfile.read(content_len)
+                try:
+                    data = json.loads(body)
+                    provider_name = data.get("provider", "").strip()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    self._send_json({"error": "invalid JSON"}, 400)
+                    return
+            
+            if not provider_name:
+                provider_name = self._get_param("provider", "").strip()
+            
+            if not provider_name:
+                self._send_json({"error": "provider name required (POST body or ?provider=name)"}, 400)
                 return
-            body = self.rfile.read(content_len)
-            try:
-                data = json.loads(body)
-                provider_name = data.get("provider", "").strip()
-                if not provider_name:
-                    self._send_json({"error": "provider name required"}, 400)
-                    return
-                if not self.health_registry:
-                    self._send_json({"error": "health registry not available"}, 503)
-                    return
-                self.health_registry.force_healthy(provider_name)
-                provider_status = self.health_registry._data.get("providers", {}).get(provider_name, {})
-                log.info("Admin reactivated provider: %s", provider_name)
-                self._send_json({
-                    "status": "ok",
-                    "provider": provider_name,
-                    "new_status": provider_status.get("status", "healthy"),
-                })
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                self._send_json({"error": "invalid JSON"}, 400)
+            
+            if not self.health_registry:
+                self._send_json({"error": "health registry not available"}, 503)
+                return
+            
+            self.health_registry.force_healthy(provider_name)
+            provider_status = self.health_registry._data.get("providers", {}).get(provider_name, {})
+            log.info("Admin reactivated provider: %s", provider_name)
+            self._send_json({
+                "status": "ok",
+                "provider": provider_name,
+                "new_status": provider_status.get("status", "healthy"),
+            })
             return
 
         # Admin: get router info (current routing state)
