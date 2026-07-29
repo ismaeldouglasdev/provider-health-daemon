@@ -91,6 +91,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
     smart_router: SmartRouter = None
     meta_registry: RouterRegistry = None  # set by server for router-of-routers
     meta_selector: MetaRouterSelector = None  # set by server
+    opener: urllib.request.OpenerDirector = None  # connection-pooled opener, set by server
     _combo_cache: list[str] = []
     _combo_cache_time: float = 0
 
@@ -150,7 +151,8 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         req.add_header("Accept", "text/event-stream, application/json")
 
         try:
-            with urllib.request.urlopen(req, timeout=180) as resp:
+            opener = self.opener if self.opener is not None else urllib.request.build_opener()
+            with opener.open(req, timeout=180) as resp:
                 resp_body = resp.read()
                 is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                 if is_chat:
@@ -240,7 +242,8 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_url = fallback_router.url.rstrip("/") + path
                         fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
-                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=180)
+                        opener = self.opener if self.opener is not None else urllib.request.build_opener()
+                        fallback_resp = opener.open(fallback_req, timeout=180)
                         fb_body = fallback_resp.read()
                         self.send_response(fallback_resp.status)
                         for k, v in fallback_resp.headers.items():
@@ -631,6 +634,8 @@ class HealthProxyServer:
         self.smart_router = SmartRouter(self.metrics_store)
         self.meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
         self.meta_selector = MetaRouterSelector(self.meta_registry)
+        self._server = None
+        self._opener = urllib.request.build_opener()
 
     def get_handler(self):
         """Create handler class with shared registry + metrics + meta-router."""
@@ -657,7 +662,9 @@ class HealthProxyServer:
         class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
             daemon_threads = True
 
-        server = ThreadingHTTPServer(("0.0.0.0", self.port), handler)
+        self._server = ThreadingHTTPServer(("0.0.0.0", self.port), handler)
+        HandlerWithRegistry = handler
+        HandlerWithRegistry.opener = self._opener
 
         log.info(f"🛡️  Health Proxy → http://localhost:{self.port}")
         log.info(f"   Forwarding → {len(DOWNSTREAM_ROUTERS)} routers (via meta-router)")
@@ -676,7 +683,11 @@ class HealthProxyServer:
         log.info("")
 
         try:
-            server.serve_forever()
+            self._server.serve_forever()
         except KeyboardInterrupt:
-            server.shutdown()
-            log.info("Health Proxy encerrado.")
+            self.shutdown()
+
+    def shutdown(self):
+        if self._server:
+            self._server.shutdown()
+            log.info("Health Proxy server shut down")

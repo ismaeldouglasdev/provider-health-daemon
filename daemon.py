@@ -12,7 +12,9 @@ Runs in parallel:
 import atexit
 import json
 import logging
+import logging.handlers
 import os
+import signal
 import sys
 import threading
 import time
@@ -73,22 +75,38 @@ class StructuredFormatter(logging.Formatter):
 
 
 def setup_logging(json_logs: bool = True, level: int = logging.INFO) -> None:
-    handler = logging.StreamHandler()
+    root = logging.getLogger()
+    root.handlers = []
+    root.setLevel(level)
+
+    # Stdout
+    sh = logging.StreamHandler()
     if json_logs:
-        handler.setFormatter(StructuredFormatter())
+        sh.setFormatter(StructuredFormatter())
     else:
-        handler.setFormatter(
+        sh.setFormatter(
             logging.Formatter(
                 fmt="%(asctime)s HEALTH %(levelname)s %(message)s",
                 datefmt="%H:%M:%S",
             )
         )
-    root = logging.getLogger()
-    root.handlers = [handler]
-    root.setLevel(level)
+    root.addHandler(sh)
+
+    # Rotating file
+    log_dir = Path.home() / ".9router"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    fh = logging.handlers.RotatingFileHandler(
+        log_dir / "health-daemon.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=3,
+    )
+    fh.setFormatter(StructuredFormatter())
+    root.addHandler(fh)
 
 
 log = logging.getLogger("health-daemon")
+
+shutdown_event = threading.Event()
 
 
 # ── Audit / metrics ──────────────────────────────────────────────────
@@ -133,8 +151,9 @@ def log_health_summary(registry: HealthRegistry) -> None:
 
 
 def audit_loop(registry: HealthRegistry, interval_seconds: int = 60) -> None:
-    while True:
-        time.sleep(interval_seconds)
+    while not shutdown_event.is_set():
+        if shutdown_event.wait(interval_seconds):
+            break
         try:
             log_health_summary(registry)
         except Exception as e:
@@ -153,7 +172,7 @@ def monitor_access_log(metrics_store):
     last_size = ACCESS_LOG_PATH.stat().st_size
     pending_request = {}  # model -> start_time tracking
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             current_size = ACCESS_LOG_PATH.stat().st_size
             if current_size > last_size:
@@ -253,8 +272,9 @@ def monitor_logs(registry: HealthRegistry):
 
     def prober():
         interval = PROBER_INTERVAL_MINUTES * 60
-        while True:
-            time.sleep(interval)
+        while not shutdown_event.is_set():
+            if shutdown_event.wait(interval):
+                break
             try:
                 promoted = registry.cleanup_expired()
                 if promoted:
@@ -282,7 +302,7 @@ def monitor_logs(registry: HealthRegistry):
 
     last_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             current_size = LOG_PATH.stat().st_size
             if current_size > last_size:
@@ -331,7 +351,7 @@ def alerter_loop(registry):
     if not HAS_ALERTER:
         return
     alerter = Alerter()
-    while True:
+    while not shutdown_event.is_set():
         try:
             transitions = alerter.check_transitions(registry._data)
             for t in transitions:
@@ -408,7 +428,7 @@ def main():
     metrics_persist = MetricsPersistence()
 
     def metrics_snapshot_loop():
-        while True:
+        while not shutdown_event.is_set():
             try:
                 providers = {}
                 if hasattr(registry, '_data'):
@@ -417,7 +437,8 @@ def main():
                 metrics_persist.snapshot(providers, global_stats)
             except Exception as e:
                 log.error(f"Snapshot error: {e}")
-            time.sleep(metrics_persist.interval)
+            if shutdown_event.wait(metrics_persist.interval):
+                break
 
     threading.Thread(
         target=metrics_snapshot_loop,
@@ -449,6 +470,15 @@ def main():
             name="alerter",
         ).start()
 
+    # ── Signal handlers for graceful shutdown ─────────────────────────
+    def _signal_handler(signum, frame):
+        if shutdown_event.is_set():
+            return  # already shutting down
+        log.info(f"Signal {signum} received, shutting down gracefully...")
+        shutdown_event.set()
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     # Start dashboard server (web UI)
     dashboard = DashboardServer(port=DASHBOARD_PORT)
     dashboard.metrics_store = shared_metrics
@@ -458,12 +488,42 @@ def main():
     dashboard.model_catalog = model_catalog
     dashboard.start()
 
-    # Start HTTP proxy (blocking)
+    # Start HTTP proxy in background thread so main thread can wait on shutdown
     server = HealthProxyServer(port=HEALTH_PROXY_PORT, metrics_store=shared_metrics)
     server.registry = registry
     server.meta_registry = meta_registry
     server.meta_selector = meta_selector
-    server.run()
+    proxy_thread = threading.Thread(target=server.run, daemon=False, name="proxy")
+    proxy_thread.start()
+
+    log.info("Daemon ready — waiting for signals", extra={"event": "daemon_ready"})
+    shutdown_event.wait()  # block until SIGTERM/SIGINT
+
+    # ── Graceful shutdown sequence ────────────────────────────────────
+    log.info("Shutting down...", extra={"event": "shutdown_start"})
+
+    # 1. Stop probe loop
+    router_probe.stop()
+    probe_thread.join(timeout=5)
+
+    # 2. Persist router state
+    try:
+        meta_registry.save_state()
+        log.info("Router state persisted", extra={"event": "persist_router_state"})
+    except Exception as e:
+        log.error(f"Failed to persist router state: {e}")
+
+    # 3. Stop proxy server
+    server.shutdown()
+    proxy_thread.join(timeout=5)
+
+    # 4. Stop dashboard server
+    if dashboard.server:
+        dashboard.server.shutdown()
+    if dashboard.thread:
+        dashboard.thread.join(timeout=5)
+
+    log.info("Shutdown complete", extra={"event": "shutdown_done"})
 
 
 if __name__ == "__main__":
