@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,7 @@ class HealthRegistry:
     def __init__(self, filepath=None):
         self.filepath = Path(filepath) if filepath else HEALTH_FILE
         self.cooldown = CooldownCalculator(max_failures=self.MAX_FAILURES)
+        self._lock = threading.RLock()
         self._data = self._load()
 
     def _empty_state(self) -> dict:
@@ -49,10 +51,12 @@ class HealthRegistry:
     # ── Read API ─────────────────────────────────────────────────────
 
     def get_provider(self, name: str) -> dict:
-        return self._data[self.PROVIDERS].get(name, {})
+        with self._lock:
+            return self._data[self.PROVIDERS].get(name, {})
 
     def get_model(self, model_id: str) -> dict:
-        return self._data[self.MODELS].get(model_id, {})
+        with self._lock:
+            return self._data[self.MODELS].get(model_id, {})
 
     def is_provider_healthy(self, name: str) -> bool:
         """Provider is usable right now."""
@@ -95,13 +99,14 @@ class HealthRegistry:
 
     def mark_healthy(self, provider: str, model: Optional[str] = None) -> None:
         """Record successful request."""
-        if model:
-            self._data[self.MODELS][model] = self._healthy_entry(provider, model)
+        with self._lock:
+            if model:
+                self._data[self.MODELS][model] = self._healthy_entry(provider, model)
 
-        entry = self._healthy_entry(provider)
-        self._data[self.PROVIDERS][provider] = entry
-        self._save()
-        log.debug(f"✓ {provider}{'/' + model if model else ''} → healthy")
+            entry = self._healthy_entry(provider)
+            self._data[self.PROVIDERS][provider] = entry
+            self._save()
+            log.debug(f"✓ {provider}{'/' + model if model else ''} → healthy")
 
     def mark_error(
         self,
@@ -110,59 +115,59 @@ class HealthRegistry:
         model: Optional[str] = None,
     ) -> None:
         """Apply cooldown from parsed error."""
-        # Model-specific vs provider-wide
-        if error_info.get("model_specific") and model:
-            current = self.get_model(model)
-            current_failures = current.get("failures", 0)
-            current_until = None
-            if current.get("until"):
-                try:
-                    current_until = datetime.fromisoformat(current["until"])
-                except ValueError:
-                    pass
-            result = self.cooldown.calculate(
-                error_info, current_failures, current_until
-            )
-            entry = {
-                "status": "disabled" if result["permanent"] else "cooldown",
-                "until": result.get("until"),
-                "reason": result["type"],
-                "failures": result["failures"],
-                "backoff_applied": result["backoff_applied"],
-                "provider": provider,
-                "model": model,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._data[self.MODELS][model] = entry
-            log.info(f"⚠ {model} → cooldown {result['duration_hours']:.1f}h ({result['type']})")
-        else:
-            # Provider-wide
-            current = self.get_provider(provider)
-            current_failures = current.get("failures", 0)
-            current_until = None
-            if current.get("until"):
-                try:
-                    current_until = datetime.fromisoformat(current["until"])
-                except ValueError:
-                    pass
-            result = self.cooldown.calculate(
-                error_info, current_failures, current_until
-            )
-            entry = {
-                "status": "disabled" if result["permanent"] else "cooldown",
-                "until": result.get("until"),
-                "reason": result["type"],
-                "failures": result["failures"],
-                "backoff_applied": result["backoff_applied"],
-                "models": list(
-                    set(self._provider_models(provider))  # inherit existing
-                ),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._data[self.PROVIDERS][provider] = entry
-            log.info(f"⚠ {provider} → cooldown {result['duration_hours']:.1f}h ({result['type']})")
+        with self._lock:
+            if error_info.get("model_specific") and model:
+                current = self.get_model(model)
+                current_failures = current.get("failures", 0)
+                current_until = None
+                if current.get("until"):
+                    try:
+                        current_until = datetime.fromisoformat(current["until"])
+                    except ValueError:
+                        pass
+                result = self.cooldown.calculate(
+                    error_info, current_failures, current_until
+                )
+                entry = {
+                    "status": "disabled" if result["permanent"] else "cooldown",
+                    "until": result.get("until"),
+                    "reason": result["type"],
+                    "failures": result["failures"],
+                    "backoff_applied": result["backoff_applied"],
+                    "provider": provider,
+                    "model": model,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._data[self.MODELS][model] = entry
+                log.info(f"⚠ {model} → cooldown {result['duration_hours']:.1f}h ({result['type']})")
+            else:
+                # Provider-wide
+                current = self.get_provider(provider)
+                current_failures = current.get("failures", 0)
+                current_until = None
+                if current.get("until"):
+                    try:
+                        current_until = datetime.fromisoformat(current["until"])
+                    except ValueError:
+                        pass
+                result = self.cooldown.calculate(
+                    error_info, current_failures, current_until
+                )
+                entry = {
+                    "status": "disabled" if result["permanent"] else "cooldown",
+                    "until": result.get("until"),
+                    "reason": result["type"],
+                    "failures": result["failures"],
+                    "backoff_applied": result["backoff_applied"],
+                    "models": list(
+                        set(self._provider_models(provider))  # inherit existing
+                    ),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._data[self.PROVIDERS][provider] = entry
+                log.info(f"⚠ {provider} → cooldown {result['duration_hours']:.1f}h ({result['type']})")
 
-        self._save()
+            self._save()
 
     @staticmethod
     def _healthy_entry(provider: str, model: Optional[str] = None) -> dict:
@@ -187,10 +192,11 @@ class HealthRegistry:
 
     def force_healthy(self, provider: str, model: Optional[str] = None) -> None:
         """Admin override: reset to healthy."""
-        if model:
-            self._data[self.MODELS].pop(model, None)
-        self._data[self.PROVIDERS].pop(provider, None)
-        self.mark_healthy(provider, model)
+        with self._lock:
+            if model:
+                self._data[self.MODELS].pop(model, None)
+            self._data[self.PROVIDERS].pop(provider, None)
+            self.mark_healthy(provider, model)
 
     def _garbage_entry(self, entry: dict) -> bool:
         """Check if entry is garbage (missing required fields)."""
@@ -200,63 +206,65 @@ class HealthRegistry:
 
     def cleanup_expired(self) -> int:
         """Promote expired cooldowns to probing. Returns count of promotions."""
-        count = 0
-        now = datetime.now(timezone.utc)
+        with self._lock:
+            count = 0
+            now = datetime.now(timezone.utc)
 
-        for provider, entry in list(self._data[self.PROVIDERS].items()):
-            if self._garbage_entry(entry):
-                del self._data[self.PROVIDERS][provider]
-                log.info(f"🗑️ Removed garbage entry for {provider}")
-                continue
-            if entry.get("status") == "cooldown" and self.cooldown.is_expired(
-                entry.get("until")
-            ):
-                failures = entry.get("failures", 0)
-                if failures >= self.MAX_FAILURES:
-                    entry["status"] = "disabled"
-                    entry["reason"] = f"{entry.get('reason')} (max_failures)"
-                    entry["until"] = None
-                    log.info(f"🔒 {provider} cooldown expired → disabled ({failures} failures)")
-                else:
-                    entry["status"] = "probing"
-                    entry["reason"] = f"{entry.get('reason')} (probing)"
-                    log.info(f"🔄 {provider} cooldown expired → probing")
-                count += 1
+            for provider, entry in list(self._data[self.PROVIDERS].items()):
+                if self._garbage_entry(entry):
+                    del self._data[self.PROVIDERS][provider]
+                    log.info(f"Removed garbage entry for {provider}")
+                    continue
+                if entry.get("status") == "cooldown" and self.cooldown.is_expired(
+                    entry.get("until")
+                ):
+                    failures = entry.get("failures", 0)
+                    if failures >= self.MAX_FAILURES:
+                        entry["status"] = "disabled"
+                        entry["reason"] = f"{entry.get('reason')} (max_failures)"
+                        entry["until"] = None
+                        log.info(f"Lock {provider} cooldown expired -> disabled ({failures} failures)")
+                    else:
+                        entry["status"] = "probing"
+                        entry["reason"] = f"{entry.get('reason')} (probing)"
+                        log.info(f"Rotate {provider} cooldown expired -> probing")
+                    count += 1
 
-        for model_id, entry in list(self._data[self.MODELS].items()):
-            if self._garbage_entry(entry):
-                del self._data[self.MODELS][model_id]
-                log.info(f"🗑️ Removed garbage entry for {model_id}")
-                continue
-            if entry.get("status") == "cooldown" and self.cooldown.is_expired(
-                entry.get("until")
-            ):
-                failures = entry.get("failures", 0)
-                if failures >= self.MAX_FAILURES:
-                    entry["status"] = "disabled"
-                    entry["reason"] = f"{entry.get('reason')} (max_failures)"
-                    entry["until"] = None
-                    log.info(f"🔒 {model_id} cooldown expired → disabled ({failures} failures)")
-                else:
-                    entry["status"] = "probing"
-                    entry["reason"] = f"{entry.get('reason')} (probing)"
-                    log.info(f"🔄 {model_id} cooldown expired → probing")
-                count += 1
+            for model_id, entry in list(self._data[self.MODELS].items()):
+                if self._garbage_entry(entry):
+                    del self._data[self.MODELS][model_id]
+                    log.info(f"Removed garbage entry for {model_id}")
+                    continue
+                if entry.get("status") == "cooldown" and self.cooldown.is_expired(
+                    entry.get("until")
+                ):
+                    failures = entry.get("failures", 0)
+                    if failures >= self.MAX_FAILURES:
+                        entry["status"] = "disabled"
+                        entry["reason"] = f"{entry.get('reason')} (max_failures)"
+                        entry["until"] = None
+                        log.info(f"Lock {model_id} cooldown expired -> disabled ({failures} failures)")
+                    else:
+                        entry["status"] = "probing"
+                        entry["reason"] = f"{entry.get('reason')} (probing)"
+                        log.info(f"Rotate {model_id} cooldown expired -> probing")
+                    count += 1
 
-        if count > 0:
-            self._save()
+            if count > 0:
+                self._save()
         return count
 
     def status_summary(self) -> dict:
         """Return counts per status."""
-        statuses = {"healthy": 0, "cooldown": 0, "probing": 0, "disabled": 0}
-        for name, entry in self._data[self.PROVIDERS].items():
-            st = entry.get("status", "healthy")
-            statuses[st] = statuses.get(st, 0) + 1
+        with self._lock:
+            statuses = {"healthy": 0, "cooldown": 0, "probing": 0, "disabled": 0}
+            for entry in self._data[self.PROVIDERS].values():
+                st = entry.get("status", "healthy")
+                statuses[st] = statuses.get(st, 0) + 1
 
-        expired = sum(
-            1
-            for e in self._data[self.PROVIDERS].values()
-            if e.get("status") == "cooldown" and self.cooldown.is_expired(e.get("until"))
-        )
-        return {"by_status": statuses, "expired_ready": expired}
+            expired = sum(
+                1
+                for e in self._data[self.PROVIDERS].values()
+                if e.get("status") == "cooldown" and self.cooldown.is_expired(e.get("until"))
+            )
+            return {"by_status": statuses, "expired_ready": expired}
