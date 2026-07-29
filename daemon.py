@@ -365,6 +365,15 @@ def main():
 
     registry = HealthRegistry()
 
+    # ── Startup validation ────────────────────────────────────────────
+    if not DOWNSTREAM_ROUTERS:
+        log.warning("DOWNSTREAM_ROUTERS is empty — no downstream routers configured")
+    else:
+        meta_self = f"http://localhost:{HEALTH_PROXY_PORT}"
+        for r in DOWNSTREAM_ROUTERS:
+            if r["url"].rstrip("/") == meta_self:
+                log.warning(f"Router '{r['name']}' URL points to self ({meta_self}) — misconfiguration")
+
     # ── Router-of-routers infrastructure (Wave 2) ─────────────────────
     meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
     meta_registry.load_state()  # Restore previous router health states
