@@ -65,11 +65,14 @@ class RouterRegistry:
         if r.health_status == "healthy":
             r.consecutive_probes_ok = 0
         elif r.health_status == "probing":
-            r.consecutive_probes_ok = 0
-            r.health_status = "healthy"
+            r.consecutive_probes_ok += 1
+            if r.consecutive_probes_ok >= 2:
+                r.health_status = "healthy"
+                r.consecutive_probes_ok = 0
         else:
-            r.consecutive_probes_ok = 0
-            r.health_status = "healthy"
+            # First success after cooldown/unknown: set to probing, require 2nd probe
+            r.consecutive_probes_ok = 1
+            r.health_status = "probing"
 
     def mark_unhealthy(self, name, error_type=None):
         r = self._routers.get(name)
