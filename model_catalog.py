@@ -1,5 +1,10 @@
 from config import MAX_MODEL_CATALOG
-from sanitizer import sanitize_model_id
+
+
+def _escape_model_id(model_id: str) -> str:
+    if not model_id or not isinstance(model_id, str):
+        return ""
+    return model_id.replace("<", "&lt;").replace(">", "&gt;").strip()
 
 
 class ModelCatalog:
@@ -12,15 +17,15 @@ class ModelCatalog:
             keys = sorted(catalog.keys())[:MAX_MODEL_CATALOG]
             catalog = {k: catalog[k] for k in keys}
         
-        sanitized = {}
+        escaped = {}
         for model_id, entry in catalog.items():
-            clean_id = sanitize_model_id(model_id)
+            clean_id = _escape_model_id(model_id)
             if clean_id:
-                sanitized[clean_id] = {
+                escaped[clean_id] = {
                     "model_id": clean_id,
                     "router_origins": entry.get("router_origins", []),
                 }
-        return sanitized
+        return escaped
 
     def get_models_list(self):
         catalog = self.get_catalog()
