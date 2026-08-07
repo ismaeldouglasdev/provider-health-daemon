@@ -30,6 +30,7 @@ MAX_COOLDOWN_HOURS = 24  # cap exponential backoff
 
 # ── Smart Router ─────────────────────────────────────────────────────
 COMBO_REFRESH_INTERVAL = 60  # seconds between combo list refresh
+COMBO_CACHE_FILE = Path.home() / ".9router" / "combo_cache.json"  # last-good catalog fallback
 
 # ── Meta-Router: Downstream Routers ──────────────────────────────────
 # Each entry: {name, url, priority(int, lower=first), health_check_path(str), timeout(float), weight(int), auth(dict|None)}
@@ -41,8 +42,8 @@ _RAW_DOWNSTREAM_ROUTERS = [
         "priority": 1,
         "weight": 1,
         "health_check_path": "/v1/models",
-        "timeout": 2.0,
-        "auth": None,
+        "timeout": 15.0,
+        "auth": {"header": "Authorization", "value": f"Bearer {os.environ.get('NINEROUTER_KEY', '')}"},
     },
     {
         "name": "Kiro",
@@ -50,14 +51,14 @@ _RAW_DOWNSTREAM_ROUTERS = [
         "priority": 2,
         "weight": 1,
         "health_check_path": "/v1/models",
-        "timeout": 2.0,
-        "auth": {"header": "X-API-Key", "value": os.environ.get("KRI_KEY", "")},
+        "timeout": 5.0,
+        "auth": {"header": "Authorization", "value": f"Bearer {os.environ.get('KRI_KEY', '')}"},
     },
 ]
 
 # ── Meta-Router: Probe Settings ──────────────────────────────────────
 PROBER_INTERVAL_SECONDS = 30       # how often to probe routers for health
-PROBE_TIMEOUT = 2.0                # seconds per health check request
+PROBE_TIMEOUT = 15.0              # seconds per health check request (must be > /v1/models latency with 1000+ models)
 PROBE_MAX_WORKERS = 5              # thread pool size for parallel probes
 MAX_MODEL_CATALOG = 500            # cap on catalog size after dedup
 

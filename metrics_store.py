@@ -18,6 +18,27 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# Error types caused by the CLIENT's request (bad params, unsupported fields,
+# malformed body) — NOT provider health problems. They must stay visible in
+# errors_by_type for debugging, but must not inflate failed_requests/error_rate
+# (which feed provider health scoring and cooldowns).
+NON_PENALIZING_ERROR_TYPES = {"request_invalid"}
+
+# Account-access errors: won't self-heal in the scoring window. Aggregated
+# separately by the dashboard so access problems (auth/credits/subscription)
+# are visible without polluting provider health metrics.
+ACCESS_ERROR_TYPES = {
+    "subscription_level",
+    "no_credit",
+    "no_credentials",
+    "payment_required",
+    "paid_required",
+    "auth_invalid",
+    "invalid_subscription",
+    "monthly_limit",
+    "daily_free_exhausted",
+}
+
 
 @dataclass
 class RequestRecord:
@@ -135,10 +156,11 @@ class MetricsStore:
             pm.total_requests += 1
             if r.success:
                 pm.successful_requests += 1
-            else:
+            elif r.error_type not in NON_PENALIZING_ERROR_TYPES:
                 pm.failed_requests += 1
-                if r.error_type:
-                    pm.errors_by_type[r.error_type] += 1
+
+            if r.error_type:
+                pm.errors_by_type[r.error_type] += 1
 
             pm.tokens_in += r.tokens_in
             pm.tokens_out += r.tokens_out
@@ -212,6 +234,7 @@ class MetricsStore:
         """Aggregate across all providers."""
         total_req = sum(pm.total_requests for pm in agg.values())
         total_ok = sum(pm.successful_requests for pm in agg.values())
+        total_failed = sum(pm.failed_requests for pm in agg.values())
         total_tokens_in = sum(pm.tokens_in for pm in agg.values())
         total_tokens_out = sum(pm.tokens_out for pm in agg.values())
         total_dur = sum(pm.total_duration_ms for pm in agg.values())
@@ -219,8 +242,8 @@ class MetricsStore:
         return {
             "total_requests": total_req,
             "successful": total_ok,
-            "failed": total_req - total_ok,
-            "error_rate": round((total_req - total_ok) / total_req, 4) if total_req else 0,
+            "failed": total_failed,
+            "error_rate": round(total_failed / total_req, 4) if total_req else 0,
             "tokens_in": total_tokens_in,
             "tokens_out": total_tokens_out,
             "total_tokens": total_tokens_in + total_tokens_out,
@@ -249,3 +272,58 @@ class MetricsStore:
     def get_provider_list(self) -> list[str]:
         """Get list of all known providers."""
         return list(set(r.provider for r in self.records))
+
+    def get_access_errors(self, window_seconds: int = 300) -> dict:
+        """Aggregate account-access errors (auth/credit/subscription).
+
+        These are errors that won't self-heal in the scoring window. They are
+        reported separately from provider health metrics so the dashboard can
+        surface access problems (missing credits, expired auth, wrong plan)
+        without polluting error_rate / health scoring.
+
+        Returns:
+            {
+              "window_seconds": int,
+              "total": int,            # total access-error records
+              "providers": int,        # distinct providers affected
+              "by_provider": {
+                  "<provider>": {
+                      "total": int,
+                      "types": {"<error_type>": int, ...},
+                      "last_seen": float,   # most recent occurrence
+                      "models": ["<model>", ...],   # distinct models affected
+                  },
+                  ...
+              },
+            }
+        """
+        records = self._window_records(window_seconds)
+        access_records = [r for r in records if r.error_type in ACCESS_ERROR_TYPES]
+
+        by_provider: dict[str, dict] = {}
+        for r in access_records:
+            entry = by_provider.setdefault(
+                r.provider,
+                {"total": 0, "types": defaultdict(int), "last_seen": 0.0, "models": []},
+            )
+            entry["total"] += 1
+            entry["types"][r.error_type] += 1
+            if r.timestamp > entry["last_seen"]:
+                entry["last_seen"] = r.timestamp
+            if r.model not in entry["models"]:
+                entry["models"].append(r.model)
+
+        return {
+            "window_seconds": window_seconds,
+            "total": len(access_records),
+            "providers": len(by_provider),
+            "by_provider": {
+                name: {
+                    "total": entry["total"],
+                    "types": dict(entry["types"]),
+                    "last_seen": entry["last_seen"],
+                    "models": entry["models"],
+                }
+                for name, entry in by_provider.items()
+            },
+        }

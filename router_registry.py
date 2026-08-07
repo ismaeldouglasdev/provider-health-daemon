@@ -62,6 +62,7 @@ class RouterRegistry:
         now = time.time()
         r.last_success = now
         r.cooldown_until = None
+        r.failure_count = 0  # reset on success so history reflects actual failures
         if r.health_status == "healthy":
             r.consecutive_probes_ok = 0
         elif r.health_status == "probing":

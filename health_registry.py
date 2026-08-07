@@ -1,7 +1,9 @@
 """Provider health registry — persistent state for cooldown management."""
 
+import copy
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,7 +48,22 @@ class HealthRegistry:
     def _save(self) -> None:
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(self._data, indent=2, default=str)
-        self.filepath.write_text(text)
+        # Atomic write: tmp file in the SAME directory (same filesystem so
+        # os.replace is atomic) + fsync before rename. A crash mid-write then
+        # leaves the previous valid file instead of a truncated/corrupt one.
+        tmp = self.filepath.with_name(self.filepath.name + ".tmp")
+        try:
+            with tmp.open("w") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.filepath)
+        except OSError as e:
+            log.error(f"Failed to save health file: {e}")
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ── Read API ─────────────────────────────────────────────────────
 
@@ -268,3 +285,8 @@ class HealthRegistry:
                 if e.get("status") == "cooldown" and self.cooldown.is_expired(e.get("until"))
             )
             return {"by_status": statuses, "expired_ready": expired}
+
+    def snapshot(self) -> dict:
+        """Deep copy of full state, safe for concurrent readers (dashboard, alerter)."""
+        with self._lock:
+            return copy.deepcopy(self._data)

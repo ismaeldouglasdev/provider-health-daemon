@@ -599,6 +599,7 @@
   <button class="tab" data-tab="charts">Charts</button>
   <button class="tab" data-tab="router">Router</button>
   <button class="tab" data-tab="aggregated">Aggregated <span class="tab-badge" id="aggCount">-</span></button>
+  <button class="tab" data-tab="access">Access <span class="tab-badge" id="accessCount">-</span></button>
   <button class="tab" data-tab="logs">Live Logs</button>
   <button class="tab" data-tab="config">Config</button>
 </div>
@@ -696,6 +697,24 @@
     <span class="text-xs text-muted" id="aggStatus" style="margin-left:auto;">Loading...</span>
   </div>
   <div class="grid" id="aggGrid"></div>
+</div>
+
+<!-- ACCESS ERRORS TAB -->
+<div id="tab-access" class="tab-content">
+  <div class="flex flex-center gap-12 mb-12">
+    <span class="text-sm text-muted">Account-access errors (auth / credits / subscription) — excluded from health scoring</span>
+    <span class="text-xs text-muted" id="accessStatus" style="margin-left:auto;">Loading...</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Provider</th><th>Errors</th><th>Types</th><th>Models</th><th>Last seen</th>
+      </tr></thead>
+      <tbody id="accessBody">
+        <tr><td colspan="5" class="loading">Loading access errors...</td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
 <!-- LOGS TAB -->
@@ -1491,6 +1510,48 @@ async function fetchAggregated() {
   }
 }
 
+// ── Access Errors ────────────────────────────────
+async function fetchAccessErrors() {
+  try {
+    const res = await fetch('/api/access-errors?window=300');
+    const data = await res.json();
+    const byProvider = data.by_provider || {};
+    const total = data.total || 0;
+    const providers = data.providers || 0;
+    document.getElementById('accessCount').textContent = providers;
+    document.getElementById('accessStatus').textContent =
+      total + ' errors across ' + providers + ' providers, ' + new Date().toLocaleTimeString();
+
+    const body = document.getElementById('accessBody');
+    const entries = Object.entries(byProvider);
+    if (entries.length === 0) {
+      body.innerHTML = '<tr><td colspan="5" class="loading">No access errors in the last 5 min</td></tr>';
+      return;
+    }
+
+    body.innerHTML = entries.map(([name, p]) => {
+      const types = Object.entries(p.types || {}).map(([t, c]) =>
+        '<span style="display:inline-block;background:rgba(255,167,38,0.12);color:var(--yellow);border-radius:100px;padding:2px 10px;font-size:11px;margin:2px;">' +
+          escHtml(t) + ' × ' + c +
+        '</span>'
+      ).join('');
+      const models = (p.models || []).map(m =>
+        '<span style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:11px;font-family:monospace;">' + escHtml(m) + '</span>'
+      ).join(' ');
+      const lastSeen = p.last_seen ? new Date(p.last_seen * 1000).toLocaleTimeString() : '-';
+      return '<tr>' +
+        '<td><strong>' + escHtml(name) + '</strong></td>' +
+        '<td>' + p.total + '</td>' +
+        '<td>' + types + '</td>' +
+        '<td class="text-xs text-muted" style="max-width:260px;overflow:hidden;text-overflow:ellipsis;">' + models + '</td>' +
+        '<td class="text-xs text-muted">' + lastSeen + '</td>' +
+      '</tr>';
+    }).join('');
+  } catch (err) {
+    document.getElementById('accessStatus').textContent = 'Failed: ' + err.message;
+  }
+}
+
 // ── Boot ──────────────────────────────────────────
 connectSSE();
 fetchHistory();
@@ -1498,9 +1559,11 @@ fetchHistoryChart();
 loadWebhookConfig();
 fetchRouterInfo();
 fetchAggregated();
+fetchAccessErrors();
 setInterval(fetchHistoryChart, 30000);
 setInterval(fetchRouterInfo, 10000);
 setInterval(fetchAggregated, 15000);
+setInterval(fetchAccessErrors, 15000);
 </script>
 </body>
 </html>

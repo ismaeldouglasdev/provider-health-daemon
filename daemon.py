@@ -15,6 +15,7 @@ import logging
 import logging.handlers
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -27,10 +28,18 @@ PROMPT_LIMITER_DIR = Path.home() / "Desktop" / "code_study" / "MeusProjetos" / "
 if str(PROMPT_LIMITER_DIR) not in sys.path:
     sys.path.insert(0, str(PROMPT_LIMITER_DIR))
 
+# Ensure local dir takes priority over prompt-limiter (which has its own smart_router.py)
+_local_dir = str(Path(__file__).parent)
+if _local_dir in sys.path:
+    sys.path.remove(_local_dir)
+sys.path.insert(0, _local_dir)
+
 from config import (
     HEALTH_PROXY_PORT, PROBER_INTERVAL_MINUTES, ACCESS_LOG_PATH, DASHBOARD_PORT,
-    DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE
+    DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE, NINEROUTER_URL, NINEROUTER_KEY,
+    PROBE_TIMEOUT,
 )
+from smart_router import SmartRouter
 from health_registry import HealthRegistry
 from router_registry import RouterRegistry
 from router_probe import RouterProbe
@@ -264,11 +273,16 @@ def monitor_access_log(metrics_store):
 LOG_PATH = Path.home() / ".9router" / "logs" / "error.log"
 
 
-def monitor_logs(registry: HealthRegistry):
-    """Tail error.log and feed parsed errors to registry."""
+def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None):
+    """Tail error.log and feed parsed errors to registry.
+
+    router_names: set of lowercased router names to exclude from provider tracking.
+                  Routers are tracked by RouterRegistry, not HealthRegistry.
+    """
     if not LOG_PATH.exists():
         log.warning("9router error.log not found, log monitoring disabled")
         return
+    router_names = router_names or set()
 
     def prober():
         interval = PROBER_INTERVAL_MINUTES * 60
@@ -292,6 +306,75 @@ def monitor_logs(registry: HealthRegistry):
                 log.error(f"Prober error: {e}")
 
     threading.Thread(target=prober, daemon=True, name="prober").start()
+
+    def recovery_prober():
+        """Periodically test cooldown/probing providers to auto-recover them."""
+        combo_models = SmartRouter.get_default_combos()
+        provider_models: dict[str, list[str]] = {}
+        for cm in combo_models:
+            p = cm.split("/")[0]
+            provider_models.setdefault(p, []).append(cm)
+
+        interval = max(PROBER_INTERVAL_MINUTES * 60, 60)
+        while not shutdown_event.is_set():
+            if shutdown_event.wait(interval):
+                break
+            try:
+                summary = registry.status_summary()
+                cooldown_count = summary["by_status"].get("cooldown", 0)
+                probing_count = summary["by_status"].get("probing", 0)
+                if cooldown_count + probing_count == 0:
+                    continue
+
+                import urllib.request, json as _json
+
+                for provider, entry in list(registry.snapshot().get("providers", {}).items()):
+                    status = entry.get("status", "")
+                    if status not in ("cooldown", "probing"):
+                        continue
+                    if entry.get("failures", 0) >= HealthRegistry.MAX_FAILURES:
+                        continue  # don't probe permanently disabled
+                    if provider not in provider_models:
+                        continue  # don't know what model to test
+
+                    test_models = provider_models[provider]
+                    for test_model in test_models:
+                        probe_body = _json.dumps({
+                            "model": test_model,
+                            "messages": [{"role": "user", "content": "ping"}],
+                            "max_tokens": 1,
+                        }).encode()
+                        try:
+                            probe_req = urllib.request.Request(
+                                f"{NINEROUTER_URL}/v1/chat/completions",
+                                data=probe_body,
+                                headers={
+                                    "Content-Type": "application/json",
+                                    "Authorization": f"Bearer {NINEROUTER_KEY}",
+                                },
+                                method="POST",
+                            )
+                            with urllib.request.urlopen(probe_req, timeout=10) as probe_resp:
+                                if probe_resp.status == 200:
+                                    log.info(
+                                        "Auto-recovery: provider responded healthy",
+                                        extra={
+                                            "event": "provider_recovered",
+                                            "provider": provider,
+                                            "model": test_model,
+                                        },
+                                    )
+                                    registry.mark_healthy(provider)
+                                    METRICS.cooldowns_promoted += 1
+                                    break
+                        except (urllib.error.URLError, urllib.error.HTTPError):
+                            pass
+                        time.sleep(2)  # rate limit between probes
+
+            except Exception as e:
+                log.error(f"Recovery prober error: {e}")
+
+    threading.Thread(target=recovery_prober, daemon=True, name="recovery-prober").start()
 
     threading.Thread(
         target=audit_loop,
@@ -318,19 +401,23 @@ def monitor_logs(registry: HealthRegistry):
                     if parsed:
                         METRICS.errors_parsed += 1
                         provider = parsed.get("provider_hint", "unknown")
+                        if provider.lower() in router_names:
+                            continue
                         model = parsed.get("model_hint")
                         registry.mark_error(
                             provider=provider,
                             error_info=parsed,
                             model=model if parsed.get("model_specific") else None,
                         )
+                        METRICS.cooldowns_applied += 1
+                        parsed_info = parsed.get("cooldown") or parsed
                         log.warning(
                             "9router error parsed",
                             extra={
                                 "event": "error_parsed",
                                 "provider": provider,
                                 "model": model,
-                                "error_type": parsed.get("cooldown", {}).get("type"),
+                                "error_type": parsed_info.get("type"),
                                 "permanent": parsed.get("permanent"),
                                 "model_specific": parsed.get("model_specific"),
                             },
@@ -353,7 +440,7 @@ def alerter_loop(registry):
     alerter = Alerter()
     while not shutdown_event.is_set():
         try:
-            transitions = alerter.check_transitions(registry._data)
+            transitions = alerter.check_transitions(registry.snapshot())
             for t in transitions:
                 alerter.alert(t)
                 log.info(
@@ -371,6 +458,26 @@ def alerter_loop(registry):
 
 def main():
     setup_logging(json_logs=True, level=logging.INFO)
+
+    # ── Single-instance lock (prevents EADDRINUSE crash-loop class) ───
+    # A second daemon (e.g. spawned by systemd while an orphan holds the
+    # ports) exits cleanly with code 0, so systemd Restart=always does NOT
+    # enter a restart loop. The lock is released automatically on exit.
+    import fcntl
+    _lock_path = Path.home() / ".9router" / "daemon.lock"
+    try:
+        _lock_path.parent.mkdir(parents=True, exist_ok=True)
+        _lock_fd = open(_lock_path, "w")
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(f"{os.getpid()}\n")
+        _lock_fd.flush()
+    except OSError:
+        log.warning(
+            "Another provider-health-daemon instance is already running "
+            f"(lock {_lock_path} held). Exiting cleanly (code 0).",
+            extra={"event": "single_instance_skip", "pid": os.getpid()},
+        )
+        sys.exit(0)
 
     log.info(
         "Provider Health Daemon starting",
@@ -394,6 +501,46 @@ def main():
             if r["url"].rstrip("/") == meta_self:
                 log.warning(f"Router '{r['name']}' URL points to self ({meta_self}) — misconfiguration")
 
+    # ── Probe timeout sanity check (single-shot, boot only) ──────────
+    # Measures real latency of each router health endpoint; warns when the
+    # configured timeout leaves no headroom — the exact failure mode that
+    # produced 914 false failures on OmniRoute (2.0s timeout vs 2.7s latency).
+    import urllib.request as _urlreq
+    for r in DOWNSTREAM_ROUTERS:
+        timeout = r.get("timeout", PROBE_TIMEOUT)
+        try:
+            url = r["url"].rstrip("/") + r.get("health_check_path", "/v1/models")
+            req = _urlreq.Request(url, method="GET")
+            auth = r.get("auth")
+            if auth:
+                req.add_header(auth["header"], auth["value"])
+            req.add_header("Accept", "application/json")
+            t0 = time.monotonic()
+            with _urlreq.urlopen(req, timeout=timeout) as resp:
+                resp.read()
+            latency = time.monotonic() - t0
+            if timeout < latency * 1.5:
+                log.warning(
+                    f"Probe timeout for router '{r['name']}' is {timeout}s but actual latency is "
+                    f"{latency:.2f}s — health checks will falsely fail. Increase 'timeout' in config.py.",
+                    extra={
+                        "event": "probe_timeout_underestimate",
+                        "router": r["name"],
+                        "timeout": timeout,
+                        "latency": round(latency, 3),
+                    },
+                )
+            else:
+                log.info(
+                    f"Startup probe OK for router '{r['name']}' ({latency:.2f}s, timeout {timeout}s)",
+                    extra={"event": "startup_probe_ok", "router": r["name"], "latency": round(latency, 3)},
+                )
+        except Exception as e:
+            log.warning(
+                f"Startup probe failed for router '{r['name']}': {type(e).__name__} {e}",
+                extra={"event": "startup_probe_failed", "router": r["name"], "error": type(e).__name__},
+            )
+
     # ── Router-of-routers infrastructure (Wave 2) ─────────────────────
     meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
     meta_registry.load_state()  # Restore previous router health states
@@ -402,9 +549,78 @@ def main():
     
     # Start router health probe loop in background
     router_probe = RouterProbe(meta_registry)
+
+    _router_history_dir = Path.home() / ".9router" / "metrics_history"
+    _routers_ever_healthy = False
+    _all_down_alerted = False
+    _down_cycles = 0
+
+    def on_router_probe(results: dict) -> None:
+        """Log, persist history, and alert when every router goes down."""
+        nonlocal _routers_ever_healthy, _all_down_alerted, _down_cycles
+        routers = meta_registry.get_all_routers()
+        healthy = [r for r in routers if r.health_status == "healthy"]
+
+        try:
+            _router_history_dir.mkdir(parents=True, exist_ok=True)
+            hist_path = _router_history_dir / f"routers-{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+            with open(hist_path, "a") as f:
+                for r in routers:
+                    f.write(json.dumps({
+                        "ts": time.time(),
+                        "router": r.name,
+                        "status": r.health_status,
+                        "models_count": len(r.models or []),
+                        "failure_count": r.failure_count,
+                        "cooldown_until": r.cooldown_until,
+                    }) + "\n")
+        except Exception as e:
+            log.debug(f"Router history write failed: {e}")
+
+        log.debug(f"Router probe: {results}", extra={"event": "router_probe", "results": results})
+
+        if healthy:
+            if _all_down_alerted:
+                log.info("All routers recovered", extra={"event": "routers_recovered"})
+            _all_down_alerted = False
+            _down_cycles = 0
+            _routers_ever_healthy = True
+            return
+
+        if not routers:
+            return
+        _down_cycles += 1
+        should_alert = (_routers_ever_healthy and not _all_down_alerted) or _down_cycles == 3
+        if should_alert:
+            _all_down_alerted = True
+            detail = ", ".join(f"{r.name}={r.health_status}" for r in routers)
+            log.error(
+                f"ALL routers down ({_down_cycles} cycles): {detail}",
+                extra={"event": "all_routers_down", "routers": [r.name for r in routers]},
+            )
+            try:
+                subprocess.run(
+                    ["notify-send", "-a", "caelestia", "-u", "critical",
+                     "9Router: ALL routers down", detail],
+                    timeout=3,
+                )
+            except Exception:
+                pass
+            try:
+                inc_path = Path.home() / ".9router" / "logs" / "incidents.jsonl"
+                inc_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(inc_path, "a") as f:
+                    f.write(json.dumps({
+                        "ts": time.time(),
+                        "event": "all_routers_down",
+                        "routers": [{"name": r.name, "status": r.health_status} for r in routers],
+                    }) + "\n")
+            except Exception as e:
+                log.debug(f"Incident log write failed: {e}")
+
     probe_thread = threading.Thread(
         target=router_probe.probe_loop,
-        kwargs={"callback": lambda r: log.debug(f"Router probe: {r}", extra={"event": "router_probe", "results": r})},
+        kwargs={"callback": on_router_probe},
         daemon=True,
         name="router-probe",
     )
@@ -431,8 +647,8 @@ def main():
         while not shutdown_event.is_set():
             try:
                 providers = {}
-                if hasattr(registry, '_data'):
-                    providers = registry._data.get("providers", {})
+                if hasattr(registry, 'snapshot'):
+                    providers = registry.snapshot().get("providers", {})
                 global_stats = shared_metrics.get_all_stats(300).get("global", {})
                 metrics_persist.snapshot(providers, global_stats)
             except Exception as e:
@@ -454,9 +670,10 @@ def main():
     ).start()
 
     # ── Start error log monitor ──────────────────────────────────────
+    router_names = {r["name"].lower() for r in DOWNSTREAM_ROUTERS}
     threading.Thread(
         target=monitor_logs,
-        args=(registry,),
+        args=(registry, router_names),
         daemon=True,
         name="log-monitor",
     ).start()
@@ -493,6 +710,7 @@ def main():
     server.registry = registry
     server.meta_registry = meta_registry
     server.meta_selector = meta_selector
+    server.audit = METRICS
     proxy_thread = threading.Thread(target=server.run, daemon=False, name="proxy")
     proxy_thread.start()
 

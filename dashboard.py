@@ -159,6 +159,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"providers": {}, "total": 0})
             return
 
+        # Account-access errors (auth/credit/subscription) — separated from health
+        if path == "/api/access-errors":
+            window = int(self._get_param("window", "300"))
+            data = self.metrics_store.get_access_errors(window) if self.metrics_store else {
+                "window_seconds": window, "total": 0, "providers": 0, "by_provider": {},
+            }
+            self._send_json(data)
+            return
+
         # Recent request history
         if path == "/api/history":
             limit = int(self._get_param("limit", "50"))
@@ -253,7 +262,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/admin/router":
             providers = {}
             if self.health_registry:
-                reg = self.health_registry._data.get("providers", {})
+                reg = self.health_registry.snapshot().get("providers", {})
                 for name, entry in reg.items():
                     providers[name] = {
                         "status": entry.get("status", "unknown"),
@@ -305,7 +314,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         now = time.time()
 
         if self.health_registry:
-            reg = self.health_registry._data.get("providers", {})
+            reg = self.health_registry.snapshot().get("providers", {})
             for name, entry in reg.items():
                 until = entry.get("until")
                 remaining = 0
@@ -490,7 +499,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             
             self.health_registry.force_healthy(provider_name)
-            provider_status = self.health_registry._data.get("providers", {}).get(provider_name, {})
+            provider_status = self.health_registry.snapshot().get("providers", {}).get(provider_name, {})
             log.info("Admin reactivated provider: %s", provider_name)
             self._send_json({
                 "status": "ok",
@@ -503,7 +512,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/admin/router":
             providers = {}
             if self.health_registry:
-                reg = self.health_registry._data.get("providers", {})
+                reg = self.health_registry.snapshot().get("providers", {})
                 for name, entry in reg.items():
                     providers[name] = {
                         "status": entry.get("status", "unknown"),
@@ -556,7 +565,16 @@ class DashboardServer:
             daemon_threads = True
             allow_reuse_address = True
 
-        self.server = ThreadingServer(("0.0.0.0", self.port), handler)
+        try:
+            self.server = ThreadingServer(("0.0.0.0", self.port), handler)
+        except OSError as e:
+            if e.errno == 98:  # EADDRINUSE — another process holds this port
+                log.error(
+                    f"Dashboard port {self.port} already in use — a second daemon instance "
+                    "is likely running. Check 'ss -tlnp | grep 20132' and kill the orphan.",
+                    extra={"event": "dashboard_port_conflict", "port": self.port},
+                )
+            raise
 
         self.thread = threading.Thread(
             target=self.server.serve_forever,

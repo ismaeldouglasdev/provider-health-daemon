@@ -66,3 +66,55 @@ def test_single_router():
     r1 = sel.select_router()
     r2 = sel.select_router()
     assert r1.name == r2.name
+
+
+def test_weighted_selection_prefers_higher_weight(triple_registry):
+    """r1 has weight 2, r2/r3 weight 1 — over many picks r1 should lead."""
+    sel = MetaRouterSelector(triple_registry)
+    picks = [sel.select_router().name for _ in range(40)]
+    counts = {name: picks.count(name) for name in set(picks)}
+    assert counts["r1"] > counts["r2"]
+    assert counts["r1"] > counts["r3"]
+    # Ratio should be close to 2:1:1 (weighted, not equal)
+    assert abs(counts["r1"] / counts["r2"] - 2.0) < 0.6
+
+
+def test_on_success_resets_streak(triple_registry):
+    sel = MetaRouterSelector(triple_registry)
+    sel.on_failure("r1", "timeout")
+    assert sel.get_stats()["r1"]["consecutive_failures"] == 1
+    sel.on_success("r1")
+    assert sel.get_stats()["r1"]["consecutive_failures"] == 0
+    assert sel.get_stats()["r1"]["successes"] == 1
+
+
+def test_on_failure_tracks_stats(triple_registry):
+    sel = MetaRouterSelector(triple_registry)
+    sel.on_failure("r2", "timeout")
+    sel.on_failure("r2", "timeout")
+    stats = sel.get_stats()["r2"]
+    assert stats["failures"] == 2
+    assert stats["consecutive_failures"] == 2
+
+
+def test_flapping_router_excluded_until_streak_reset(triple_registry):
+    """Router with failures >= threshold is skipped while others are healthy."""
+    sel = MetaRouterSelector(triple_registry, failure_threshold=3)
+    # r1 gets 3 consecutive failures (but stays "healthy" in registry — simulate
+    # a router that recovered per probes but keeps failing at request time)
+    for _ in range(3):
+        sel.on_failure("r1", "timeout")
+        sel.on_success("r2")
+        sel.on_success("r3")
+    triple_registry.get_router("r1").health_status = "healthy"
+    picks = [sel.select_router().name for _ in range(20)]
+    assert "r1" not in picks
+    # After a success, r1 is back in rotation
+    sel.on_success("r1")
+    picks_after = {sel.select_router().name for _ in range(20)}
+    assert "r1" in picks_after
+
+
+def test_get_stats_empty_initially(triple_registry):
+    sel = MetaRouterSelector(triple_registry)
+    assert sel.get_stats() == {}
