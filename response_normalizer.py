@@ -51,11 +51,40 @@ def _normalize_chunk_text(text: str) -> str:
     return text.get("content", "") if isinstance(text, dict) else str(text)
 
 
+def _content_blocks_to_string(content) -> str:
+    """Convert array-of-content-blocks (Mistral new format) to plain string.
+
+    Mistral streams ``delta.content`` (or ``message.content``) as a list of
+    typed blocks::
+
+        [{"type": "reference", "reference_ids": []},
+         {"type": "text", "text": "Hello"}]
+
+    OpenAI-compatible clients expect a plain string, so extract the ``text``
+    of each ``type == "text"`` block and concatenate, ignoring non-text
+    blocks (reference, tool_calls, reasoning, etc.).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+            elif block is not None:
+                parts.append(str(block))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
 def normalize_sse_chunk(chunk: dict) -> dict:
     """Normalize a single SSE JSON chunk to OpenAI completion chunk shape.
 
     Handles variations:
       - {choices: [{delta: {content: "..."}}]}  (OpenAI standard)
+      - {choices: [{delta: {content: [{type: "text", text: "..."}, ...]}}]}
+                                              (Mistral content blocks)
       - {choices: [{text: "..."}]}               (some older APIs)
       - {token: {text: "..."}, ...}              (HuggingFace TGI style)
     """
@@ -66,13 +95,14 @@ def normalize_sse_chunk(chunk: dict) -> dict:
                 continue
             # Some APIs return {delta: {content:}} — already correct
             if "delta" in c and isinstance(c["delta"], dict):
-                pass  # Fine as-is
+                c["delta"]["content"] = _content_blocks_to_string(c["delta"].get("content"))
             # Some return {message: {content:}} instead of {delta:}
             elif "message" in c and isinstance(c["message"], dict):
                 c["delta"] = c.pop("message")
+                c["delta"]["content"] = _content_blocks_to_string(c["delta"].get("content"))
             # Some return {text: "..."} instead of {delta: {content: "..."}}
             elif "text" in c:
-                c["delta"] = {"content": c.pop("text")}
+                c["delta"] = {"content": _content_blocks_to_string(c.pop("text"))}
         return chunk
 
     # HuggingFace TGI style: {"token": {"text": "...", "special": false}, ...}
@@ -119,7 +149,7 @@ def _extract_content_from_choices(choices: list) -> str:
         if isinstance(msg, dict):
             content = msg.get("content", "")
             if content:
-                return content
+                return _content_blocks_to_string(content)
         if "text" in c:
             return c["text"]
     return ""
@@ -159,6 +189,10 @@ def normalize_response(body: str | bytes | dict) -> dict:
     if isinstance(body, (str, bytes)):
         if isinstance(body, bytes):
             body = body.decode("utf-8", errors="replace")
+        # 9router->glm glues "data: [DONE]" onto non-streaming JSON; strip before parse
+        glued = re.search(r"data:\s*\[DONE\]\s*$", body)
+        if glued:
+            body = body[: glued.start()].rstrip()
         data = json.loads(body)
     else:
         data = body
@@ -209,13 +243,18 @@ def _ensure_standard_choice(choice: dict) -> None:
     """Mutate a choice dict to ensure standard {'message': {'role', 'content'}} shape."""
     # Message already present
     if "message" in choice and isinstance(choice["message"], dict):
-        return
+        msg = choice["message"]
     # Delta → message
-    if "delta" in choice:
-        choice["message"] = choice.pop("delta")
+    elif "delta" in choice:
+        msg = choice["message"] = choice.pop("delta")
     # Text → message
-    if "text" in choice:
-        choice["message"] = {"role": "assistant", "content": choice.pop("text")}
+    elif "text" in choice:
+        msg = choice["message"] = {"role": "assistant", "content": choice.pop("text")}
+    else:
+        return
+    # Content blocks (Mistral new format) → plain string
+    if isinstance(msg.get("content"), list):
+        msg["content"] = _content_blocks_to_string(msg["content"])
 
 
 # ── Streaming passthrough / line-by-line normalization ───────────────

@@ -59,6 +59,66 @@ class TestNormalizeSSEChunk:
         result = normalize_sse_chunk(chunk)
         assert result["choices"][0]["delta"]["content"] == "fallback text"
 
+    def test_mistral_content_blocks_in_delta(self):
+        chunk = {
+            "id": "f3399968e12546b78859d3488de8239e",
+            "object": "chat.completion.chunk",
+            "created": 1786245718,
+            "model": "mistral-large-latest",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": [
+                            {"type": "reference", "reference_ids": []},
+                            {"type": "text", "text": '{"category'},
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        result = normalize_sse_chunk(chunk)
+        assert result["choices"][0]["delta"]["content"] == '{"category'
+
+    def test_mistral_content_blocks_multiple_text(self):
+        chunk = {
+            "id": "m2",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": [
+                            {"type": "text", "text": "Hello "},
+                            {"type": "text", "text": "world"},
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        result = normalize_sse_chunk(chunk)
+        assert result["choices"][0]["delta"]["content"] == "Hello world"
+
+    def test_mistral_content_blocks_in_message(self):
+        chunk = {
+            "id": "m3",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "full text"},
+                            {"type": "reference", "reference_ids": []},
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        result = normalize_sse_chunk(chunk)
+        assert result["choices"][0]["delta"]["content"] == "full text"
+
 
 class TestNormalizeResponse:
     def test_standard_passthrough(self):
@@ -102,6 +162,43 @@ class TestNormalizeResponse:
         result = normalize_response(resp)
         assert result["choices"][0]["message"]["content"] == "delta content"
 
+    def test_content_blocks_in_message(self):
+        resp = {
+            "id": "r7",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "non-stream "},
+                            {"type": "text", "text": "content blocks"},
+                            {"type": "reference", "reference_ids": []},
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        }
+        result = normalize_response(resp)
+        assert result["choices"][0]["message"]["content"] == "non-stream content blocks"
+
+    def test_content_blocks_without_usage(self):
+        resp = {
+            "id": "r8",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "no usage"}],
+                    },
+                }
+            ],
+        }
+        result = normalize_response(resp)
+        assert result["choices"][0]["message"]["content"] == "no usage"
+
     def test_from_json_string(self):
         resp_str = json.dumps({"choices": [{"message": {"content": "from string"}}]})
         result = normalize_response(resp_str)
@@ -111,6 +208,21 @@ class TestNormalizeResponse:
         resp_bytes = json.dumps({"choices": [{"message": {"content": "from bytes"}}]}).encode()
         result = normalize_response(resp_bytes)
         assert result["choices"][0]["message"]["content"] == "from bytes"
+
+    def test_glued_done_suffix_stripped(self):
+        body = '{"choices":[{"message":{"content":"TESTE"},"finish_reason":"stop"}]}data: [DONE]'
+        result = normalize_response(body)
+        assert result["choices"][0]["message"]["content"] == "TESTE"
+
+    def test_glued_done_suffix_with_trailing_newlines(self):
+        body = '{"choices":[{"message":{"content":"TESTE"},"finish_reason":"stop"}]}data: [DONE]\n\n'
+        result = normalize_response(body)
+        assert result["choices"][0]["message"]["content"] == "TESTE"
+
+    def test_glued_done_suffix_stripped_bytes(self):
+        body = '{"choices":[{"message":{"content":"TESTE"},"finish_reason":"stop"}]}data: [DONE]'
+        result = normalize_response(body.encode())
+        assert result["choices"][0]["message"]["content"] == "TESTE"
 
     def test_non_dict_returns_error(self):
         result = normalize_response([1, 2, 3])
