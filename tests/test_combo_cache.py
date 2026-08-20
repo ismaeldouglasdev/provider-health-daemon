@@ -12,12 +12,21 @@ from smart_router import SmartRouter
 def _reset_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(SmartRouter, "_combo_cache", [])
     monkeypatch.setattr(SmartRouter, "_combo_cache_time", 0.0)
+    monkeypatch.setattr(SmartRouter, "_disabled_cache", set())
+    monkeypatch.setattr(SmartRouter, "_disabled_cache_time", 0.0)
+    monkeypatch.setattr(SmartRouter, "_locked_models_cache", set())
+    monkeypatch.setattr(SmartRouter, "_locked_models_cache_time", 0.0)
+    monkeypatch.setattr(SmartRouter, "_conn_counts_cache", {})
+    monkeypatch.setattr(SmartRouter, "_conn_counts_cache_time", 0.0)
+    monkeypatch.setattr(SmartRouter, "_get_locked_model_ids", classmethod(lambda cls: set()))
+    monkeypatch.setattr(SmartRouter, "_get_connection_counts", classmethod(lambda cls: {}))
     monkeypatch.setattr(smart_router, "COMBO_CACHE_FILE", tmp_path / "combo_cache.json")
+    monkeypatch.setattr("catalog_sync.get_disabled_models", lambda: {})
 
 
 class TestComboCache:
     def test_catalog_success_writes_disk_cache(self, _reset_cache, tmp_path, monkeypatch):
-        catalog = ["groq/llama-3.3-70b-versatile", "nvidia/z-ai/glm-5.2"]
+        catalog = ["groq/llama-3.3-70b-versatile", "gh/gpt-4.1"]
         monkeypatch.setattr(SmartRouter, "_fetch_catalog_models", lambda: catalog)
 
         assert SmartRouter.get_default_combos() == catalog
@@ -50,15 +59,22 @@ class TestComboCache:
         combos = SmartRouter.get_default_combos()
         assert combos  # static list, no crash
 
-    def test_filter_removes_blocked_and_bare(self):
+    def test_filter_keeps_blocked_as_fallback_drops_bare(self):
+        """PERMANENTLY_BLOCKED providers stay in the pool as last-resort
+        fallbacks (rank_models applies the penalty); only @-prefixed and bare
+        ids are dropped."""
         ids = [
             "groq/llama-3.3-70b-versatile",
-            "kr/claude-sonnet-4.5",        # PERMANENTLY_BLOCKED
-            "anthropic/claude-sonnet-4",   # PERMANENTLY_BLOCKED
-            "@cf/meta/llama-3.1-8b",       # starts with @
-            "ollama",                      # bare id, no provider
+            "mistral/codestral-latest",    # PERMANENTLY_BLOCKED → fallback, kept
+            "anthropic/claude-sonnet-4",   # PERMANENTLY_BLOCKED → fallback, kept
+            "@cf/meta/llama-3.1-8b",       # starts with @ → dropped
+            "ollama",                      # bare id, no provider → dropped
         ]
-        assert SmartRouter._filter_static_models(ids) == ["groq/llama-3.3-70b-versatile"]
+        assert SmartRouter._filter_static_models(ids) == [
+            "groq/llama-3.3-70b-versatile",
+            "mistral/codestral-latest",
+            "anthropic/claude-sonnet-4",
+        ]
 
     def test_filter_dedupes_preserving_order(self):
         ids = ["groq/llama-3.3-70b-versatile", "groq/llama-3.3-70b-versatile"]

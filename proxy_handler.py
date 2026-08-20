@@ -81,7 +81,7 @@ def _strip_anthropic_caching(obj):
             _strip_anthropic_caching(item)
 
 try:
-    from prompt_limiter import count_tokens, get_model_limits, truncate_prompt
+    from prompt_limiter import count_tokens, get_explicit_limits, truncate_prompt
 except ImportError:
     # Fallback: simple implementations
     log.warning("prompt_limiter not available, using fallback token counter")
@@ -89,8 +89,8 @@ except ImportError:
     def count_tokens(text: str) -> int:
         return len(text) // 4
 
-    def get_model_limits(model_id: str) -> dict:
-        return {"tpm": 30000, "rpm": 60, "context": 8192}
+    def get_explicit_limits(model_id: str) -> dict | None:
+        return None
 
     def truncate_prompt(prompt: str, max_tokens: int) -> str:
         lines = prompt.split("\n")
@@ -262,6 +262,31 @@ def _is_empty_chat_response(resp_body: bytes) -> bool:
     return True
 
 
+def _normalize_sse_line(line: bytes) -> bytes:
+    """Normalize one SSE data line (content blocks → string) in place."""
+    if line.startswith(b"data: ") and b"[DONE]" not in line:
+        try:
+            chunk = json.loads(line[6:].decode("utf-8", errors="replace"))
+            return ("data: " + json.dumps(normalize_sse_chunk(chunk), ensure_ascii=False) + "\n").encode()
+        except (json.JSONDecodeError, ValueError):
+            return line
+    return line
+
+
+class EmptyUpstreamResponse(Exception):
+    """HTTP 200 with no usable content (dead model / exhausted quota).
+
+    Raised by _emit_upstream_response BEFORE anything is written to the
+    client so _forward can cooldown the model and retry the next healthy
+    one. Without this the empty 200 reaches the client and the session
+    completes silently (opencode "silent session" bug).
+    """
+
+    def __init__(self, body: bytes = b""):
+        super().__init__("empty upstream 200 response")
+        self.body = body
+
+
 class HealthProxyHandler(BaseHTTPRequestHandler):
     """HTTP handler with health-aware routing + smart model selection."""
 
@@ -292,19 +317,20 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
     _fallback_attempts: int = 0
     _tried_models: set = set()
 
-    def _global_fallback_chain(self, force_refresh: bool = False) -> list[str]:
+    def _global_fallback_chain(self, force_refresh: bool = False, force_broad: bool = False) -> list[str]:
         """Full-catalog fallback chain: healthy models ranked, best first.
 
         Unlike _get_combo_models (cached combo list), this ranks against the
         complete catalog so a 5xx from one model can fall back to any other
         healthy model upstream. force_refresh bypasses the combo cache TTL.
+        force_broad skips the 9router disabled registry (same as combo pool).
         """
         if not self.registry or not self.smart_router:
             return []
         if force_refresh:
             SmartRouter.invalidate_combo_cache()
         try:
-            catalog = SmartRouter.get_default_combos()
+            catalog = SmartRouter.get_default_combos(skip_disabled=force_broad)
         except Exception as e:
             log.warning(f"Global fallback: catalog fetch failed: {e}")
             return []
@@ -312,6 +338,13 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             return []
         if self.registry:
             catalog = self.registry.get_available_models(catalog)
+        if not catalog and not force_broad:
+            try:
+                catalog = SmartRouter.get_default_combos(skip_disabled=True)
+                if self.registry:
+                    catalog = self.registry.get_available_models(catalog)
+            except Exception as e:
+                log.warning(f"Global fallback broad catalog failed: {e}")
         if not catalog:
             return []
         return self.smart_router.fallback_chain(catalog, self.registry)
@@ -394,13 +427,25 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             log.warning(f"Response normalization failed: {e}", extra={"event": "normalize_error"})
             return resp_body
 
-    def _emit_upstream_response(self, resp, is_chat: bool, fallback_used: bool = False) -> bytes:
-        """Stream upstream response to client; returns normalized body sent.
+    def _emit_upstream_response(self, resp, is_chat: bool, fallback_used: bool = False,
+                                start_time=None) -> tuple[bytes, int]:
+        """Stream upstream response to client; returns (normalized body sent, ttft_ms).
 
         SSE (chat streaming) is forwarded chunk-by-chunk with Transfer-Encoding:
         chunked so the client sees tokens as they arrive (low TTFT) instead of
         waiting for the full body. Non-streaming bodies are buffered, normalized,
         and sent with Content-Length.
+
+        ttft_ms = time to first byte of the body (only meaningful for streaming,
+        measured at the first readline; 0 for non-streaming, where the caller
+        falls back to duration).
+
+        Empty-200 guard: dead models / exhausted quotas answer HTTP 200 with an
+        empty body. The health gate only inspects HTTP status, so emitting it
+        here would hand the client a silent empty completion (opencode "session
+        didn't respond"). The full body is read and checked BEFORE
+        send_response; an empty one raises EmptyUpstreamResponse so _forward
+        can fall back to the next healthy model.
         """
         if self.audit:
             self.audit.requests_proxied += 1
@@ -408,14 +453,37 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         content_type = resp.headers.get("Content-Type", "")
         is_streaming = is_chat and "event-stream" in content_type
         first_line = b""
+        ttft_ms = 0
         if is_streaming:
             # Upstreams sometimes advertise text/event-stream but return a
             # plain JSON body (9router->glm glues "data: [DONE]" onto it).
             # Detect real SSE by the "data: " prefix of the first line.
             first_line = resp.readline()
+            if start_time is not None:
+                ttft_ms = int((time.time() - start_time) * 1000)
             if not first_line.startswith(b"data: "):
                 is_streaming = False
                 content_type = "application/json"
+
+        # ── Empty-200 guard (chat only) ──────────────────────────────────
+        # Read the whole body up-front and raise before any byte reaches the
+        # client, so _forward can retry the next healthy model. Non-chat
+        # endpoints (embeddings etc.) are forwarded untouched.
+        sent: list[bytes] = []
+        body: bytes = b""
+        if is_chat:
+            if is_streaming:
+                for line in [first_line] + list(resp):
+                    sent.append(_normalize_sse_line(line))
+                if _is_empty_chat_response(b"".join(sent)):
+                    raise EmptyUpstreamResponse(b"".join(sent))
+            else:
+                body = first_line + resp.read()
+                body = self._normalize_response_body(body, content_type)
+                if _is_empty_chat_response(body):
+                    raise EmptyUpstreamResponse(body)
+        elif not is_streaming:
+            body = first_line + resp.read()
 
         self.send_response(resp.status)
         for k, v in resp.headers.items():
@@ -429,24 +497,13 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if is_streaming:
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            sent: list[bytes] = []
-            for line in [first_line] + list(resp):
-                if line.startswith(b"data: ") and b"[DONE]" not in line:
-                    try:
-                        chunk = json.loads(line[6:].decode("utf-8", errors="replace"))
-                        line = ("data: " + json.dumps(normalize_sse_chunk(chunk), ensure_ascii=False) + "\n").encode()
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                sent.append(line)
+            for line in sent:
                 self.wfile.write(f"{len(line):X}\r\n".encode() + line + b"\r\n")
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-            return b"".join(sent)
+            return b"".join(sent), ttft_ms
 
-        body = first_line + resp.read()
-        if is_chat:
-            body = self._normalize_response_body(body, content_type)
         # Response cache: store non-streaming 200 chat responses so identical
         # retries within TTL are served from cache (retry-after-crash on the
         # same prompt). Key was computed in do_POST from the ORIGINAL request
@@ -456,16 +513,41 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
-        return body
+        return body, ttft_ms
 
-    def _get_combo_models(self) -> list[str]:
-        """Get cached list of combo models from 9router."""
+    def _get_combo_models(self, force_broad: bool = False) -> list[str]:
+        """Get cached list of combo models from 9router, health-filtered."""
         now = time.time()
-        if now - self._combo_cache_time < COMBO_REFRESH_INTERVAL and self._combo_cache:
+        if (
+            not force_broad
+            and now - self._combo_cache_time < COMBO_REFRESH_INTERVAL
+            and self._combo_cache
+        ):
+            if self.registry:
+                avail = self.registry.get_available_models(self._combo_cache)
+                if avail:
+                    return avail
+                log.warning(
+                    "Cached combo pool models are all in cooldown; "
+                    "forcing broad refresh with full catalog"
+                )
+                SmartRouter.invalidate_combo_cache()
+                return self._get_combo_models(force_broad=True)
             return self._combo_cache
-        models = SmartRouter.get_default_combos()
+
+        models = SmartRouter.get_default_combos(skip_disabled=force_broad)
         if self.registry:
-            models = self.registry.get_available_models(models)
+            available = self.registry.get_available_models(models)
+            if not available and not force_broad:
+                log.warning(
+                    "Combo pool empty after disabled filter (%d candidates); "
+                    "retrying with full catalog + health filter only",
+                    len(models),
+                )
+                SmartRouter.invalidate_combo_cache()
+                return self._get_combo_models(force_broad=True)
+            models = available
+
         self._combo_cache = models
         self._combo_cache_time = now
         return self._combo_cache
@@ -520,13 +602,41 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             opener = self.opener if self.opener is not None else urllib.request.build_opener()
             with opener.open(req, timeout=180) as resp:
                 is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
-                resp_body = self._emit_upstream_response(resp, is_chat, fallback_used)
+                resp_body, ttft_ms = self._emit_upstream_response(resp, is_chat, fallback_used, start_time)
 
                 if target_router and self.meta_selector:
                     self.meta_selector.on_success(target_router.name)
 
                 if body and resp.status == 200:
-                    self._record_upstream_health(body, resp_body, start_time)
+                    self._record_upstream_health(body, resp_body, start_time, ttft_ms)
+
+        except EmptyUpstreamResponse as e:
+            # HTTP 200 with an empty body (dead model / exhausted quota) was
+            # detected in _emit_upstream_response BEFORE any byte reached the
+            # client — nothing was emitted yet, so this request is replayable.
+            # Record health (marks 15m empty_response model cooldown) then
+            # retry with the next healthy model via the same global fallback
+            # gate used for 5xx/access errors.
+            if body:
+                self._record_upstream_health(body, e.body, start_time)
+                if getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES:
+                    tried = set(getattr(self, "_tried_models", set()))
+                    tried.add(body.get("model", ""))
+                    self._tried_models = tried
+                    next_model = self._next_fallback_model(tried)
+                    if next_model:
+                        self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
+                        log.warning(
+                            f"Global fallback {self._fallback_attempts}/{MAX_FALLBACK_RETRIES}: "
+                            f"Empty 200 on '{body.get('model')}' → retrying with '{next_model}'"
+                        )
+                        body["model"] = next_model
+                        self._router_selected = True
+                        self._forward(body)
+                        return
+            # No healthy model left — fail loudly instead of a silent empty 200
+            self._respond_unavailable("empty upstream response")
+            return
 
         except urllib.error.HTTPError as e:
             resp_body = e.read()
@@ -544,31 +654,40 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
                         fallback_resp = urllib.request.urlopen(fallback_req, timeout=180)
                         is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
-                        fb_body = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True)
+                        fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
                         if body and fallback_resp.status == 200:
-                            self._record_upstream_health(body, fb_body, start_time)
+                            self._record_upstream_health(body, fb_body, start_time, fb_ttft)
                         return
                     router_fallback_tried = True
-                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable):
+                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse):
                     router_fallback_tried = True
                     pass
 
-            # ── Global fallback: retry 5xx / 429-access with next healthy model ──
+            # ── Global fallback: retry 5xx / access-error with next healthy model ──
             # A 5xx here means the router's chosen provider failed at runtime.
-            # A 429 classified as an access error (weekly/monthly limit, no
-            # credit, subscription) is non-transient: routing around it via the
-            # catalog is safe. Generic/transient 429 (rate limit) never
-            # triggers fallback. Streaming can't be replayed (partial SSE
-            # already sent to the client), so it is never retried.
+            # Access errors (no credit, no credentials, model not found,
+            # subscription/weekly/monthly limit) are non-transient: routing
+            # around them via the catalog is safe and required — otherwise the
+            # error leaks to the agent (e.g. 402 insufficient_balance on a dead
+            # provider stalls opencode's compaction with "provider temporarily
+            # unavailable"). Generic/transient 429 (rate limit) never triggers
+            # fallback. HTTPError is raised by opener.open() BEFORE any SSE is
+            # emitted, so streaming requests CAN be retried with another model —
+            # only mid-stream connection failures (URLError inside
+            # _emit_upstream_response) can't be replayed.
             raw_body_text = resp_body.decode(errors="replace")
             error_info = self._handle_error(e.code, raw_body_text, body)
             fallback_etype = (error_info.get("cooldown") or error_info).get("type", "")
             if (
                 body
-                and not body.get("stream")
                 and (
                     500 <= e.code <= 599
-                    or (e.code == 429 and fallback_etype in self._ACCESS_ERROR_TYPES)
+                    or fallback_etype in self._ACCESS_ERROR_TYPES
+                    or (
+                        getattr(self, "_router_selected", False)
+                        and 400 <= e.code <= 499
+                        and fallback_etype not in self._RATE_LIMIT_ERROR_TYPES
+                    )
                 )
                 and getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES
             ):
@@ -583,6 +702,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         f"HTTP {e.code} on '{body.get('model')}' → retrying with '{next_model}'"
                     )
                     body["model"] = next_model
+                    self._router_selected = True
                     self._forward(body)
                     return
 
@@ -595,6 +715,12 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
             # error_info already computed above (fallback decision depends on it)
             friendly = self._friendly_error_message(error_info, (body or {}).get("model", ""))
+
+            # An unclassified 4xx from a router-selected model (combo/smart-
+            # routing/global-fallback picked it) must never reach the agent raw
+            # — a bare 400/404 from a dead endpoint stalls opencode. Shield as
+            # generic 503 when no fallback model is left.
+            shielded = False
 
             if friendly:
                 # Anti-leak: access-error detail goes to server log only — the
@@ -614,12 +740,31 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     }
                 }).encode()
             else:
-                try:
-                    err_normalized = normalize_error(resp_body)
-                    resp_body = json.dumps(err_normalized).encode()
-                except Exception as norm_err:
-                    log.warning(f"Error normalization failed: {norm_err}", extra={"event": "normalize_error_failed"})
-            self.send_response(e.code)
+                shielded = (
+                    getattr(self, "_router_selected", False)
+                    and 400 <= e.code <= 499
+                    and fallback_etype not in self._RATE_LIMIT_ERROR_TYPES
+                )
+                if shielded:
+                    log.warning(
+                        "Router-selected model '%s' failed HTTP %s with no fallback "
+                        "— shielding as 503 (anti-leak)",
+                        (body or {}).get("model", ""),
+                        e.code,
+                    )
+                    resp_body = json.dumps({
+                        "error": {
+                            "message": "provider temporarily unavailable",
+                            "type": "provider_unavailable",
+                        }
+                    }).encode()
+                else:
+                    try:
+                        err_normalized = normalize_error(resp_body)
+                        resp_body = json.dumps(err_normalized).encode()
+                    except Exception as norm_err:
+                        log.warning(f"Error normalization failed: {norm_err}", extra={"event": "normalize_error_failed"})
+            self.send_response(503 if shielded else e.code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(resp_body)))
             self.end_headers()
@@ -645,11 +790,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         opener = self.opener if self.opener is not None else urllib.request.build_opener()
                         fallback_resp = opener.open(fallback_req, timeout=180)
                         is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
-                        fb_body = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True)
+                        fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
                         if body and fallback_resp.status == 200:
-                            self._record_upstream_health(body, fb_body, start_time)
+                            self._record_upstream_health(body, fb_body, start_time, fb_ttft)
                         return
-                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable):
+                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse):
                     pass
 
             self._respond_unavailable(f"Connection error: {e.reason}")
@@ -658,7 +803,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 provider = model.split("/")[0] if "/" in model else model
                 self._record_usage(body, b"", start_time, provider, model, False, "connection_error")
 
-    def _record_upstream_health(self, body, resp_body, start_time):
+    def _record_upstream_health(self, body, resp_body, start_time, ttft_ms=0):
         """Record provider health + usage after a 200, with airforce-fake guard.
 
         api.airforce answers HTTP 200 + "The model does not exist in
@@ -679,35 +824,46 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 model,
             )
             self._handle_error(404, fake_text, body)
-            self._record_usage(body, resp_body, start_time, provider, model, False, "model_not_found")
+            self._record_usage(body, resp_body, start_time, provider, model, False, "model_not_found", ttft_ms)
             return
 
         if _is_empty_chat_response(resp_body):
             log.warning(
-                "Empty 200 from upstream for model=%s — treating as model_not_found",
+                "Empty 200 from upstream for model=%s — applying 15m model cooldown",
                 model,
                 extra={"event": "empty_200", "provider": provider, "model": model},
             )
-            self._handle_error(404, "model does not exist (empty 200 response)", body)
-            self._record_usage(body, resp_body, start_time, provider, model, False, "model_not_found")
+            error_info = {
+                "hours": 0, "minutes": 15, "type": "empty_response",
+                "model_specific": True, "recheck": True
+            }
+            if self.registry:
+                self.registry.mark_error(provider=provider, error_info=error_info, model=model)
+            self._record_usage(body, resp_body, start_time, provider, model, False, "empty_response", ttft_ms)
             return
 
         self.registry.mark_healthy(provider)
-        self._record_usage(body, resp_body, start_time, provider, model, True)
+        self._record_usage(body, resp_body, start_time, provider, model, True, ttft_ms=ttft_ms)
 
     def _record_usage(self, request_body: dict, response_body: bytes, start_time: float,
-                      provider: str, model: str, success: bool, error_type: str = None):
+                      provider: str, model: str, success: bool, error_type: str = None,
+                      ttft_ms: int = 0):
         """Record request metrics."""
         if not self.metrics_store:
             return
 
         duration_ms = int((time.time() - start_time) * 1000)
 
+        # ttft_ms = real time-to-first-byte from _emit_upstream_response
+        # (streaming only). Fall back to duration when it wasn't measured
+        # (non-streaming buffered responses, error paths).
+        if ttft_ms <= 0:
+            ttft_ms = duration_ms
+
         # Try to extract tokens from response
         tokens_in = 0
         tokens_out = 0
         tokens_cache = 0
-        ttft_ms = duration_ms
 
         try:
             if response_body and response_body.strip():
@@ -819,6 +975,15 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         "invalid_subscription",
     }
 
+    _RATE_LIMIT_ERROR_TYPES = {
+        "generic_429",
+        "unknown_429",
+        "rate_limit_rpm",
+        "rate_limit_tpd",
+        "rate_limit_until",
+        "daily_quota_exceeded",
+    }
+
     def _friendly_error_message(self, error_info: dict, model: str) -> str | None:
         """Human-readable message for account/access errors; None otherwise."""
         cd = error_info.get("cooldown") or error_info
@@ -876,6 +1041,19 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
 
 
+    def _prompt_tokens(self, body: dict) -> int:
+        """Estimate prompt size in tokens from the request body."""
+        try:
+            all_text = "\n".join(
+                m.get("content", "") or ""
+                if isinstance(m.get("content"), str)
+                else json.dumps(m.get("content", ""))
+                for m in (body.get("messages") or [])
+            )
+            return count_tokens(all_text)
+        except Exception:
+            return 0
+
     def _find_healthy_alternative(self, body: dict) -> str | None:
         """Smart routing: find the best performing model from combo."""
         if not self.registry or not self.smart_router:
@@ -888,7 +1066,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         # For combo models, use smart router to pick the best
         combo_models = self._get_combo_models()
         if combo_models:
-            best = self.smart_router.best_model(combo_models, self.registry)
+            best = self.smart_router.best_model(
+                combo_models,
+                self.registry,
+                {"prompt_tokens": self._prompt_tokens(body)},
+            )
             if best and best != current:
                 log.info(f"SmartRouter: {current} → {best} (healthier alternative)")
                 return best
@@ -922,8 +1104,35 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         combo_models = self._get_combo_models()
         available = []
         skipped = []
+
+        # Prompt size in tokens: models whose REAL context window can't fit
+        # the request must be skipped. The 9router catalog reports ctx 128000
+        # for samba free models, but the upstream only accepts 8192 → 400
+        # "Max_len exceeded" on large agentic prompts (and empty compactions).
+        prompt_tokens = 0
+        try:
+            all_text = "\n".join(
+                m.get("content", "") or ""
+                if isinstance(m.get("content"), str)
+                else json.dumps(m.get("content", ""))
+                for m in (body.get("messages") or [])
+            )
+            prompt_tokens = count_tokens(all_text)
+        except Exception as exc:
+            log.debug("Prompt size estimate failed: %s", exc)
+
         for cm in combo_models:
             provider = cm.split("/")[0]
+            # Skip models whose real context can't hold the prompt: catalog
+            # ctx is often inflated (samba → 8192 real vs 128000 catalog);
+            # sending an oversized prompt → 400 → combo retry loop. Only
+            # filters with EXPLICIT model_limits.json entries (unknown ctx
+            # = respect the catalog, don't guess).
+            limits = get_explicit_limits(cm)
+            ctx = limits.get("context", 0) or 0 if limits else 0
+            if ctx and prompt_tokens > int(ctx * 0.75):
+                skipped.append(f"{cm}(ctx {ctx} < prompt {prompt_tokens})")
+                continue
             # Filter on MODEL availability, not just provider health: a
             # healthy provider can still have specific models in cooldown
             # (e.g. groq healthy but groq/openai/gpt-oss-120b in
@@ -940,12 +1149,28 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 f"Combo '{model}': ALL {len(combo_models)} models unavailable. "
                 f"Skipped: {', '.join(skipped[:10])}"
             )
+            # Try broad catalog with force_broad=True to bypass 9router disabled registry
+            broad_models = self._get_combo_models(force_broad=True)
+            broad_available = [m for m in broad_models if self.registry.is_model_available(m)]
+            if broad_available:
+                best = self.smart_router.best_model(
+                    broad_available,
+                    self.registry,
+                    {"prompt_tokens": prompt_tokens},
+                ) if self.smart_router else broad_available[0]
+                log.info(f"Combo '{model}': broad pool fallback → {best} ({len(broad_available)} healthy)")
+                return best
+
             # Global fallback: the combo's candidates are all dead — try the
             # FULL catalog before giving up (pass-through returns a 503 from
             # the 9router combo router, which the client retries in a loop).
-            chain = self._global_fallback_chain(force_refresh=True)
+            chain = self._global_fallback_chain(force_refresh=True, force_broad=True)
             if chain:
-                best = self.smart_router.best_model(chain, self.registry) if self.smart_router else chain[0]
+                best = self.smart_router.best_model(
+                    chain,
+                    self.registry,
+                    {"prompt_tokens": prompt_tokens},
+                ) if self.smart_router else chain[0]
                 log.info(f"Combo '{model}': global fallback → {best} (full catalog, {len(chain)} healthy)")
                 return best
             return None
@@ -957,7 +1182,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             )
 
         if self.smart_router:
-            best = self.smart_router.best_model(available, self.registry)
+            best = self.smart_router.best_model(
+                available,
+                self.registry,
+                {"prompt_tokens": prompt_tokens},
+            )
             if best:
                 return best
             # best_model found nothing usable (e.g. all remaining candidates
@@ -975,11 +1204,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
 
-        limits = get_model_limits(model)
+        limits = get_explicit_limits(model)
         # Only truncate when the model has an EXPLICIT entry in model_limits.json.
         # Unknown models fall back to the tiny default (8192 ctx → 6144 effective)
         # which destroys legitimate prompts for large-context models.
-        if not _has_explicit_limits(model):
+        if not limits:
             log.debug("Prompt limit: no explicit limits for model '%s', skipping truncation", model)
             return None
         max_context = limits.get("context", 8192)
@@ -1175,6 +1404,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # — a retry sends the same combo name, so it must map to the same key.
             self._fallback_attempts = 0
             self._tried_models = set()
+            self._router_selected = False
             self._request_cache_key = "" if body.get("stream") else self._cache_key(body)
 
             # Fast-path: trivial single-word messages ("ping") answered by the
@@ -1217,16 +1447,19 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 if healthy_model:
                     body["_original_model"] = model
                     body["model"] = healthy_model
+                    self._router_selected = True
                     log.info(f"Combo {model} → {healthy_model} (skipped dead providers)")
                     model = healthy_model
                     provider = healthy_model.split("/")[0]
                 else:
-                    # No suitable healthy provider selected — let the 9router
-                    # try (its own health state may be fresher than ours).
                     log.warning(
-                        f"Combo '{model}': no suitable healthy provider, "
-                        "passing through to downstream router"
+                        f"Combo '{model}': no healthy model in pool "
+                        f"(catalog exhausted or all in cooldown)"
                     )
+                    self._respond_unavailable(
+                        "no healthy combo models available — all providers in cooldown"
+                    )
+                    return
 
             # Health gate: check before forwarding. Combo names (no "/") are
             # virtual router aliases — never gate them on provider/model health
@@ -1243,6 +1476,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         body["model"] = alternative
                         body["_smart_routed"] = True
                         body["_original_model"] = old_model
+                        self._router_selected = True
                         log.info(f"Smart routed {old_model} → {alternative} (model unavailable)")
                         model = alternative
                         provider = alternative.split("/")[0] if "/" in alternative else alternative

@@ -42,8 +42,17 @@ class MetricsPersistence:
         self,
         providers: dict[str, dict[str, Any]],
         global_stats: Optional[dict[str, Any]] = None,
+        latency_stats: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Take a snapshot of current provider states."""
+        """Take a snapshot of current provider states.
+
+        Args:
+            providers: Health registry provider states.
+            global_stats: Aggregated metrics (tokens, requests) for the window.
+            latency_stats: Per-provider/per-model latency aggregates
+                (avg/p95/TTFT) so routing history survives restarts — see
+                MetricsStore.get_all_stats()/get_all_model_stats().
+        """
         # Count statuses
         healthy = probing = cooldown = disabled = 0
         for name, p in providers.items():
@@ -72,6 +81,9 @@ class MetricsPersistence:
             ),
             "global": global_stats or {},
         }
+
+        if latency_stats:
+            point["latency"] = latency_stats
 
         self.history.append(point)
         if len(self.history) > self.max_points:

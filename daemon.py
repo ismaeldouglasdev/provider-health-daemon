@@ -37,16 +37,19 @@ sys.path.insert(0, _local_dir)
 from config import (
     HEALTH_PROXY_PORT, PROBER_INTERVAL_MINUTES, ACCESS_LOG_PATH, DASHBOARD_PORT,
     DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE, NINEROUTER_URL, NINEROUTER_KEY,
-    PROBE_TIMEOUT,
+    PROBE_TIMEOUT, DISCOVERY_INTERVAL_SECONDS, PROXY_CHECK_INTERVAL_SECONDS,
 )
 from smart_router import SmartRouter
+from catalog_sync import sync_disable_dead_model
 from health_registry import HealthRegistry
 from router_registry import RouterRegistry
 from router_probe import RouterProbe
 from meta_router import MetaRouterSelector
 from model_catalog import ModelCatalog
-from error_parser import parse_log_line
-from proxy_handler import HealthProxyServer
+from provider_discovery import ProviderDiscovery
+from proxy_manager import ProxyManager
+from error_parser import parse_log_line, parse_request_detail_row
+from proxy_handler import HealthProxyServer, _is_empty_chat_response
 from access_parser import parse_line as parse_access_line
 from dashboard import DashboardServer
 from metrics_store import MetricsStore, RequestRecord
@@ -125,6 +128,7 @@ class AuditMetrics:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     requests_proxied: int = 0
     requests_blocked: int = 0
+    requests_trivial: int = 0
     errors_parsed: int = 0
     cooldowns_applied: int = 0
     cooldowns_promoted: int = 0
@@ -136,6 +140,7 @@ class AuditMetrics:
             "uptime_seconds": (datetime.now(timezone.utc) - self.started_at).total_seconds(),
             "requests_proxied": self.requests_proxied,
             "requests_blocked": self.requests_blocked,
+            "requests_trivial": self.requests_trivial,
             "errors_parsed": self.errors_parsed,
             "cooldowns_applied": self.cooldowns_applied,
             "cooldowns_promoted": self.cooldowns_promoted,
@@ -271,6 +276,7 @@ def monitor_access_log(metrics_store):
 # ── Error log monitor ───────────────────────────────────────────────
 
 LOG_PATH = Path.home() / ".9router" / "logs" / "error.log"
+SQLITE_DB_PATH = Path.home() / ".9router" / "db" / "data.sqlite"
 
 
 def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None):
@@ -356,6 +362,19 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                             )
                             with urllib.request.urlopen(probe_req, timeout=10) as probe_resp:
                                 if probe_resp.status == 200:
+                                    probe_body = probe_resp.read()
+                                    if _is_empty_chat_response(probe_body):
+                                        log.warning(
+                                            "Auto-recovery: empty 200 for model=%s — "
+                                            "keeping cooldown",
+                                            test_model,
+                                            extra={
+                                                "event": "empty_200_probe",
+                                                "provider": provider,
+                                                "model": test_model,
+                                            },
+                                        )
+                                        continue
                                     log.info(
                                         "Auto-recovery: provider responded healthy",
                                         extra={
@@ -410,6 +429,8 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                             model=model if parsed.get("model_specific") else None,
                         )
                         METRICS.cooldowns_applied += 1
+                        if model and parsed.get("model_specific"):
+                            sync_disable_dead_model(provider, model, parsed)
                         parsed_info = parsed.get("cooldown") or parsed
                         log.warning(
                             "9router error parsed",
@@ -428,6 +449,106 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
             time.sleep(5)
         except Exception as e:
             log.error(f"Log monitor error: {e}")
+            time.sleep(10)
+
+
+# ── SQLite requestDetails monitor ────────────────────────────────────
+
+def monitor_sqlite(registry: HealthRegistry, router_names: set[str] | None = None):
+    """Poll the 9router requestDetails table in SQLite for error rows.
+
+    The 9router (next-server) writes request details to
+    ~/.9router/db/data.sqlite instead of error.log; this monitor polls
+    the table for new status='error' rows and feeds cooldowns to the
+    registry via parse_request_detail_row().
+
+    router_names: set of lowercased router names to exclude from provider
+                  tracking (routers are tracked by RouterRegistry).
+    """
+    import sqlite3
+
+    if not SQLITE_DB_PATH.exists():
+        log.warning(
+            f"9router SQLite DB not found at {SQLITE_DB_PATH}, SQLite monitoring disabled"
+        )
+        return
+    router_names = router_names or set()
+
+    try:
+        con = sqlite3.connect(SQLITE_DB_PATH, timeout=5)
+        con.row_factory = sqlite3.Row
+        start_rowid = con.execute(
+            "SELECT COALESCE(MAX(rowid), 0) FROM requestDetails"
+        ).fetchone()[0]
+    except sqlite3.Error as e:
+        log.error(f"SQLite monitor init failed: {e}")
+        return
+
+    last_rowid = start_rowid
+    log.info(
+        "Monitoring requestDetails",
+        extra={"event": "sqlite_monitor_start", "db": str(SQLITE_DB_PATH), "start_rowid": start_rowid},
+    )
+
+    while not shutdown_event.is_set():
+        try:
+            min_rowid = con.execute(
+                "SELECT COALESCE(MIN(rowid), 0) FROM requestDetails"
+            ).fetchone()[0]
+            if last_rowid < min_rowid:
+                last_rowid = start_rowid = con.execute(
+                    "SELECT COALESCE(MAX(rowid), 0) FROM requestDetails"
+                ).fetchone()[0]
+                continue
+
+            rows = con.execute(
+                "SELECT rowid, data FROM requestDetails "
+                "WHERE rowid > ? AND status = 'error' ORDER BY rowid",
+                (last_rowid,),
+            ).fetchall()
+
+            for row in rows:
+                rowid = row["rowid"]
+                try:
+                    parsed = parse_request_detail_row(row["data"])
+                except Exception as e:
+                    log.error(f"parse_request_detail_row failed rowid={rowid}: {e}")
+                    continue
+                if not parsed:
+                    continue
+                METRICS.errors_parsed += 1
+                provider = parsed.get("provider_hint", "unknown")
+                if provider.lower() in router_names:
+                    continue
+                model = parsed.get("model_hint")
+                registry.mark_error(
+                    provider=provider,
+                    error_info=parsed,
+                    model=model if parsed.get("model_specific") else None,
+                )
+                METRICS.cooldowns_applied += 1
+                if model and parsed.get("model_specific"):
+                    sync_disable_dead_model(provider, model, parsed)
+                parsed_info = parsed.get("cooldown") or parsed
+                log.warning(
+                    "9router SQLite error parsed",
+                    extra={
+                        "event": "sqlite_error_parsed",
+                        "provider": provider,
+                        "model": model,
+                        "error_type": parsed_info.get("type"),
+                        "permanent": parsed.get("permanent"),
+                        "model_specific": parsed.get("model_specific"),
+                    },
+                )
+                last_rowid = rowid
+
+            time.sleep(5)
+        except sqlite3.Error as e:
+            log.error(f"SQLite monitor error: {e}")
+            time.sleep(10)
+        except Exception as e:
+            log.error(f"SQLite monitor unexpected error: {e}")
             time.sleep(10)
 
 
@@ -452,6 +573,46 @@ def alerter_loop(registry):
         except Exception as e:
             log.error(f"Alerter error: {e}")
             time.sleep(30)
+
+
+def discovery_loop(registry):
+    """Auto-probe new providers added to the 9router hub and register them in the registry."""
+    discovery = ProviderDiscovery(base_url=NINEROUTER_URL, registry=registry)
+    known = set(registry.snapshot().get("providers", {}).keys())
+    while not shutdown_event.is_set():
+        try:
+            result = discovery.discover_new_providers(known)
+            new_providers = result["new_providers"]
+            if new_providers:
+                log.info(
+                    f"Discovery: {len(new_providers)} new provider(s) detected and probed: {new_providers}",
+                    extra={"event": "discovery_new_providers", "providers": new_providers},
+                )
+            known.update(new_providers)
+        except Exception as e:
+            log.error(f"Discovery error: {e}", extra={"event": "discovery_error"})
+        if shutdown_event.wait(DISCOVERY_INTERVAL_SECONDS):
+            break
+
+
+def proxy_loop():
+    """Auto-apply proxies to 9router connections: new provider/account gets a proxy,
+    and the free-proxy pool is renewed on a fixed cadence."""
+    manager = ProxyManager()
+    while not shutdown_event.is_set():
+        try:
+            result = manager.ensure_all_proxied()
+            if result["applied"]:
+                log.info(
+                    f"Proxy manager: applied {result['applied']} assignment(s) "
+                    f"({result['unproxied']} unproxied, {result['connections']} connections, "
+                    f"pool={result['pool']}, refreshed={result['refreshed']})",
+                    extra={"event": "proxy_applied", **result},
+                )
+        except Exception as e:
+            log.error(f"Proxy manager error: {e}", extra={"event": "proxy_error"})
+        if shutdown_event.wait(PROXY_CHECK_INTERVAL_SECONDS):
+            break
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -650,7 +811,35 @@ def main():
                 if hasattr(registry, 'snapshot'):
                     providers = registry.snapshot().get("providers", {})
                 global_stats = shared_metrics.get_all_stats(300).get("global", {})
-                metrics_persist.snapshot(providers, global_stats)
+                # Per-provider + top-model latency aggregates so routing
+                # history (avg/p95/TTFT) survives restarts.
+                latency_stats = None
+                try:
+                    all_stats = shared_metrics.get_all_stats(300)
+                    model_stats = shared_metrics.get_all_model_stats(300)
+                    prov_lat = {
+                        name: {
+                            "avg_ms": p.get("avg_latency_ms", 0),
+                            "p95_ms": p.get("p95_latency_ms", 0),
+                            "ttft_ms": p.get("avg_ttft_ms", 0),
+                        }
+                        for name, p in all_stats.get("providers", {}).items()
+                    }
+                    top_models = sorted(
+                        model_stats.get("models", {}).items(),
+                        key=lambda kv: (kv[1].get("p95_latency_ms") or 0),
+                        reverse=True,
+                    )[:10]
+                    latency_stats = {
+                        "providers": prov_lat,
+                        "top_models": [
+                            {"model": m, **s}
+                            for m, s in top_models
+                        ],
+                    }
+                except Exception as lat_err:
+                    log.error(f"Latency snapshot error: {lat_err}")
+                metrics_persist.snapshot(providers, global_stats, latency_stats)
             except Exception as e:
                 log.error(f"Snapshot error: {e}")
             if shutdown_event.wait(metrics_persist.interval):
@@ -676,6 +865,29 @@ def main():
         args=(registry, router_names),
         daemon=True,
         name="log-monitor",
+    ).start()
+
+    # ── Start SQLite requestDetails monitor ──────────────────────────
+    threading.Thread(
+        target=monitor_sqlite,
+        args=(registry, router_names),
+        daemon=True,
+        name="sqlite-monitor",
+    ).start()
+
+    # ── Start provider discovery (new providers → auto-probe) ────────
+    threading.Thread(
+        target=discovery_loop,
+        args=(registry,),
+        daemon=True,
+        name="provider-discovery",
+    ).start()
+
+    # ── Start proxy auto-manager (new provider/account → auto-proxy) ──
+    threading.Thread(
+        target=proxy_loop,
+        daemon=True,
+        name="proxy-manager",
     ).start()
 
     # ── Start alerter (desktop notifications) ────────────────────────

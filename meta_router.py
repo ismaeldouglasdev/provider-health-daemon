@@ -32,6 +32,29 @@ class MetaRouterSelector:
             capable = [r for r in healthy if model in r.models]
             if capable:
                 healthy = capable
+            else:
+                # Model is not in any healthy router's catalog. Do NOT fall
+                # back to every healthy router: a router with a small catalog
+                # (e.g. Kiro, 13 models) would be picked for models it cannot
+                # serve and reject them with "Invalid model ID or insufficient
+                # subscription level" (kiro_api_error) — recorded by
+                # error_parser as a 24h subscription_level cooldown, poisoning
+                # GOOD models (2026-08-14: ag/kr/gemini/cu cascade). Fall back
+                # only to routers serving the same provider prefix or the bare
+                # model name (Kiro catalogs "minimax-m2.5" bare while requests
+                # use "kr/minimax-m2.5"); else fail with ServiceUnavailable.
+                provider, sep, rest = model.partition("/")
+                serving = [
+                    r for r in healthy
+                    if any(
+                        (provider and m.startswith(provider + "/"))
+                        or (sep and m == rest)
+                        for m in r.models
+                    )
+                ]
+                if not serving:
+                    raise ServiceUnavailable(f"model '{model}' not served by any healthy router")
+                healthy = serving
         return healthy
 
     def _pick_weighted(self, routers):

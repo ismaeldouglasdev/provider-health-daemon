@@ -60,6 +60,42 @@ def test_handle_error_increments_cooldowns_applied(tmp_path):
     assert registry.is_provider_healthy("test-provider") is False
 
 
+def test_handle_error_combo_body_names_real_provider(tmp_path):
+    """Combo request failing with 'No active credentials for provider: X'
+    must mark the REAL provider (X), not the virtual combo name."""
+    audit = _fresh_audit()
+    registry = HealthRegistry(filepath=tmp_path / "health.json")
+    handler = _stub_handler(audit, registry)
+
+    handler._handle_error(
+        404,
+        '{"error": {"message": "No active credentials for provider: openai",'
+        ' "type": "invalid_request_error", "code": "model_not_found"}}',
+        {"model": "main-rr"},
+    )
+
+    assert audit.cooldowns_applied == 1
+    assert registry.is_provider_healthy("openai") is False
+    # Virtual combo name must NOT create a phantom provider entry
+    assert registry.get_provider("main-rr") == {}
+
+
+def test_handle_error_combo_without_hint_marks_nothing(tmp_path):
+    """Combo request with a generic body must not create phantom entries."""
+    audit = _fresh_audit()
+    registry = HealthRegistry(filepath=tmp_path / "health.json")
+    handler = _stub_handler(audit, registry)
+
+    handler._handle_error(
+        503,
+        '{"error": {"message": "boom", "type": "server_error"}}',
+        {"model": "main-rr"},
+    )
+
+    assert audit.cooldowns_applied == 0
+    assert registry.is_provider_healthy("main-rr") is True
+
+
 def test_emit_upstream_response_increments_requests_proxied(tmp_path):
     audit = _fresh_audit()
     registry = HealthRegistry(filepath=tmp_path / "health.json")

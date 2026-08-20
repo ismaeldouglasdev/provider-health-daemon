@@ -44,7 +44,7 @@ def test_mark_error_provider(tmp_registry: HealthRegistry):
         "type": "rate_limit",
         "status": 429,
         "model_specific": False,
-        "cooldown": {"type": "rate_limit", "duration_hours": 1},
+        "cooldown": {"type": "rate_limit", "hours": 1},
     })
     assert not tmp_registry.is_provider_healthy("test-provider")
     entry = tmp_registry.get_provider("test-provider")
@@ -87,6 +87,82 @@ def test_cleanup_expired(tmp_registry: HealthRegistry):
     assert entry["status"] == "probing"
 
 
+def test_cleanup_promotion_sets_fresh_probing_window(tmp_registry: HealthRegistry):
+    """Cooldown → probing must refresh `until` so the recovery prober has
+    time to test before the next cleanup run would treat it as orphaned."""
+    from datetime import datetime, timezone
+
+    tmp_registry.mark_error("test-provider", {
+        "type": "rate_limit",
+        "status": 429,
+        "model_specific": False,
+        "cooldown": {"type": "rate_limit", "duration_hours": 0},
+    })
+    tmp_registry.cleanup_expired()
+    entry = tmp_registry.get_provider("test-provider")
+    assert entry["status"] == "probing"
+    until = datetime.fromisoformat(entry["until"])
+    assert until > datetime.now(timezone.utc), "probing `until` must be in the future"
+
+    removed = tmp_registry.cleanup_expired()
+    assert tmp_registry.get_provider("test-provider")["status"] == "probing"
+
+
+def test_cleanup_removes_orphaned_probing(tmp_registry: HealthRegistry):
+    """Probing entries whose window expired long ago (removed from catalog,
+    never re-tested) must be dropped instead of lingering forever."""
+    from datetime import datetime, timedelta, timezone
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    tmp_registry._data[tmp_registry.PROVIDERS]["ghost"] = {
+        "status": "probing",
+        "until": stale,
+        "reason": "unknown_401 (probing)",
+        "failures": 1,
+        "models": [],
+    }
+
+    removed = tmp_registry.cleanup_expired()
+    assert removed >= 1
+    assert tmp_registry.get_provider("ghost") == {}
+
+
+def test_cleanup_keeps_active_probing(tmp_registry: HealthRegistry):
+    """Probing entries with a still-valid window must NOT be removed."""
+    from datetime import datetime, timedelta, timezone
+
+    fresh = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    tmp_registry._data[tmp_registry.PROVIDERS]["active"] = {
+        "status": "probing",
+        "until": fresh,
+        "reason": "generic_429 (probing)",
+        "failures": 2,
+        "models": [],
+    }
+
+    removed = tmp_registry.cleanup_expired()
+    assert tmp_registry.get_provider("active")["status"] == "probing"
+
+
+def test_cleanup_removes_orphaned_probing_models(tmp_registry: HealthRegistry):
+    """Model-level probing entries with expired windows are cleaned too."""
+    from datetime import datetime, timedelta, timezone
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    tmp_registry._data[tmp_registry.MODELS]["ghost-model"] = {
+        "status": "probing",
+        "until": stale,
+        "reason": "generic_429 (probing)",
+        "failures": 1,
+        "provider": "ghost",
+        "model": "ghost-model",
+    }
+
+    removed = tmp_registry.cleanup_expired()
+    assert removed >= 1
+    assert tmp_registry.get_model("ghost-model") == {}
+
+
 def test_status_summary(tmp_registry: HealthRegistry):
     summary = tmp_registry.status_summary()
     assert "by_status" in summary
@@ -115,6 +191,31 @@ def test_load_corrupted_file(tmp_path: Path):
     r = HealthRegistry(filepath=fp)
     # Should gracefully fall back to empty state
     assert r.status_summary()["by_status"]["healthy"] == 0
+
+
+def test_load_migrates_duplicate_alias_keys(tmp_path: Path):
+    fp = tmp_path / "health.json"
+    fp.write_text(json.dumps({
+        "providers": {
+            "bzl": {"status": "cooldown", "until": "2099-01-01T00:00:00+00:00",
+                    "reason": "no_credit", "failures": 1, "models": []},
+            "bazaarlink": {"status": "healthy", "failures": 0},
+            "samba": {"status": "healthy", "failures": 0},
+            "sambanova": {},
+        },
+        "models": {},
+    }))
+    r = HealthRegistry(filepath=fp)
+    providers = r.snapshot()["providers"]
+    assert "bazaarlink" not in providers
+    assert "sambanova" not in providers
+    # Most restrictive status wins: bzl cooldown preserved over healthy
+    assert providers["bzl"]["status"] == "cooldown"
+    assert providers["bzl"]["reason"] == "no_credit"
+    assert providers["samba"]["status"] == "healthy"
+    # Aliased lookups resolve to the canonical key
+    assert r.get_provider("bazaarlink")["status"] == "cooldown"
+    assert r.get_provider("sambanova")["status"] == "healthy"
 
 
 # ── Thread safety ──────────────────────────────────────────────────

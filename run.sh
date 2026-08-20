@@ -38,7 +38,14 @@ start() {
 stop() {
     if [ -f /tmp/health-daemon.pid ]; then
         PID=$(cat /tmp/health-daemon.pid)
-        kill "$PID" 2>/dev/null && echo "✅ Stopped (PID $PID)"
+        if kill -0 "$PID" 2>/dev/null; then
+            kill "$PID" 2>/dev/null && echo "✅ Stopped (PID $PID)"
+            # Aguarda liberar o lock de instância única (raça shutdown/start)
+            for i in $(seq 1 10); do
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 0.5
+            done
+        fi
         rm -f /tmp/health-daemon.pid
     else
         echo "Daemon not running"

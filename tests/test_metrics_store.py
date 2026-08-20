@@ -123,3 +123,66 @@ class TestGetAccessErrors:
         stats = ms.get_provider_stats("groq")
         assert stats["failed"] == 1
         assert stats["errors_by_type"]["no_credit"] == 1
+
+
+class TestGetModelStats:
+    """Per-model stats must isolate latency by MODEL, not just provider —
+    a fast model on a slow provider must not inherit the provider's latency."""
+
+    def _seed(self) -> MetricsStore:
+        ms = MetricsStore()
+        now = time.time()
+        ms.record_request(RequestRecord(
+            timestamp=now, provider="ag", model="ag/gemini-3.5-flash",
+            duration_ms=500, ttft_ms=120, success=True,
+        ))
+        ms.record_request(RequestRecord(
+            timestamp=now, provider="ag", model="ag/gemini-3.5-flash",
+            duration_ms=800, ttft_ms=200, success=True,
+        ))
+        ms.record_request(RequestRecord(
+            timestamp=now, provider="ag", model="ag/gemini-2.5-pro",
+            duration_ms=40000, ttft_ms=30000, success=True,
+        ))
+        return ms
+
+    def test_model_stats_isolated_from_provider_aggregate(self):
+        ms = self._seed()
+        fast = ms.get_model_stats("ag/gemini-3.5-flash")
+        assert fast["total_requests"] == 2
+        assert fast["avg_latency_ms"] == 650.0
+        assert fast["p95_latency_ms"] == 800
+        assert fast["avg_ttft_ms"] == 160.0
+        assert fast["failed"] == 0
+        assert fast["provider"] == "ag"
+
+        slow = ms.get_model_stats("ag/gemini-2.5-pro")
+        assert slow["total_requests"] == 1
+        assert slow["avg_latency_ms"] == 40000.0
+
+        # Provider-level aggregate blends BOTH models — the router must
+        # prefer the per-model view to avoid sinking the fast model.
+        prov = ms.get_provider_stats("ag")
+        assert prov["total_requests"] == 3
+        assert prov["avg_latency_ms"] == round((500 + 800 + 40000) / 3, 1)
+
+    def test_unknown_model_returns_none(self):
+        ms = self._seed()
+        assert ms.get_model_stats("ag/nope") is None
+
+    def test_model_stats_respect_window(self):
+        ms = MetricsStore()
+        old = time.time() - 6000
+        ms.record_request(RequestRecord(
+            timestamp=old, provider="ag", model="ag/gemini-3.5-flash",
+            duration_ms=100, success=True,
+        ))
+        assert ms.get_model_stats("ag/gemini-3.5-flash", window_seconds=60) is None
+        assert ms.get_model_stats("ag/gemini-3.5-flash", window_seconds=7200) is not None
+
+    def test_get_all_model_stats_groups_by_model(self):
+        ms = self._seed()
+        out = ms.get_all_model_stats()
+        assert out["total_records"] == 3
+        assert set(out["models"]) == {"ag/gemini-3.5-flash", "ag/gemini-2.5-pro"}
+        assert out["models"]["ag/gemini-3.5-flash"]["avg_latency_ms"] == 650.0

@@ -4,7 +4,11 @@
   blocks which strict OpenAI-compatible schemas (mistral 422) reject.
 - _trivial_reply: "ping"-style single-word messages get a canned reply
   from the proxy itself instead of burning seconds of LLM thinking time.
+- _record_usage TTFT: the real time-to-first-byte measured at the first
+  SSE line must be persisted, not a copy of the total duration.
 """
+
+import time
 
 import pytest
 
@@ -202,3 +206,37 @@ class TestIsEmptyChatResponse:
 
     def test_non_json_error_text_is_not_empty(self):
         assert _is_empty_chat_response(b"upstream exploded") is False
+
+
+class TestRecordUsageTTFT:
+    """Fase 1: the ttft_ms measured at the first SSE line must reach the
+    persisted RequestRecord — not be overwritten by the total duration."""
+
+    @staticmethod
+    def _handler():
+        from proxy_handler import HealthProxyHandler
+        from metrics_store import MetricsStore
+
+        handler = HealthProxyHandler.__new__(HealthProxyHandler)
+        handler.metrics_store = MetricsStore()
+        return handler
+
+    def test_uses_measured_ttft_when_provided(self):
+        h = self._handler()
+        body = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n'
+        h._record_usage(
+            {}, body, time.time() - 10, "ag", "ag/gemini-3.5-flash", True, ttft_ms=1500,
+        )
+        rec = h.metrics_store.records[-1]
+        assert rec.ttft_ms == 1500
+        assert rec.duration_ms >= 9000
+        assert rec.ttft_ms != rec.duration_ms
+
+    def test_falls_back_to_duration_when_ttft_zero(self):
+        h = self._handler()
+        h._record_usage(
+            {}, b"", time.time() - 5, "ag", "ag/gemini-3.5-flash",
+            False, "connection_error",
+        )
+        rec = h.metrics_store.records[-1]
+        assert rec.ttft_ms == rec.duration_ms

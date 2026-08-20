@@ -5,12 +5,13 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from cooldown import CooldownCalculator
-from config import HEALTH_FILE
+from config import HEALTH_FILE, PROBER_INTERVAL_MINUTES
+from provider_aliases import normalize_provider
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +23,10 @@ class HealthRegistry:
     MODELS = "models"
 
     MAX_FAILURES = 30  # after this many consecutive failures, permanently disable
+    # Fresh window granted when cooldown → probing: the recovery prober runs
+    # every PROBER_INTERVAL_MINUTES, so 2x that interval guarantees it has a
+    # chance to test the provider before the entry becomes orphan-cleanup eligible.
+    PROBING_WINDOW_MINUTES = max(PROBER_INTERVAL_MINUTES * 2, 10)
 
     def __init__(self, filepath=None):
         self.filepath = Path(filepath) if filepath else HEALTH_FILE
@@ -40,10 +45,45 @@ class HealthRegistry:
             # Validate structure
             data.setdefault(self.PROVIDERS, {})
             data.setdefault(self.MODELS, {})
+            self._migrate_duplicate_keys(data)
             return data
         except (json.JSONDecodeError, IOError) as e:
             log.warning(f"Failed to load health file: {e}")
             return self._empty_state()
+
+    def _migrate_duplicate_keys(self, data: dict) -> None:
+        providers = data.get(self.PROVIDERS, {})
+        merged: dict = {}
+        for raw_key, entry in providers.items():
+            canonical = normalize_provider(raw_key)
+            if canonical != raw_key:
+                log.info(
+                    f"Migrating health entry '{raw_key}' -> '{canonical}'"
+                )
+            if canonical not in merged:
+                merged[canonical] = entry
+            else:
+                existing = merged[canonical]
+                merged[canonical] = self._merge_entries(existing, entry)
+        data[self.PROVIDERS] = merged
+
+    @staticmethod
+    def _merge_entries(a: dict, b: dict) -> dict:
+        rank = {"disabled": 3, "cooldown": 2, "probing": 1, "healthy": 0}
+        ra = rank.get(str(a.get("status")), 0)
+        rb = rank.get(str(b.get("status")), 0)
+        if rb > ra:
+            a, b = b, a
+        merged = copy.deepcopy(a)
+        merged["failures"] = max(a.get("failures", 0), b.get("failures", 0))
+        models = set(a.get("models") or []) | set(b.get("models") or [])
+        if models:
+            merged["models"] = sorted(models)
+        if b.get("updated_at") and (
+            not merged.get("updated_at") or b["updated_at"] < merged["updated_at"]
+        ):
+            merged["updated_at"] = b["updated_at"]
+        return merged
 
     def _save(self) -> None:
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -69,18 +109,26 @@ class HealthRegistry:
 
     def get_provider(self, name: str) -> dict:
         with self._lock:
-            return self._data[self.PROVIDERS].get(name, {})
+            return self._data[self.PROVIDERS].get(normalize_provider(name), {})
 
     def get_model(self, model_id: str) -> dict:
         with self._lock:
             return self._data[self.MODELS].get(model_id, {})
 
     def is_provider_healthy(self, name: str) -> bool:
-        """Provider is usable right now."""
+        """Provider is usable right now (probing counts as semi-available).
+
+        Must stay consistent with ``is_model_available``/``_entry_is_healthy``:
+        providers transition to ``probing`` right after a cooldown expires and
+        are selectable again — if this method only accepted ``healthy``, the
+        smart router would reject every candidate of a probing provider and
+        fall through to the downstream combo router, which then fails with
+        no_credentials/monthly_limit ("provider temporarily unavailable").
+        """
         entry = self.get_provider(name)
         if not entry:
             return True  # unknown = assume healthy
-        return entry.get("status") == "healthy"
+        return self._entry_is_healthy(entry)
 
     def is_model_available(self, model_id: str) -> bool:
         """Model is usable right now (checks both model-specific and parent provider)."""
@@ -116,6 +164,7 @@ class HealthRegistry:
 
     def mark_healthy(self, provider: str, model: Optional[str] = None) -> None:
         """Record successful request."""
+        provider = normalize_provider(provider)
         with self._lock:
             if model:
                 self._data[self.MODELS][model] = self._healthy_entry(provider, model)
@@ -132,6 +181,7 @@ class HealthRegistry:
         model: Optional[str] = None,
     ) -> None:
         """Apply cooldown from parsed error."""
+        provider = normalize_provider(provider)
         with self._lock:
             if error_info.get("model_specific") and model:
                 current = self.get_model(model)
@@ -199,16 +249,18 @@ class HealthRegistry:
 
     def _provider_models(self, provider: str) -> list[str]:
         """List model entries belonging to provider."""
+        canonical = normalize_provider(provider)
         return [
             model_id
             for model_id, entry in self._data[self.MODELS].items()
-            if entry.get("provider") == provider
+            if normalize_provider(str(entry.get("provider", ""))) == canonical
         ]
 
     # ── Admin ─────────────────────────────────────────────────────────
 
     def force_healthy(self, provider: str, model: Optional[str] = None) -> None:
         """Admin override: reset to healthy."""
+        provider = normalize_provider(provider)
         with self._lock:
             if model:
                 self._data[self.MODELS].pop(model, None)
@@ -244,7 +296,24 @@ class HealthRegistry:
                     else:
                         entry["status"] = "probing"
                         entry["reason"] = f"{entry.get('reason')} (probing)"
+                        entry["until"] = (
+                            now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)
+                        ).isoformat()
+                        entry["updated_at"] = now.isoformat()
                         log.info(f"Rotate {provider} cooldown expired -> probing")
+                    count += 1
+                elif entry.get("status") == "probing" and self.cooldown.is_expired(
+                    entry.get("until")
+                ):
+                    # Probing window expired → revert to healthy (unknown).
+                    # Without this, providers removed from the catalog but
+                    # left in health.json get stuck in "probing" forever
+                    # (until stale, never re-tested, never cleaned up).
+                    del self._data[self.PROVIDERS][provider]
+                    log.info(
+                        f"Removed orphaned probing entry for {provider} "
+                        f"(until expired {(now - datetime.fromisoformat(entry['until'].replace('Z','+00:00'))).days}d ago)"
+                    )
                     count += 1
 
             for model_id, entry in list(self._data[self.MODELS].items()):
@@ -264,7 +333,17 @@ class HealthRegistry:
                     else:
                         entry["status"] = "probing"
                         entry["reason"] = f"{entry.get('reason')} (probing)"
+                        entry["until"] = (
+                            now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)
+                        ).isoformat()
+                        entry["updated_at"] = now.isoformat()
                         log.info(f"Rotate {model_id} cooldown expired -> probing")
+                    count += 1
+                elif entry.get("status") == "probing" and self.cooldown.is_expired(
+                    entry.get("until")
+                ):
+                    del self._data[self.MODELS][model_id]
+                    log.info(f"Removed orphaned probing entry for model {model_id}")
                     count += 1
 
             if count > 0:

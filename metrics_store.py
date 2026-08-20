@@ -147,29 +147,33 @@ class MetricsStore:
         cutoff = time.time() - window_seconds
         return [r for r in self.records if r.timestamp >= cutoff]
 
+    @staticmethod
+    def _accumulate(pm: ProviderMetrics, r: RequestRecord) -> None:
+        """Accumulate one record into a ProviderMetrics bucket."""
+        pm.total_requests += 1
+        if r.success:
+            pm.successful_requests += 1
+        elif r.error_type not in NON_PENALIZING_ERROR_TYPES:
+            pm.failed_requests += 1
+
+        if r.error_type:
+            pm.errors_by_type[r.error_type] += 1
+
+        pm.tokens_in += r.tokens_in
+        pm.tokens_out += r.tokens_out
+        pm.tokens_cache += r.tokens_cache
+
+        pm.total_duration_ms += r.duration_ms
+        pm.total_ttft_ms += r.ttft_ms
+        pm.durations.append(r.duration_ms)
+        pm.ttfts.append(r.ttft_ms)
+
     def _aggregate(self, records: list[RequestRecord]) -> dict[str, ProviderMetrics]:
         """Aggregate records by provider."""
         providers: dict[str, ProviderMetrics] = defaultdict(ProviderMetrics)
 
         for r in records:
-            pm = providers[r.provider]
-            pm.total_requests += 1
-            if r.success:
-                pm.successful_requests += 1
-            elif r.error_type not in NON_PENALIZING_ERROR_TYPES:
-                pm.failed_requests += 1
-
-            if r.error_type:
-                pm.errors_by_type[r.error_type] += 1
-
-            pm.tokens_in += r.tokens_in
-            pm.tokens_out += r.tokens_out
-            pm.tokens_cache += r.tokens_cache
-
-            pm.total_duration_ms += r.duration_ms
-            pm.total_ttft_ms += r.ttft_ms
-            pm.durations.append(r.duration_ms)
-            pm.ttfts.append(r.ttft_ms)
+            self._accumulate(providers[r.provider], r)
 
         return providers
 
@@ -199,6 +203,67 @@ class MetricsStore:
             "avg_ttft_ms": round(pm.avg_ttft_ms, 1),
             "tokens_per_second": round(pm.tokens_per_second, 1),
             "errors_by_type": dict(pm.errors_by_type),
+        }
+
+    def get_model_stats(self, model: str, window_seconds: int = 300) -> Optional[dict]:
+        """Get stats for a specific MODEL in the given window.
+
+        Aggregates per-model (not per-provider) so the router can rank by
+        the latency of the exact model — a fast model on a slow provider must
+        not inherit the provider's latency, and vice versa. Keys mirror
+        get_provider_stats so _compute_score can consume either dict.
+        """
+        records = self._window_records(window_seconds)
+        model_records = [r for r in records if r.model == model]
+        if not model_records:
+            return None
+        pm = ProviderMetrics()
+        for r in model_records:
+            self._accumulate(pm, r)
+        provider = model.split("/")[0] if "/" in model else model_records[0].provider
+        return {
+            "model": model,
+            "provider": provider,
+            "window_seconds": window_seconds,
+            "total_requests": pm.total_requests,
+            "successful": pm.successful_requests,
+            "failed": pm.failed_requests,
+            "error_rate": round(pm.error_rate, 4),
+            "tokens_in": pm.tokens_in,
+            "tokens_out": pm.tokens_out,
+            "tokens_cache": pm.tokens_cache,
+            "total_tokens": pm.tokens_in + pm.tokens_out,
+            "avg_latency_ms": round(pm.avg_latency_ms, 1),
+            "p95_latency_ms": pm.p95_latency_ms,
+            "avg_ttft_ms": round(pm.avg_ttft_ms, 1),
+            "tokens_per_second": round(pm.tokens_per_second, 1),
+            "errors_by_type": dict(pm.errors_by_type),
+        }
+
+    def get_all_model_stats(self, window_seconds: int = 300) -> dict:
+        """Get stats for all models in the given window (for persistence)."""
+        records = self._window_records(window_seconds)
+        models: dict[str, ProviderMetrics] = defaultdict(ProviderMetrics)
+        for r in records:
+            self._accumulate(models[r.model], r)
+
+        return {
+            "window_seconds": window_seconds,
+            "total_records": len(records),
+            "models": {
+                name: {
+                    "provider": name.split("/")[0] if "/" in name else "",
+                    "total_requests": pm.total_requests,
+                    "successful": pm.successful_requests,
+                    "failed": pm.failed_requests,
+                    "error_rate": round(pm.error_rate, 4),
+                    "avg_latency_ms": round(pm.avg_latency_ms, 1),
+                    "p95_latency_ms": pm.p95_latency_ms,
+                    "avg_ttft_ms": round(pm.avg_ttft_ms, 1),
+                    "tokens_per_second": round(pm.tokens_per_second, 1),
+                }
+                for name, pm in models.items()
+            },
         }
 
     def get_all_stats(self, window_seconds: int = 300) -> dict:
