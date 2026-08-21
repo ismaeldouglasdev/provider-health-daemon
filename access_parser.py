@@ -19,13 +19,15 @@ log = logging.getLogger(__name__)
 # ── Regex patterns ───────────────────────────────────────────────────
 
 # "▶ POST main-rr → nvidia/minimaxai/minimax-m3 · STREAM · 2 MSG · 43 TOOL · ACC:nvidia"
-RE_REQUEST = re.compile(
-    r"[▶].*?(?P<direction>→)\s*(?P<model>\S+?)\s*(?:·\s*.*?)?(?:ACC:\s*(?P<provider>\S+))?"
-)
+# model é guloso (para no whitespace); provider vem do campo ACC via RE_ACC
+RE_REQUEST = re.compile(r"[▶]\s*POST\s+\S+\s*→\s*(?P<model>\S+)")
+RE_ACC = re.compile(r"ACC:\s*(.+?)\s*$")
 
-# "📊 DONE 8908ms · TTFT 8414ms · IN 51007 (CACHE ↻128) · OUT 15"
+# Formato novo: "📊 DONE 924ms · IN 6141 · OUT 0" (TTFT opcional e pode não existir)
+# Formato antigo: "📊 DONE 8908ms · TTFT 8414ms · IN 51007 (CACHE ↻128) · OUT 15"
 RE_DONE = re.compile(
-    r"DONE\s+(?P<duration_ms>\d+)ms\s*·\s*TTFT\s+(?P<ttft_ms>\d+)ms"
+    r"DONE\s+(?P<duration_ms>\d+)ms"
+    r"(?:\s*·\s*TTFT\s+(?P<ttft_ms>\d+)ms)?"
     r"(?:\s*·\s*IN\s+(?P<tokens_in>\d+))?"
     r"(?:\s*\(CACHE\s*↻\s*(?P<tokens_cache>\d+)\))?"
     r"(?:\s*·\s*OUT\s+(?P<tokens_out>\d+))?"
@@ -144,7 +146,12 @@ def parse_line(line: str) -> Optional[dict]:
     m = RE_REQUEST.search(stripped)
     if m:
         model = m.group("model")
-        provider_from_acc = m.group("provider") or (model.split("/")[0] if "/" in model else model)
+        m_acc = RE_ACC.search(stripped)
+        provider_from_acc = (
+            m_acc.group(1)
+            if m_acc
+            else (model.split("/")[0] if "/" in model else model)
+        )
         return {
             "type": "request",
             "timestamp": ts,
@@ -160,7 +167,7 @@ def parse_line(line: str) -> Optional[dict]:
             "type": "done",
             "timestamp": ts,
             "duration_ms": int(m.group("duration_ms")),
-            "ttft_ms": int(m.group("ttft_ms")),
+            "ttft_ms": int(m.group("ttft_ms") or 0),
             "tokens_in": int(m.group("tokens_in") or 0),
             "tokens_out": int(m.group("tokens_out") or 0),
             "tokens_cache": int(m.group("tokens_cache") or 0),
