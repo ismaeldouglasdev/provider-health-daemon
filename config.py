@@ -29,6 +29,10 @@ NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "").strip() or _load_opencode_api_key("9router")
 KRI_KEY = os.environ.get("KRI_KEY", "").strip() or _load_opencode_api_key("kiro")
 
+# Must stay BELOW typical client timeouts so the proxy can time out a slow
+# upstream, fall back, and still answer (regression guard: bugs-erros-opencode.md 2026-08-14).
+UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
+
 # ── Dashboard ────────────────────────────────────────────────────────
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "20132"))
 

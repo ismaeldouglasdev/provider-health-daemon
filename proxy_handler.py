@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import urllib.request
@@ -23,7 +24,7 @@ from pathlib import Path
 # daemon.py inserts prompt-limiter at sys.path[0], which shadows our
 # local modules (smart_router.py, metrics_store.py, etc.).
 # Fix: put our directory at [0], prompt-limiter at [1].
-from config import PROMPT_LIMITER_DIR
+from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT
 
 _local_dir = str(Path(__file__).parent)
 _prompt_dir = str(PROMPT_LIMITER_DIR)
@@ -600,7 +601,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         try:
             opener = self.opener if self.opener is not None else urllib.request.build_opener()
-            with opener.open(req, timeout=180) as resp:
+            with opener.open(req, timeout=UPSTREAM_TIMEOUT) as resp:
                 is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                 resp_body, ttft_ms = self._emit_upstream_response(resp, is_chat, fallback_used, start_time)
 
@@ -652,7 +653,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_url = fallback_router.url.rstrip("/") + path
                         fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
-                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=180)
+                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=UPSTREAM_TIMEOUT)
                         is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                         fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
                         if body and fallback_resp.status == 200:
@@ -778,6 +779,36 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 self._record_usage(body, resp_body, start_time, provider, model, False, sem_type)
 
         except urllib.error.URLError as e:
+            # Pure upstream slowness must NOT feed the router failure counter:
+            # a slow provider ≠ dead router (cooldown-cascade regression guard,
+            # bugs-erros-opencode.md 2026-08-14). Try model-level fallback only.
+            reason = getattr(e, "reason", None)
+            is_pure_timeout = isinstance(reason, (socket.timeout, TimeoutError)) or (
+                reason is not None and "timed out" in str(reason).lower()
+            )
+            if is_pure_timeout:
+                if body and getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES:
+                    tried = set(getattr(self, "_tried_models", set()))
+                    tried.add(body.get("model", ""))
+                    self._tried_models = tried
+                    next_model = self._next_fallback_model(tried)
+                    if next_model:
+                        self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
+                        log.warning(
+                            f"Global fallback {self._fallback_attempts}/{MAX_FALLBACK_RETRIES}: "
+                            f"upstream timeout on '{body.get('model')}' → retrying with '{next_model}'"
+                        )
+                        body["model"] = next_model
+                        self._router_selected = True
+                        self._forward(body)
+                        return
+                self._respond_unavailable(f"Upstream timeout after {UPSTREAM_TIMEOUT:.0f}s")
+                if body:
+                    model = body.get("model", "")
+                    provider = model.split("/")[0] if "/" in model else model
+                    self._record_usage(body, b"", start_time, provider, model, False, "timeout")
+                return
+
             # Attempt fallback via meta-router
             if target_router and self.meta_selector and not fallback_used:
                 try:
@@ -788,7 +819,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
                         opener = self.opener if self.opener is not None else urllib.request.build_opener()
-                        fallback_resp = opener.open(fallback_req, timeout=180)
+                        fallback_resp = opener.open(fallback_req, timeout=UPSTREAM_TIMEOUT)
                         is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                         fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
                         if body and fallback_resp.status == 200:
