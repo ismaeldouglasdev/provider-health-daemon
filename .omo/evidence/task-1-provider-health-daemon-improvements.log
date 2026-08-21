@@ -1,0 +1,30 @@
+=== Todo 1 — opencode_ghost_sanitizer ===
+Failing-first: fixture /tmp com ghost rows antigas + fresh row
+============================== 2 passed in 1.87s ===============================
+
+--- dry-run (não modifica):
+após dry-run ainda ghost: 2
+--- run real:
+m1: {"role":"user","model":{"providerID":"9router","modelID":"ollama/gpt-oss:120b"}}
+session: {"id":"ollama/gpt-oss:120b","providerID":"9router"}
+fresh intacto: {"role":"user","model":{"providerID":"opencode","modelID":"fresh"}}
+ghosts restantes (deve ser 1, só o fresh): 1
+ok
+--- idempotência (2ª rodada):
+exit 0 ok
+--- systemd units (fora do repo):
+[Unit]
+Description=Opencode Ghost Sanitizer Service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/ismaeldev/Desktop/code_study/MeusProjetos/provider-health-daemon/scripts/opencode_ghost_sanitizer.py
+[Unit]
+Description=Hourly Opencode Ghost Sanitizer Timer
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
