@@ -625,7 +625,9 @@ def main():
     # ports) exits cleanly with code 0, so systemd Restart=always does NOT
     # enter a restart loop. The lock is released automatically on exit.
     import fcntl
-    _lock_path = Path.home() / ".9router" / "daemon.lock"
+    # Lock path injetável via env: testes spawnam daemons em paralelo ao
+    # daemon real sem colidir no lock de instância única.
+    _lock_path = Path(os.environ.get("DAEMON_LOCK_PATH", str(Path.home() / ".9router" / "daemon.lock")))
     try:
         _lock_path.parent.mkdir(parents=True, exist_ok=True)
         _lock_fd = open(_lock_path, "w")
@@ -662,45 +664,51 @@ def main():
             if r["url"].rstrip("/") == meta_self:
                 log.warning(f"Router '{r['name']}' URL points to self ({meta_self}) — misconfiguration")
 
-    # ── Probe timeout sanity check (single-shot, boot only) ──────────
+    # ── Probe timeout sanity check (background — must NOT block bind) ──
     # Measures real latency of each router health endpoint; warns when the
     # configured timeout leaves no headroom — the exact failure mode that
     # produced 914 false failures on OmniRoute (2.0s timeout vs 2.7s latency).
+    # Network-bound (~13s+ por router): roda em thread para os servidores
+    # bindarem <3s após o start (janela morta gera cascade nos fallback chains).
     import urllib.request as _urlreq
-    for r in DOWNSTREAM_ROUTERS:
-        timeout = r.get("timeout", PROBE_TIMEOUT)
-        try:
-            url = r["url"].rstrip("/") + r.get("health_check_path", "/v1/models")
-            req = _urlreq.Request(url, method="GET")
-            auth = r.get("auth")
-            if auth:
-                req.add_header(auth["header"], auth["value"])
-            req.add_header("Accept", "application/json")
-            t0 = time.monotonic()
-            with _urlreq.urlopen(req, timeout=timeout) as resp:
-                resp.read()
-            latency = time.monotonic() - t0
-            if timeout < latency * 1.5:
+
+    def _startup_sanity_probes():
+        for r in DOWNSTREAM_ROUTERS:
+            timeout = r.get("timeout", PROBE_TIMEOUT)
+            try:
+                url = r["url"].rstrip("/") + r.get("health_check_path", "/v1/models")
+                req = _urlreq.Request(url, method="GET")
+                auth = r.get("auth")
+                if auth:
+                    req.add_header(auth["header"], auth["value"])
+                req.add_header("Accept", "application/json")
+                t0 = time.monotonic()
+                with _urlreq.urlopen(req, timeout=timeout) as resp:
+                    resp.read()
+                latency = time.monotonic() - t0
+                if timeout < latency * 1.5:
+                    log.warning(
+                        f"Probe timeout for router '{r['name']}' is {timeout}s but actual latency is "
+                        f"{latency:.2f}s — health checks will falsely fail. Increase 'timeout' in config.py.",
+                        extra={
+                            "event": "probe_timeout_underestimate",
+                            "router": r["name"],
+                            "timeout": timeout,
+                            "latency": round(latency, 3),
+                        },
+                    )
+                else:
+                    log.info(
+                        f"Startup probe OK for router '{r['name']}' ({latency:.2f}s, timeout {timeout}s)",
+                        extra={"event": "startup_probe_ok", "router": r["name"], "latency": round(latency, 3)},
+                    )
+            except Exception as e:
                 log.warning(
-                    f"Probe timeout for router '{r['name']}' is {timeout}s but actual latency is "
-                    f"{latency:.2f}s — health checks will falsely fail. Increase 'timeout' in config.py.",
-                    extra={
-                        "event": "probe_timeout_underestimate",
-                        "router": r["name"],
-                        "timeout": timeout,
-                        "latency": round(latency, 3),
-                    },
+                    f"Startup probe failed for router '{r['name']}': {type(e).__name__} {e}",
+                    extra={"event": "startup_probe_failed", "router": r["name"], "error": type(e).__name__},
                 )
-            else:
-                log.info(
-                    f"Startup probe OK for router '{r['name']}' ({latency:.2f}s, timeout {timeout}s)",
-                    extra={"event": "startup_probe_ok", "router": r["name"], "latency": round(latency, 3)},
-                )
-        except Exception as e:
-            log.warning(
-                f"Startup probe failed for router '{r['name']}': {type(e).__name__} {e}",
-                extra={"event": "startup_probe_failed", "router": r["name"], "error": type(e).__name__},
-            )
+
+    threading.Thread(target=_startup_sanity_probes, daemon=True, name="startup-sanity").start()
 
     # ── Router-of-routers infrastructure (Wave 2) ─────────────────────
     meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
