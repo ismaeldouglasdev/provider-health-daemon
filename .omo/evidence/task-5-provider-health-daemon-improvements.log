@@ -1,0 +1,9 @@
+=== Todo 5 — daily_provider_usage ===
+Fonte decidida: access.log via access_parser.parse_line (data.sqlite vazio — sem tabelas)
+Failing-first: teste criado antes da implementação (import error capturado)
+Bug descoberto no caminho: access_parser.py quebrado vs formato atual do log
+  - RE_REQUEST lazy \S+? casava 1 char (model='g'); ACC:\S+ quebrava em providers com espaço
+  - RE_DONE exigia TTFT obrigatório; formato novo não tem TTFT
+  - Correção: model guloso + RE_ACC (resto da linha, espaços ok) + TTFT opcional + int(None or 0)
+============================== 4 passed in 0.92s ===============================
+======================== 2 failed, 450 passed in 9.26s =========================
