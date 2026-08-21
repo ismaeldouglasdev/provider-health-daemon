@@ -26,7 +26,7 @@ from typing import Optional
 from socketserver import ThreadingMixIn
 
 from metrics_store import MetricsStore
-from config import DASHBOARD_PORT
+from config import DASHBOARD_PORT, DASHBOARD_HOST
 
 log = logging.getLogger(__name__)
 
@@ -534,8 +534,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 class DashboardServer:
     """Dashboard server that runs in a background thread."""
 
-    def __init__(self, port: int = DASHBOARD_PORT):
+    def __init__(self, port: int = DASHBOARD_PORT, host: str = DASHBOARD_HOST):
         self.port = port
+        self.host = host
         self.metrics_store = MetricsStore()
         self.health_registry = None
         self.metrics_persistence = None
@@ -566,7 +567,7 @@ class DashboardServer:
             allow_reuse_address = True
 
         try:
-            self.server = ThreadingServer(("0.0.0.0", self.port), handler)
+            self.server = ThreadingServer((self.host, self.port), handler)
         except OSError as e:
             if e.errno == 98:  # EADDRINUSE — another process holds this port
                 log.error(

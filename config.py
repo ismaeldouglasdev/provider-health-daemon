@@ -25,6 +25,7 @@ def _load_opencode_api_key(provider: str) -> str:
 
 # ── Network ──────────────────────────────────────────────────────────
 HEALTH_PROXY_PORT = int(os.environ.get("HEALTH_PROXY_PORT", "20131"))
+HEALTH_PROXY_HOST = os.environ.get("HEALTH_PROXY_HOST", "127.0.0.1")
 NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "").strip() or _load_opencode_api_key("9router")
 KRI_KEY = os.environ.get("KRI_KEY", "").strip() or _load_opencode_api_key("kiro")
@@ -40,6 +41,7 @@ STREAM_HEAD_WINDOW_LINES = int(os.environ.get("STREAM_HEAD_WINDOW_LINES", "64"))
 
 # ── Dashboard ────────────────────────────────────────────────────────
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "20132"))
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 
 # ── Access Log ───────────────────────────────────────────────────────
 ACCESS_LOG_PATH = Path.home() / ".9router" / "logs" / "access.log"

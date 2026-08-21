@@ -1,0 +1,11 @@
+=== Todos 3+4 — bind-first + security bind ===
+Todo 3: sanity probes de boot (rede, ~13-30s) movidas para thread background — não bloqueiam mais o bind
+Todo 3 extra: DAEMON_LOCK_PATH env-injectável (testes spawnam daemons paralelos ao real)
+Todo 4: HEALTH_PROXY_HOST/DASHBOARD_HOST env-injectáveis, default 127.0.0.1 (antes: 0.0.0.0 hardcoded em proxy_handler.py e dashboard.py)
+Failing-first: tests/test_bind_first.py criado antes (falhava com lock collision → resolvido com DAEMON_LOCK_PATH; falhava por bind lento → resolvido com threading dos probes)
+
+=== pytest final ===
+============================= 452 passed in 40.86s =============================
+
+=== grep 0.0.0.0 restante nos bindings ===
+nenhum binding 0.0.0.0 restante

@@ -53,6 +53,7 @@ from response_normalizer import normalize_response, normalize_error, normalize_s
 # ── Rest of config (PROMPT_LIMITER_DIR already imported above) ────────
 from config import (
     HEALTH_PROXY_PORT,
+    HEALTH_PROXY_HOST,
     NINEROUTER_URL,
     NINEROUTER_KEY,
     MODEL_LIMITS_FILE,
@@ -1642,8 +1643,10 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 class HealthProxyServer:
     """Main server that ties proxy + health registry + metrics + smart router + meta-router together."""
 
-    def __init__(self, port: int = HEALTH_PROXY_PORT, metrics_store: MetricsStore = None):
+    def __init__(self, port: int = HEALTH_PROXY_PORT, metrics_store: MetricsStore = None,
+                 host: str = HEALTH_PROXY_HOST):
         self.port = port
+        self.host = host
         self.registry = HealthRegistry()
         self.metrics_store = metrics_store or MetricsStore()
         self.smart_router = SmartRouter(self.metrics_store)
@@ -1680,7 +1683,7 @@ class HealthProxyServer:
         class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
             daemon_threads = True
 
-        self._server = ThreadingHTTPServer(("0.0.0.0", self.port), handler)
+        self._server = ThreadingHTTPServer((self.host, self.port), handler)
         HandlerWithRegistry = handler
         HandlerWithRegistry.opener = self._opener
 
