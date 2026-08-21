@@ -24,7 +24,7 @@ from pathlib import Path
 # daemon.py inserts prompt-limiter at sys.path[0], which shadows our
 # local modules (smart_router.py, metrics_store.py, etc.).
 # Fix: put our directory at [0], prompt-limiter at [1].
-from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT
+from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT, STREAM_HEAD_WINDOW_LINES
 
 _local_dir = str(Path(__file__).parent)
 _prompt_dir = str(PROMPT_LIMITER_DIR)
@@ -444,9 +444,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         Empty-200 guard: dead models / exhausted quotas answer HTTP 200 with an
         empty body. The health gate only inspects HTTP status, so emitting it
         here would hand the client a silent empty completion (opencode "session
-        didn't respond"). The full body is read and checked BEFORE
-        send_response; an empty one raises EmptyUpstreamResponse so _forward
-        can fall back to the next healthy model.
+        didn't respond"). A head window of STREAM_HEAD_WINDOW_LINES is drained
+        first: if the upstream closes within it, the body is checked and an
+        empty one raises EmptyUpstreamResponse so _forward can fall back to
+        the next healthy model; if the window fills, the model is alive and
+        the remainder streams through chunk-by-chunk.
         """
         if self.audit:
             self.audit.requests_proxied += 1
@@ -472,12 +474,28 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         # endpoints (embeddings etc.) are forwarded untouched.
         sent: list[bytes] = []
         body: bytes = b""
+        stream_live = False
         if is_chat:
             if is_streaming:
-                for line in [first_line] + list(resp):
-                    sent.append(_normalize_sse_line(line))
-                if _is_empty_chat_response(b"".join(sent)):
+                # Head-window drain: read up to STREAM_HEAD_WINDOW_LINES (or
+                # EOF) before committing. Empty-200 upstreams finish inside
+                # the window, so EOF keeps the model-fallback path; a filled
+                # window proves the model is alive and the remainder is
+                # forwarded live (real TTFT instead of full-body buffering).
+                head_lines = [first_line]
+                while len(head_lines) < STREAM_HEAD_WINDOW_LINES:
+                    try:
+                        line = resp.readline()
+                    except (socket.timeout, TimeoutError, OSError):
+                        break
+                    if not line:
+                        break
+                    head_lines.append(line)
+                head_eof = len(head_lines) < STREAM_HEAD_WINDOW_LINES
+                sent = [_normalize_sse_line(line) for line in head_lines]
+                if head_eof and _is_empty_chat_response(b"".join(sent)):
                     raise EmptyUpstreamResponse(b"".join(sent))
+                stream_live = not head_eof
             else:
                 body = first_line + resp.read()
                 body = self._normalize_response_body(body, content_type)
@@ -501,6 +519,16 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             for line in sent:
                 self.wfile.write(f"{len(line):X}\r\n".encode() + line + b"\r\n")
                 self.wfile.flush()
+            if stream_live:
+                try:
+                    for raw in resp:
+                        line = _normalize_sse_line(raw)
+                        self.wfile.write(f"{len(line):X}\r\n".encode() + line + b"\r\n")
+                        self.wfile.flush()
+                except (socket.timeout, TimeoutError, OSError) as e:
+                    # Mid-stream upstream failure can't be replayed; close the
+                    # chunked response cleanly so the client's parser finishes.
+                    log.warning(f"SSE upstream interrupted mid-stream: {e}")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             return b"".join(sent), ttft_ms

@@ -452,3 +452,77 @@ def test_direct_request_unclassified_4xx_returns_raw(tmp_path):
     assert len(opener.calls) == 1
     assert statuses == [404]
     assert b"provider_unavailable" not in wfile.getvalue()
+
+
+class _LongLivedSSEResponse(_FakeSSEResponse):
+    """SSE fake with more lines than STREAM_HEAD_WINDOW_LINES plus a probe
+    hook that records how many bytes the client wfile already holds when each
+    tail line is produced — proves progressive forwarding."""
+
+    def __init__(self, lines, wfile_ref, timeline):
+        super().__init__(lines)
+        self._wfile_ref = wfile_ref
+        self._timeline = timeline
+
+    def __iter__(self):
+        while self.lines:
+            self._timeline.append(len(self._wfile_ref.getvalue()))
+            yield self.lines.pop(0)
+
+
+class _MidstreamTimeoutSSEResponse(_FakeSSEResponse):
+    """SSE fake whose body iterator dies with TimeoutError mid-stream."""
+
+    def __iter__(self):
+        while self.lines:
+            yield self.lines.pop(0)
+        raise TimeoutError("upstream read timed out")
+
+
+def _sse_long_stream(total_lines: int = 80) -> list[bytes]:
+    lines = []
+    for i in range(total_lines - 1):
+        lines.append(
+            f'data: {{"id":"c1","object":"chat.completion.chunk",'
+            f'"choices":[{{"index":0,"delta":{{"content":"tok{i}"}},'
+            f'"finish_reason":null}}]}}\n\n'.encode()
+        )
+    lines.append(b"data: [DONE]\n\n")
+    return lines
+
+
+def test_sse_streams_progressively_before_eof(tmp_path):
+    """Window fills (no EOF) → commit early; client receives bytes while the
+    upstream is still producing, instead of after full-body buffering."""
+    registry = HealthRegistry(filepath=tmp_path / "health.json")
+    timeline: list[int] = []
+    resp = _LongLivedSSEResponse(_sse_long_stream(80), None, timeline)
+    opener = _FakeOpener([("ok", resp)])
+    handler, wfile = _stub_handler(registry, opener)
+    resp._wfile_ref = wfile
+    handler.smart_router = MagicMock()
+
+    with _fallback_env(handler.smart_router):
+        handler._forward(_stream_body())
+
+    assert handler._fallback_attempts == 0
+    # First tail line was produced AFTER the head was already flushed.
+    assert timeline and timeline[0] > 0
+    # Full stream still reached the client, terminal chunk included.
+    body = wfile.getvalue()
+    assert b"tok78" in body
+    assert body.endswith(b"0\r\n\r\n")
+
+
+def test_midstream_timeout_writes_terminal_chunk(tmp_path):
+    """Upstream dying mid-stream must not raise out of _forward; the chunked
+    response is closed cleanly so the client's parser terminates."""
+    registry = HealthRegistry(filepath=tmp_path / "health.json")
+    opener = _FakeOpener([("ok", _MidstreamTimeoutSSEResponse(_sse_long_stream(80)))])
+    handler, wfile = _stub_handler(registry, opener)
+    handler.smart_router = MagicMock()
+
+    with _fallback_env(handler.smart_router):
+        handler._forward(_stream_body())  # must not raise
+
+    assert wfile.getvalue().endswith(b"0\r\n\r\n")

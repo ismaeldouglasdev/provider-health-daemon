@@ -33,6 +33,11 @@ KRI_KEY = os.environ.get("KRI_KEY", "").strip() or _load_opencode_api_key("kiro"
 # upstream, fall back, and still answer (regression guard: bugs-erros-opencode.md 2026-08-14).
 UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
 
+# SSE head-window (lines) drained before committing a streaming response.
+# Empty-200 upstreams finish inside the window (EOF → model fallback still
+# possible); a filled window proves the model is alive → forward the rest live.
+STREAM_HEAD_WINDOW_LINES = int(os.environ.get("STREAM_HEAD_WINDOW_LINES", "64"))
+
 # ── Dashboard ────────────────────────────────────────────────────────
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "20132"))
 
