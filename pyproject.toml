@@ -1,0 +1,34 @@
+[project]
+name = "provider-health-daemon"
+version = "1.0.0"
+description = "Health proxy + smart routing para o 9router (meta-gateway de IA)"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = [
+    ".omo",
+    "prompt-limiter",
+]
+
+[tool.ruff.lint]
+# Mesmos ignores do CI (.github/workflows/ci.yml) — manter em sincronia.
+ignore = ["E501", "F403", "F401", "E402"]
+
+[tool.ruff.format]
+quote-style = "preserve"
+
+[tool.pyright]
+typeCheckingMode = "basic"
+exclude = [
+    "tests",
+    "scripts",
+    "prompt-limiter",
+    "**/__pycache__",
+]
+# Tipagem fraca legada em proxy_handler/daemon/dashboard — baseline pragmático,
+# não big-bang (ver LSP errors conhecidos; plano todo 9).
+reportAttributeAccessIssue = false
+reportArgumentType = false
+reportAssignmentType = false

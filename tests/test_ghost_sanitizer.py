@@ -1,10 +1,12 @@
+import json
 import sqlite3
 import subprocess
 import tempfile
 import time
-import pytest
-import json
 from pathlib import Path
+
+import pytest
+
 
 @pytest.fixture(scope="function")
 def fixture_db():
@@ -19,7 +21,7 @@ def fixture_db():
             "event": "CREATE TABLE event (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER)"
         }
 
-        for table, create_sql in tables.items():
+        for create_sql in tables.values():
             conn.execute(create_sql)
 
         aged_epoch = (time.time() - 2 * 3600) * 1000  # > 1 hour old
@@ -41,7 +43,7 @@ def test_sanitizer(fixture_db):
 
     result = subprocess.run([
         "python3", script_path, "--db", fixture_db, "--dry-run"
-    ], capture_output=True)
+    ], capture_output=True, check=False)
     assert result.returncode == 0
 
     with sqlite3.connect(fixture_db) as conn:
@@ -52,7 +54,7 @@ def test_sanitizer(fixture_db):
 
     result = subprocess.run([
         "python3", script_path, "--db", fixture_db
-    ], capture_output=True)
+    ], capture_output=True, check=False)
     assert result.returncode == 0
 
     with sqlite3.connect(fixture_db) as conn:
@@ -74,7 +76,7 @@ def test_sanitizer(fixture_db):
 
     result = subprocess.run([
         "python3", script_path, "--db", fixture_db
-    ], capture_output=True)
+    ], capture_output=True, check=False)
     assert result.returncode == 0  # Idempotency check
 
     with sqlite3.connect(fixture_db) as conn:
@@ -91,5 +93,5 @@ def test_missing_column(fixture_db):
 
     result = subprocess.run([
         "python3", script_path, "--db", fixture_db
-    ], capture_output=True)
+    ], capture_output=True, check=False)
     assert result.returncode == 2

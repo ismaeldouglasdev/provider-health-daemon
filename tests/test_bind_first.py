@@ -10,8 +10,9 @@ import socket
 import subprocess
 import sys
 import time
-import pytest
 from typing import Literal
+
+import pytest
 
 
 def try_connect(host: str, port: int, timeout: float = 0.5, retries: int = 3) -> bool:
@@ -23,7 +24,7 @@ def try_connect(host: str, port: int, timeout: float = 0.5, retries: int = 3) ->
             sock.connect((host, port))
             sock.close()
             return True
-        except (ConnectionRefusedError, socket.timeout, OSError):
+        except (TimeoutError, ConnectionRefusedError, OSError):
             time.sleep(0.1 * (attempt + 1))
     return False
 
@@ -31,8 +32,8 @@ def try_connect(host: str, port: int, timeout: float = 0.5, retries: int = 3) ->
 def test_bind_first():
     """Ensure servers bind within 5s of startup."""
     # Use unique ports for this test to avoid conflicts
-    HEALTH_PROXY_PORT = int(20141)
-    DASHBOARD_PORT = int(20142)
+    HEALTH_PROXY_PORT = 20141
+    DASHBOARD_PORT = 20142
 
     # Verify ports are not currently in use
     for port in (HEALTH_PROXY_PORT, DASHBOARD_PORT):
@@ -117,14 +118,13 @@ def test_bind_first():
 
 def test_binding_hosts():
     """Ensure decoration matches default "127.0.0.1" and env override works."""
-    import os
     import socket
     import subprocess
     import sys
     import time
 
-    HEALTH_PROXY_PORT = int(20141)
-    DASHBOARD_PORT = int(20142)
+    HEALTH_PROXY_PORT = 20141
+    DASHBOARD_PORT = 20142
 
     # Override host via env (dev override before daemon binds)
     override_host = "127.0.0.1"

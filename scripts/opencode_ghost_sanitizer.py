@@ -1,11 +1,12 @@
 #!/usr/bin/python3
-import sqlite3
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time
-from typing import Dict, Any
+from typing import Any
+
 
 def process_data(data: Any) -> Any:
     if isinstance(data, dict):

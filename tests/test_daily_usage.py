@@ -2,14 +2,12 @@ import pytest
 
 from daily_usage import daily_provider_usage
 
-FIXTURE = "\n".join(
-    [
-        "[10:00:01] 🔴 ▶ POST groq/llama-3.3-70b-versatile → groq/llama-3.3-70b-versatile · FMT: openai→groq · JSON · 2 MSG · ACC:groq",
-        "[10:00:05] 📊 DONE 1200ms · IN 500 (CACHE ↻100) · OUT 250",
-        "[10:01:01] 🔴 ▶ POST samba/Meta-Llama-3.3-70B-Instruct → samba/Meta-Llama-3.3-70B-Instruct · FMT: openai→samba · JSON · 1 MSG · ACC:samba",
-        "[10:01:04] 📊 DONE 900ms · TTFT 200ms · IN 300 · OUT 150",
-        "[10:02:01] 🔴 ▶ POST groq/llama-3.3-70b-versatile → groq/llama-3.3-70b-versatile · FMT: openai→groq · JSON · 1 MSG · ACC:groq",
-    ]
+FIXTURE = (
+    "[10:00:01] 🔴 ▶ POST groq/llama-3.3-70b-versatile → groq/llama-3.3-70b-versatile · FMT: openai→groq · JSON · 2 MSG · ACC:groq\n"
+    "[10:00:05] 📊 DONE 1200ms · IN 500 (CACHE ↻100) · OUT 250\n"
+    "[10:01:01] 🔴 ▶ POST samba/Meta-Llama-3.3-70B-Instruct → samba/Meta-Llama-3.3-70B-Instruct · FMT: openai→samba · JSON · 1 MSG · ACC:samba\n"
+    "[10:01:04] 📊 DONE 900ms · TTFT 200ms · IN 300 · OUT 150\n"
+    "[10:02:01] 🔴 ▶ POST groq/llama-3.3-70b-versatile → groq/llama-3.3-70b-versatile · FMT: openai→groq · JSON · 1 MSG · ACC:groq"
 )
 
 

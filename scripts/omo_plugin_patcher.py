@@ -64,7 +64,7 @@ def main() -> int:
     with open(plugin_path, "w", encoding="utf-8") as fh:
         fh.write(patched)
 
-    check = subprocess.run(["node", "--check", plugin_path], capture_output=True)
+    check = subprocess.run(["node", "--check", plugin_path], capture_output=True, check=False)
     if check.returncode != 0:
         shutil.copy2(backup, plugin_path)
         print(f"ERRO: node --check falhou após patch (restaurado do backup): "
