@@ -36,12 +36,14 @@ def main():
         sys.stderr.write(f"Error connecting to DB: {e}\n")
         sys.exit(1)
 
+    # event EXCLUÍDO: sem coluna de timestamp no schema real — pela regra
+    # conservadora, row sem idade comprovada nunca é limpa (e eventos não
+    # são lidos na retomada de sessão).
     tables = {
         "message": ("data", "time_created"),
         "session": ("model", "time_created"),
         "part": ("data", "time_created"),
         "session_message": ("data", "time_created"),
-        "event": ("data", "time_created")
     }
 
     cursor = conn.cursor()
