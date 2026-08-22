@@ -1,0 +1,7 @@
+=== Todo 2 — omo_plugin_patcher ===
+Idempotente por marker; backup timestamped antes de patchear; node --check valida; formato desconhecido = exit 3
+Cenário 1 (real, marker presente): exit 0 silencioso
+Cenário 2 (/tmp cópia sem patch): patch aplicado + node --check ok + backup criado
+Idempotência: 2ª rodada exit 0 sem mudanças
+Wiring: ExecStartPre no opencode-ghost-sanitizer.service (patcher roda antes do sanitizador a cada ciclo hourly)
+run final no real: exit=0
