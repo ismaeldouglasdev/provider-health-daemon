@@ -24,6 +24,7 @@ from config import (
     NINEROUTER_KEY,
     NINEROUTER_URL,
     PROBE_TIMEOUT,
+    QUOTA_AWARE_ROTATION,
 )
 from metrics_store import MetricsStore
 
@@ -249,7 +250,7 @@ class SmartRouter:
     Takes a list of model IDs and returns the best available one.
     """
 
-    def __init__(self, metrics_store: MetricsStore):
+    def __init__(self, metrics_store: MetricsStore, usage_cache=None):
         self.metrics = metrics_store
         # Load-spreading state (thread-safe): tracks the last time each
         # provider was selected so concurrent requests don't all pile onto
@@ -258,6 +259,9 @@ class SmartRouter:
         # unavailable"). ThreadingHTTPServer serves requests in parallel.
         self._spread_lock = threading.Lock()
         self._last_selected: dict[str, float] = {}  # provider -> monotonic ts
+        # Quota-aware rotation (todo 6): objeto com .get() -> dict[provider,
+        # {"tokens","requests"}] do dia. None = feature desligada.
+        self.usage_cache = usage_cache
 
     def rank_models(
         self,
@@ -475,10 +479,25 @@ class SmartRouter:
 
         with self._spread_lock:
             now = time.monotonic()
+            # Quota-aware boost (todo 6): providers sem uso hoje ordenam antes
+            # dos já usados; LRU continua decidindo dentro de cada tier. Boost
+            # de ordenação apenas — nada é bloqueado ou penalizado.
+            usage = {}
+            if self.usage_cache is not None and QUOTA_AWARE_ROTATION:
+                try:
+                    usage = self.usage_cache.get() or {}
+                except Exception as e:
+                    log.debug("quota usage cache unavailable: %s", e)
+
+            def _sort_key(r):
+                lru = self._last_selected.get(r[1], 0.0)
+                if usage:
+                    used_today = 1 if usage.get(r[1], {}).get("requests", 0) > 0 else 0
+                    return (used_today, lru)
+                return (0, lru)
+
             # Least-recently-used provider first; never-used counts as oldest.
-            band.sort(
-                key=lambda r: self._last_selected.get(r[1], 0.0)
-            )
+            band.sort(key=_sort_key)
             chosen = band[0]
             self._last_selected[chosen[1]] = now
 

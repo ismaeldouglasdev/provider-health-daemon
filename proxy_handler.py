@@ -61,6 +61,7 @@ from config import (
     MAX_FALLBACK_RETRIES,
     RESPONSE_CACHE_TTL,
     RESPONSE_CACHE_MAX_BYTES,
+    QUOTA_AWARE_ROTATION,
     DOWNSTREAM_ROUTERS,
 )
 
@@ -1649,7 +1650,12 @@ class HealthProxyServer:
         self.host = host
         self.registry = HealthRegistry()
         self.metrics_store = metrics_store or MetricsStore()
-        self.smart_router = SmartRouter(self.metrics_store)
+        self.usage_cache = None
+        if QUOTA_AWARE_ROTATION:
+            from daily_usage import CachedProviderUsage
+
+            self.usage_cache = CachedProviderUsage()
+        self.smart_router = SmartRouter(self.metrics_store, usage_cache=self.usage_cache)
         self.meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
         self.meta_selector = MetaRouterSelector(self.meta_registry)
         self.audit = None

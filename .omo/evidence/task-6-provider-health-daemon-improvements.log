@@ -1,0 +1,7 @@
+=== Todo 6 — rotação quota-aware ===
+Mecanismo: chave de ordenação (used_today, LRU) dentro da banda de spread — boost de ordenação, nunca bloqueio
+Fonte de uso: daily_usage.CachedProviderUsage (TTL 60s) sobre access.log; provider normalizado ACC 'github|user' -> 'github'
+Flag: QUOTA_AWARE_ROTATION (default true); cache com erro ou flag off = comportamento antigo (LRU puro)
+
+============================== 4 passed in 3.85s ===============================
+============================= 456 passed in 38.61s =============================

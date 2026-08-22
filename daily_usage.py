@@ -43,7 +43,10 @@ def daily_provider_usage(date: str | None = None, log_path: str | None = None) -
                 continue
             etype = event.get("type")
             if etype == "request":
-                provider = event.get("provider") or "unknown"
+                # Normaliza "github|user_01..." -> "github" para alinhar com
+                # os nomes de provider usados pelo smart_router.
+                raw = str(event.get("provider") or "unknown")
+                provider = raw.split("|")[0] or "unknown"
                 last_provider = provider
                 entry = usage.setdefault(provider, {"tokens": 0, "requests": 0})
                 entry["requests"] += 1
@@ -61,3 +64,30 @@ if __name__ == "__main__":
     import json
 
     print(json.dumps(daily_provider_usage(), indent=1, ensure_ascii=False))
+
+
+class CachedProviderUsage:
+    """Cache com TTL para daily_provider_usage — evita re-ler o access.log
+    inteiro a cada request do proxy (log cresce durante o dia)."""
+
+    def __init__(self, ttl_seconds: int = 60, log_path: str | None = None):
+        self.ttl_seconds = ttl_seconds
+        self.log_path = log_path
+        self._cache: dict | None = None
+        self._cached_at = 0.0
+        import threading
+
+        self._lock = threading.Lock()
+
+    def get(self) -> dict:
+        import time as _time
+
+        now = _time.monotonic()
+        with self._lock:
+            if self._cache is not None and now - self._cached_at < self.ttl_seconds:
+                return self._cache
+        data = daily_provider_usage(log_path=self.log_path)
+        with self._lock:
+            self._cache = data
+            self._cached_at = now
+        return data

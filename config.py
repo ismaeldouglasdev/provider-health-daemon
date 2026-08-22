@@ -39,6 +39,10 @@ UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
 # possible); a filled window proves the model is alive → forward the rest live.
 STREAM_HEAD_WINDOW_LINES = int(os.environ.get("STREAM_HEAD_WINDOW_LINES", "64"))
 
+# Quota-aware rotation: providers sem uso hoje ganham prioridade dentro da
+# banda de spread do smart_router (boost de ordenação, nunca bloqueio).
+QUOTA_AWARE_ROTATION = os.environ.get("QUOTA_AWARE_ROTATION", "true").strip().lower() == "true"
+
 # ── Dashboard ────────────────────────────────────────────────────────
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "20132"))
 DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
