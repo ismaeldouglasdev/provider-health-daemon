@@ -43,6 +43,9 @@ STREAM_HEAD_WINDOW_LINES = int(os.environ.get("STREAM_HEAD_WINDOW_LINES", "64"))
 # banda de spread do smart_router (boost de ordenação, nunca bloqueio).
 QUOTA_AWARE_ROTATION = os.environ.get("QUOTA_AWARE_ROTATION", "true").strip().lower() == "true"
 
+# Pool degradado: healthy_count abaixo disso dispara alerta (dashboard + alerter).
+POOL_DEGRADED_THRESHOLD = int(os.environ.get("POOL_DEGRADED_THRESHOLD", "8"))
+
 # ── Dashboard ────────────────────────────────────────────────────────
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "20132"))
 DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")

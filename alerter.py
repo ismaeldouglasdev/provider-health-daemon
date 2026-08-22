@@ -26,6 +26,8 @@ SIGNIFICANT_TRANSITIONS = frozenset({
     ("cooldown", "probing"),   # retry attempt started
     ("probing", "healthy"),    # recovered after retry
     ("cooldown", "healthy"),   # recovered directly
+    ("healthy", "degraded"),   # pool inteiro abaixo do threshold (todo 7)
+    ("degraded", "healthy"),   # pool recuperado
 })
 
 # Never re-notify the same provider + target status within this window

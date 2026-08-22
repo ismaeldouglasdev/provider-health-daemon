@@ -38,6 +38,7 @@ from config import (
     HEALTH_PROXY_PORT, PROBER_INTERVAL_MINUTES, ACCESS_LOG_PATH, DASHBOARD_PORT,
     DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE, NINEROUTER_URL, NINEROUTER_KEY,
     PROBE_TIMEOUT, DISCOVERY_INTERVAL_SECONDS, PROXY_CHECK_INTERVAL_SECONDS,
+    POOL_DEGRADED_THRESHOLD,
 )
 from smart_router import SmartRouter
 from catalog_sync import sync_disable_dead_model
@@ -559,6 +560,7 @@ def alerter_loop(registry):
     if not HAS_ALERTER:
         return
     alerter = Alerter()
+    pool_degraded = False
     while not shutdown_event.is_set():
         try:
             transitions = alerter.check_transitions(registry.snapshot())
@@ -569,6 +571,24 @@ def alerter_loop(registry):
                     t["provider"], t["from"], t["to"],
                     extra={"event": "alerter", "transition": t},
                 )
+            # Pool-level degradation (todo 7): healthy_count abaixo do threshold.
+            by_status = (registry.status_summary() or {}).get("by_status") or {}
+            healthy_count = by_status.get("healthy", 0)
+            degraded_now = healthy_count < POOL_DEGRADED_THRESHOLD
+            if degraded_now != pool_degraded:
+                fired = alerter.alert({
+                    "provider": "POOL",
+                    "from": "healthy" if degraded_now else "degraded",
+                    "to": "degraded" if degraded_now else "healthy",
+                })
+                log.warning(
+                    f"Pool {'DEGRADED' if degraded_now else 'RECOVERED'}: "
+                    f"healthy={healthy_count} (threshold={POOL_DEGRADED_THRESHOLD}, "
+                    f"notified={fired})",
+                    extra={"event": "pool_degradation", "healthy": healthy_count,
+                           "degraded": degraded_now, "notified": fired},
+                )
+                pool_degraded = degraded_now
             time.sleep(10)
         except Exception as e:
             log.error(f"Alerter error: {e}")

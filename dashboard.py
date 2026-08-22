@@ -26,7 +26,7 @@ from typing import Optional
 from socketserver import ThreadingMixIn
 
 from metrics_store import MetricsStore
-from config import DASHBOARD_PORT, DASHBOARD_HOST
+from config import DASHBOARD_PORT, DASHBOARD_HOST, POOL_DEGRADED_THRESHOLD
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +124,28 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/metrics":
             window = int(self._get_param("window", "300"))
             data = self._build_metrics(window)
+            self._send_json(data)
+            return
+
+        # Pool health: TTFT p50/p95 + provider status counts + degraded flag
+        if path == "/api/pool":
+            ttft = (
+                self.metrics_store.ttft_percentiles()
+                if self.metrics_store else {"p50": None, "p95": None, "samples": 0}
+            )
+            summary = (
+                self.health_registry.status_summary()
+                if self.health_registry else {}
+            )
+            healthy = summary.get("by_status", {}).get("healthy", 0)
+            threshold = POOL_DEGRADED_THRESHOLD
+            data = {
+                "ttft": ttft,
+                "providers": summary,
+                "healthy_count": healthy,
+                "pool_degraded_threshold": threshold,
+                "degraded": healthy < threshold,
+            }
             self._send_json(data)
             return
 

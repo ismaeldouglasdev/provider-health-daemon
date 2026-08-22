@@ -129,6 +129,26 @@ class MetricsStore:
             self.records = self.records[-self.max_records:]
         self._cleanup()
 
+    def ttft_percentiles(self, window_seconds: int = 86400) -> dict:
+        """TTFT p50/p95 (ms) dentro da janela; ttft_ms==0 = não medido, ignorado.
+
+        Nota: o store rolling mantém no máximo 1h de records (_cleanup), então
+        a janela padrão de 24h efetivamente cobre o que existir na memória.
+        """
+        cutoff = time.time() - window_seconds
+        samples = sorted(
+            r.ttft_ms for r in self.records
+            if r.timestamp >= cutoff and r.ttft_ms > 0
+        )
+        if not samples:
+            return {"p50": None, "p95": None, "samples": 0}
+
+        def _pct(p: float) -> int:
+            idx = min(len(samples) - 1, max(0, round(p / 100 * (len(samples) - 1))))
+            return samples[idx]
+
+        return {"p50": _pct(50), "p95": _pct(95), "samples": len(samples)}
+
     def _cleanup(self):
         """Remove records older than the max window (1h)."""
         now = time.time()

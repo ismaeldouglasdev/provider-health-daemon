@@ -1,0 +1,8 @@
+=== Todo 7 — dashboard TTFT p50/p95 + alerta de pool ===
+metrics_store.ttft_percentiles(window_seconds): p50/p95 ignorando ttft_ms==0 (não medido); janela padrão 24h (store rolling mantém 1h)
+dashboard.py: endpoint GET /api/pool -> {ttft:{p50,p95,samples}, providers, healthy_count, pool_degraded_threshold, degraded}
+alerter.py: SIGNIFICANT_TRANSITIONS += (healthy,degraded)/(degraded,healthy)
+daemon.py alerter_loop: transição POOL healthy<->degraded quando healthy_count < POOL_DEGRADED_THRESHOLD (default 8), com notificação única por transição
+
+============================== 5 passed in 4.12s ===============================
+============================= 461 passed in 40.90s =============================
