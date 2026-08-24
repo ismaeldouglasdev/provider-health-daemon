@@ -106,7 +106,7 @@ _RAW_DOWNSTREAM_ROUTERS = [
         "priority": 1,
         "weight": 1,
         "health_check_path": "/v1/models",
-        "timeout": 30.0,  # OmniRoute /v1/models latency ~13.5s; 15s caused false cooldowns (2026-08-14)
+        "timeout": 60.0,  # /v1/models mediu 19.7s/412KB em 2026-08-23; 30s causava probes falsos → "all routers unavailable"
         "auth": {"header": "Authorization", "value": f"Bearer {NINEROUTER_KEY}"},
     },
     {
@@ -122,7 +122,7 @@ _RAW_DOWNSTREAM_ROUTERS = [
 
 # ── Meta-Router: Probe Settings ──────────────────────────────────────
 PROBER_INTERVAL_SECONDS = 30       # how often to probe routers for health
-PROBE_TIMEOUT = 30.0              # seconds per health check request (must be > /v1/models latency with 1000+ models; 15s falsely failed OmniRoute at 13.5s latency - 2026-08-14)
+PROBE_TIMEOUT = 60.0              # seconds per health check request (must be > /v1/models latency with 1000+ models; 15s falsely failed OmniRoute at 13.5s latency - 2026-08-14)
 PROBE_MAX_WORKERS = 5              # thread pool size for parallel probes
 MAX_MODEL_CATALOG = 500            # cap on catalog size after dedup
 

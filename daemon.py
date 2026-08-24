@@ -642,8 +642,10 @@ def main():
 
     # ── Single-instance lock (prevents EADDRINUSE crash-loop class) ───
     # A second daemon (e.g. spawned by systemd while an orphan holds the
-    # ports) exits cleanly with code 0, so systemd Restart=always does NOT
-    # enter a restart loop. The lock is released automatically on exit.
+    # ports) exits cleanly with code 0. NOTE: the unit uses Restart=on-failure
+    # (NOT always) precisely because Restart=also restarts clean exits —
+    # an occupied lock here would otherwise loop forever every RestartSec.
+    # The lock is released automatically on exit.
     import fcntl
     # Lock path injetável via env: testes spawnam daemons em paralelo ao
     # daemon real sem colidir no lock de instância única.
