@@ -611,6 +611,15 @@ def discovery_loop(registry):
             known.update(new_providers)
         except Exception as e:
             log.error(f"Discovery error: {e}", extra={"event": "discovery_error"})
+        try:
+            connections = discovery.sync_connections()
+            accounts_by_provider = {
+                prefix: info.get("accounts", [])
+                for prefix, info in connections.items()
+            }
+            registry.sync_accounts(accounts_by_provider)
+        except Exception as e:
+            log.error(f"Account pool sync error: {e}", extra={"event": "account_sync_error"})
         if shutdown_event.wait(DISCOVERY_INTERVAL_SECONDS):
             break
 

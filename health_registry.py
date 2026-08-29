@@ -21,8 +21,8 @@ class HealthRegistry:
 
     PROVIDERS = "providers"
     MODELS = "models"
+    ACCOUNTS = "accounts"
 
-    MAX_FAILURES = 30  # after this many consecutive failures, permanently disable
     # Fresh window granted when cooldown → probing: the recovery prober runs
     # every PROBER_INTERVAL_MINUTES, so 2x that interval guarantees it has a
     # chance to test the provider before the entry becomes orphan-cleanup eligible.
@@ -35,7 +35,7 @@ class HealthRegistry:
         self._data = self._load()
 
     def _empty_state(self) -> dict:
-        return {self.PROVIDERS: {}, self.MODELS: {}}
+        return {self.PROVIDERS: {}, self.MODELS: {}, self.ACCOUNTS: {}}
 
     def _load(self) -> dict:
         if not self.filepath.exists():
@@ -45,7 +45,19 @@ class HealthRegistry:
             # Validate structure
             data.setdefault(self.PROVIDERS, {})
             data.setdefault(self.MODELS, {})
+            data.setdefault(self.ACCOUNTS, {})
             self._migrate_duplicate_keys(data)
+            denied = [k for k in data.get(self.PROVIDERS, {}) if PROVIDER_DENYLIST.match(k)]
+            for k in denied:
+                del data[self.PROVIDERS][k]
+            denied_m = [k for k in data.get(self.MODELS, {}) if PROVIDER_DENYLIST.match(k.split('/')[0])]
+            for k in denied_m:
+                del data[self.MODELS][k]
+            denied_a = [k for k in data.get(self.ACCOUNTS, {}) if PROVIDER_DENYLIST.match(k)]
+            for k in denied_a:
+                del data[self.ACCOUNTS][k]
+            if denied or denied_m or denied_a:
+                log.warning(f"purged denied providers from health file: {denied + denied_m + denied_a}")
             return data
         except (json.JSONDecodeError, IOError) as e:
             log.warning(f"Failed to load health file: {e}")
@@ -255,6 +267,85 @@ class HealthRegistry:
             for model_id, entry in self._data[self.MODELS].items()
             if normalize_provider(str(entry.get("provider", ""))) == canonical
         ]
+
+    # ── Account Pools ─────────────────────────────────────────────────
+
+    def sync_accounts(self, accounts_by_provider: dict) -> None:
+        """Merge per-provider account pool state from discovery.
+
+        Accounts are stored as a list per provider, matched by ``id``: fields the
+        discovery does not send (e.g. a manual flag written by an admin tool)
+        survive a re-sync, while incoming values win for overlapping keys.
+
+        Args:
+            accounts_by_provider: {normalized_prefix: [account_dicts]} as produced
+                by provider_discovery.fetch_provider_connections (each account has
+                id/name/status/errorCode/backoffLevel/isActive/lastUsedAt/model_locks).
+        """
+        with self._lock:
+            for prefix, accounts in (accounts_by_provider or {}).items():
+                if PROVIDER_DENYLIST.match(prefix):
+                    continue
+                if not isinstance(accounts, list):
+                    continue
+                existing = {
+                    a.get("id"): a
+                    for a in self._data[self.ACCOUNTS].get(prefix, [])
+                    if isinstance(a, dict) and a.get("id") is not None
+                }
+                merged = []
+                for a in accounts:
+                    if not isinstance(a, dict):
+                        continue
+                    aid = a.get("id")
+                    if aid is not None and aid in existing:
+                        base = dict(existing[aid])
+                        base.update(a)
+                        merged.append(base)
+                    else:
+                        merged.append(a)
+                self._data[self.ACCOUNTS][prefix] = merged
+            self._save()
+
+    def get_accounts(self, provider: str) -> list:
+        """Return the account pool for a provider (empty list if none)."""
+        with self._lock:
+            return list(self._data[self.ACCOUNTS].get(normalize_provider(provider), []))
+
+    def account_summary(self, provider: str) -> dict:
+        """Aggregate the account pool for a provider.
+
+        Returns:
+            {"count", "active", "locked", "backoff", "status"} where:
+            - active: accounts with status not in ("error", "unavailable")
+            - locked: accounts with any active model_lock
+            - backoff: accounts with backoffLevel > 0
+            - status: worst-case status across the pool ("healthy" if none bad)
+        """
+        accounts = self.get_accounts(provider)
+        if not accounts:
+            return {"count": 0, "active": 0, "locked": 0, "backoff": 0, "status": "healthy"}
+        active = 0
+        locked = 0
+        backoff = 0
+        worst = "healthy"
+        for a in accounts:
+            st = a.get("status", "active")
+            if st in ("error", "unavailable"):
+                worst = "unavailable"
+            else:
+                active += 1
+            if a.get("model_locks"):
+                locked += 1
+            if a.get("backoffLevel", 0) > 0:
+                backoff += 1
+        return {
+            "count": len(accounts),
+            "active": active,
+            "locked": locked,
+            "backoff": backoff,
+            "status": worst,
+        }
 
     # ── Admin ─────────────────────────────────────────────────────────
 

@@ -149,6 +149,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(data)
             return
 
+        # Account Pools: per-provider account pools (multi-account rotation view)
+        if path == "/api/pools":
+            data = self._build_pools()
+            self._send_json(data)
+            return
+
         # Provider list with health
         if path == "/api/providers":
             data = self._build_providers()
@@ -384,6 +390,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "timestamp": now,
             "providers": providers,
             "daemon_uptime": self._get_uptime(),
+        }
+
+    def _build_pools(self) -> dict:
+        """Build per-provider account pools from the registry accounts section."""
+        pools = {}
+        total_accounts = 0
+        if self.health_registry:
+            accounts = self.health_registry.snapshot().get("accounts", {})
+            for prefix, accts in accounts.items():
+                accts = list(accts.values()) if isinstance(accts, dict) else accts
+                active = sum(1 for a in accts if a.get("status") not in ("error", "unavailable"))
+                locked = sum(1 for a in accts if a.get("model_locks"))
+                worst = "unavailable" if any(
+                    a.get("status") in ("error", "unavailable") for a in accts
+                ) else "healthy"
+                pools[prefix] = {
+                    "accounts": accts,
+                    "connection_count": len(accts),
+                    "active_count": active,
+                    "locked_count": locked,
+                    "status": worst,
+                }
+                total_accounts += len(accts)
+        return {
+            "providers": pools,
+            "total_accounts": total_accounts,
+            "total_providers": len(pools),
         }
 
     def _get_uptime(self) -> float:

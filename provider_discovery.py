@@ -41,7 +41,19 @@ def fetch_provider_connections(base_url: Optional[str] = None) -> Dict[str, Dict
             "backoffLevel": int,
             "connection_count": int,
             "model_locks": dict,
-            "connections": list
+            "connections": list,
+            "accounts": [
+              {
+                "id": str | None,
+                "name": str | None,       # name, else email, else id
+                "status": str,            # testStatus
+                "errorCode": int | None,
+                "backoffLevel": int,
+                "isActive": bool | None,
+                "lastUsedAt": str | None,
+                "model_locks": dict,      # model_id -> lock expiry (non-null only)
+              }
+            ]
           }
         }
         Empty dict {} on any error; never raises exceptions.
@@ -91,7 +103,8 @@ def fetch_provider_connections(base_url: Optional[str] = None) -> Dict[str, Dict
                         "backoffLevel": conn.get("backoffLevel", 0),
                         "connection_count": 0,
                         "model_locks": {},
-                        "connections": []
+                        "connections": [],
+                        "accounts": []
                     }
 
                 # Accumulate values
@@ -116,6 +129,23 @@ def fetch_provider_connections(base_url: Optional[str] = None) -> Dict[str, Dict
                 ident = conn.get("name") or conn.get("email")
                 if ident:
                     aggregated[prefix]["connections"].append(ident)
+
+                # Per-account detail (Account Pools): preserve id/status/backoff/locks
+                account_locks = {
+                    k[len("modelLock_"):]: v
+                    for k, v in conn.items()
+                    if k.startswith("modelLock_") and v is not None
+                }
+                aggregated[prefix]["accounts"].append({
+                    "id": conn.get("id"),
+                    "name": conn.get("name") or conn.get("email") or conn.get("id"),
+                    "status": conn.get("testStatus", "active"),
+                    "errorCode": conn.get("errorCode"),
+                    "backoffLevel": conn.get("backoffLevel", 0),
+                    "isActive": conn.get("isActive", True),
+                    "lastUsedAt": conn.get("lastUsedAt"),
+                    "model_locks": account_locks,
+                })
 
                 # Check for modelLock_ fields
                 for k, v in conn.items():
