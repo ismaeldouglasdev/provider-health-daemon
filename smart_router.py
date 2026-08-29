@@ -41,7 +41,7 @@ PERMANENTLY_BLOCKED = {
     "anthropic",     # no credits
     "kc",            # kilocode - no credits
     "cl",            # cline - no auth
-    "bpm",           # byteplus - subscription expired
+    "bpm",           # byteplus - subscription expired (402 verified 2026-08-10)
     "ps",            # poolside - 404 laguna-s-2.1 (model unknown to API)
     "cbai",          # cursor - credits exhausted (429 verified 2026-08-10)
     "gcli",          # grok cli - requires paid subscription
@@ -55,6 +55,11 @@ PERMANENTLY_BLOCKED = {
     "replicate",     # replicate - no credit (402 "Insufficient credit", 429 until payment method) (verified 2026-08-11)
     "kimchi",        # cast ai serverless - ALL models 402 credits exhausted / 410 model_not_found (verified 2026-08-13)
     "modelscope",    # modelscope - 401 "Please bind your Alibaba Cloud account before use" on all models (verified 2026-08-13)
+    "cerebras",      # 402 payment required on all models via 9router (verified 2026-08-26)
+    "blockrun",      # 402 payment required on all models via 9router (verified 2026-08-26)
+    "bzl",           # 402 payment required on all models via 9router (verified 2026-08-26)
+    "hf",            # 404 on all models via 9router, no valid API key (verified 2026-08-26)
+    "pollinations",  # payment_required on all models (verified 2026-08-26)
 }
 
 # Providers whose FREE tier is only reachable via `:free`-suffixed ids
@@ -169,20 +174,31 @@ DEAD_MODELS = {
     "nvidia/nemotron-3-ultra-550b-a55b",  # 404 page not found - verified
     "groq/meta-llama/llama-4-maverick-17b-128e-instruct",  # 404 model_not_found on groq API (listed in 9router catalog, doesn't exist) - verified 2026-08-10
     "groq/gpt-oss-120b",  # 404 model_not_found via 20128 direct test - verified 2026-08-14
+    "groq/openai/gpt-oss-120b",  # rate_limit_rpm: 30 failures, permanently blocked by health daemon - verified 2026-08-26
     "kr/minimax-m2.1",  # kiro_api_error "Invalid model ID or insufficient subscription level" (genuine Kiro rejection) - verified 2026-08-14
+    "deepseek-v4-flash-free",  # 429 FreeUsageLimitError (rate limit) on EVERY request -> opencode retry loop, corruption. Verified 2026-08-27
+    "opencode/deepseek-v4-flash-free",  # does not match substring below; same 429 loop ("AMD Radeon DeepSeek-V4-Flash"). Verified 2026-08-27
+    "llm7/deepseek-v4-flash",  # model_not_supported -> 24h cooldown -> combo re-picks when expired -> loop. Verified 2026-08-27
 }
 
 
 # Provider priority ranking (lower = preferred)
 # Verified 2026-08-10 via live tests against 9router:20128
+# Expanded 2026-08-26: added rw (498 free models), gemini, llm7, openrouter, any
 PROVIDER_PRIORITY = {
     "ag": 10,        # Antigravity — 5/5 models OK, 4 accounts, fast (1.2s)
     "kr": 15,        # Kiro — 4/4 models OK, 2 accounts
     "cu": 20,        # Cursor — 3/3 models OK
+    "rw": 22,        # Replicate/Runway — 498 free models, DeepSeek/Qwen/Llama/Gemma all 200 OK (verified 2026-08-26)
+    "amd": 23,       # AMD Radeon — DeepSeek-V4-Flash (1M ctx), GLM-5.2, MinerU2.5-Pro free (verified 2026-08-26)
     "glm": 25,       # GLM Z.AI — glm-4.7 verified live 2026-08-11 (glm-5.2 model_not_found)
     "glm-cn": 28,    # GLM China — glm-5.1 verified live 2026-08-11 (glm-5.2 model_not_found)
     "cf": 30,        # Cloudflare — free, reliable (429 rate-limited right now)
+    "openrouter": 31, # OpenRouter — 13 free models, reliable (verified 2026-08-26)
+    "gemini": 32,    # Google Gemini — 6 free models, gemini-3.6-flash 200 OK (verified 2026-08-26)
     "samba": 35,     # SambaNova — 4 models in registry (allowlisted), key validada 2026-08-11 (3/4 modelos OK direto)
+    "llm7": 37,      # LLM7 — 10 models, deepseek-v4-flash 200 OK (verified 2026-08-26)
+    "any": 38,       # AnyAPI — 7 free nvidia models, free tier (verified 2026-08-26)
     "groq": 40,      # Groq — gpt-oss-120b OK, llama-3.3 429
     "gh": 45,        # GitHub Copilot — only gpt-4o-mini-2024-07-18 verified OK
     "cx": 50,        # Codex — 429 usage limit (temporary, self-heals)
@@ -207,14 +223,22 @@ _ACCESS_ERROR_TYPES = {
 }
 
 _STATIC_COMBOS = [
-    "cf/@cf/meta/llama-3.1-70b-instruct-fp8-fast",
-    "cf/@cf/meta/llama-3.1-8b-instruct-fp8-fast",
+    # Cloudflare — free, reliable
     "cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "cf/@cf/mistralai/mistral-small-3.1-24b-instruct",
+    "cf/@cf/meta/llama-3.1-70b-instruct-fp8-fast",
     "cf/@cf/qwen/qwen2.5-coder-32b-instruct",
+    # AMD Radeon — free, 1M context (DeepSeek-V4-Flash)
+    "amd/DeepSeek-V4-Flash",
+    "amd/GLM-5.2",
+    "amd/MinerU2.5-Pro",
+    # Groq — fast, free tier
     "groq/llama-3.3-70b-versatile",
-    "nvidia/minimaxai/minimax-m3",
+    # Ollama Cloud — local fallback
     "ollama/gpt-oss:120b",
+    # Replicate — 498 free models
+    "rw/deepseek-ai/deepseek-v4-flash:free",
+    "rw/google/gemma-4-31b-it:free",
+    "rw/nvidia/nemotron-3-super-120b-a12b:free",
 ]
 
 # Pool-size limits. Raised 2026-08-13: the 9router catalog holds ~1030 models

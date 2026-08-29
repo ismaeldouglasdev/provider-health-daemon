@@ -13,7 +13,7 @@ import urllib.request
 from typing import Dict, List, Optional, Any
 
 from catalog_sync import compute_cli_token
-from config import NINEROUTER_KEY, NINEROUTER_URL
+from config import NINEROUTER_KEY, NINEROUTER_URL, PROVIDER_DENYLIST
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +95,10 @@ def fetch_provider_connections(base_url: Optional[str] = None) -> Dict[str, Dict
                     continue
 
                 prefix = normalize_provider(provider_field)
+
+                if PROVIDER_DENYLIST.match(prefix):
+                    log.debug(f"fetch_provider_connections: ignoring denied provider {prefix!r}")
+                    continue
 
                 if prefix not in aggregated:
                     aggregated[prefix] = {

@@ -4,13 +4,15 @@ import copy
 import json
 import logging
 import os
+import shutil
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from cooldown import CooldownCalculator
-from config import HEALTH_FILE, PROBER_INTERVAL_MINUTES
+from config import HEALTH_FILE, PROBER_INTERVAL_MINUTES, PROVIDER_DENYLIST
 from provider_aliases import normalize_provider
 
 log = logging.getLogger(__name__)
@@ -23,6 +25,7 @@ class HealthRegistry:
     MODELS = "models"
     ACCOUNTS = "accounts"
 
+    MAX_FAILURES = 10  # after this many consecutive failures, permanently disable (reduced from 30: gpt-oss-120b accumulated 30 rate_limit failures before being blocked, wasting user prompts)
     # Fresh window granted when cooldown → probing: the recovery prober runs
     # every PROBER_INTERVAL_MINUTES, so 2x that interval guarantees it has a
     # chance to test the provider before the entry becomes orphan-cleanup eligible.
@@ -110,12 +113,32 @@ class HealthRegistry:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.filepath)
+            self._rotate_backup()
         except OSError as e:
             log.error(f"Failed to save health file: {e}")
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _rotate_backup(self) -> None:
+        """Um snapshot por dia (health.json.bak-YYYYMMDD), 7 dias de retenção."""
+        today = time.strftime("%Y%m%d")
+        bak = self.filepath.with_name(f"{self.filepath.name}.bak-{today}")
+        if not bak.exists():
+            try:
+                shutil.copy2(self.filepath, bak)
+            except OSError as e:
+                log.warning(f"backup rotation skipped: {e}")
+        prefix = f"{self.filepath.name}.bak-"
+        cutoff = time.strftime("%Y%m%d", time.localtime(time.time() - 7 * 86400))
+        for old in self.filepath.parent.glob(prefix + "*"):
+            day = old.name[len(prefix):]
+            if len(day) == 8 and day.isdigit() and day < cutoff:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
 
     # ── Read API ─────────────────────────────────────────────────────
 
@@ -177,6 +200,8 @@ class HealthRegistry:
     def mark_healthy(self, provider: str, model: Optional[str] = None) -> None:
         """Record successful request."""
         provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return
         with self._lock:
             if model:
                 self._data[self.MODELS][model] = self._healthy_entry(provider, model)
@@ -194,6 +219,8 @@ class HealthRegistry:
     ) -> None:
         """Apply cooldown from parsed error."""
         provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return
         with self._lock:
             if error_info.get("model_specific") and model:
                 current = self.get_model(model)
