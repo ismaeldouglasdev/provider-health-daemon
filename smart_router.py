@@ -19,11 +19,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config import (
+    CATALOG_TIMEOUT,
     COMBO_CACHE_FILE,
     COMBO_REFRESH_INTERVAL,
     NINEROUTER_KEY,
     NINEROUTER_URL,
-    PROBE_TIMEOUT,
     QUOTA_AWARE_ROTATION,
 )
 from metrics_store import MetricsStore
@@ -807,7 +807,7 @@ class SmartRouter:
                 f"{NINEROUTER_URL}/v1/models",
                 headers={"Authorization": f"Bearer {NINEROUTER_KEY}"},
             )
-            with urllib.request.urlopen(req, timeout=PROBE_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=CATALOG_TIMEOUT) as resp:
                 payload = json.loads(resp.read())
         except Exception as e:
             log.warning(f"Combo catalog fetch failed: {e}")
