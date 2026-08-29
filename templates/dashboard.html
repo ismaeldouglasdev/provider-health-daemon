@@ -88,6 +88,25 @@
   .dot-blue { background: var(--blue); box-shadow: 0 0 6px rgba(88,166,255,0.3); }
   .uptime { color: var(--text-muted); font-size: 13px; white-space: nowrap; }
 
+  .pool-account {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,0.06));
+  }
+  .pool-account:last-child { border-bottom: none; }
+
+  .status-badge {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.06);
+  }
+
   /* ── Summary cards ─────────────────────────────── */
   .summary {
     display: grid;
@@ -595,6 +614,7 @@
 
 <div class="tabs">
   <button class="tab active" data-tab="providers">Providers<span class="tab-badge" id="providerCount">-</span></button>
+  <button class="tab" data-tab="pools">Pools<span class="tab-badge" id="poolCount">-</span></button>
   <button class="tab" data-tab="requests">Requests</button>
   <button class="tab" data-tab="charts">Charts</button>
   <button class="tab" data-tab="router">Router</button>
@@ -622,6 +642,18 @@
     <div class="ready-grid" id="readyGrid"></div>
   </div>
   <div class="grid" id="providerGrid">
+    <div class="skeleton skeleton-card"></div>
+    <div class="skeleton skeleton-card"></div>
+    <div class="skeleton skeleton-card"></div>
+  </div>
+</div>
+
+<!-- POOLS TAB -->
+<div id="tab-pools" class="tab-content">
+  <div class="flex flex-center gap-12 mb-12" style="flex-wrap:wrap;">
+    <span class="text-xs text-muted" id="poolSummary"></span>
+  </div>
+  <div class="grid" id="poolGrid">
     <div class="skeleton skeleton-card"></div>
     <div class="skeleton skeleton-card"></div>
     <div class="skeleton skeleton-card"></div>
@@ -1040,6 +1072,53 @@ function toggleCompact() {
   filterProviders();
 }
 
+// ── Account Pools ───────────────────────────────
+async function loadPools() {
+  try {
+    const res = await fetch('/api/pools');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderPools(data);
+  } catch (err) { /* ignore */ }
+}
+
+function renderPools(data) {
+  const grid = document.getElementById('poolGrid');
+  const summary = document.getElementById('poolSummary');
+  const pools = data.providers || {};
+  const total = data.total_accounts || 0;
+  document.getElementById('poolCount').textContent = Object.keys(pools).length;
+  summary.textContent = Object.keys(pools).length + ' providers, ' + total + ' accounts';
+
+  if (Object.keys(pools).length === 0) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-icon">🗂️</div><div class="empty-title">No account pools</div><div class="text-muted text-sm">Discovery has not synced any accounts yet</div></div>';
+    return;
+  }
+
+  grid.innerHTML = Object.entries(pools).map(([prefix, p]) => {
+    const status = p.status || 'unknown';
+    const statusColor = status === 'healthy' ? 'green' : status === 'unavailable' ? 'red' : 'yellow';
+    const accts = p.accounts || [];
+    const rows = accts.map(a => {
+      const ast = a.status || 'active';
+      const acolor = ast === 'active' ? 'green' : 'red';
+      const locks = Object.keys(a.model_locks || {}).length;
+      return '<div class="pool-account">' +
+        '<span class="status-dot" style="background:' + (acolor === 'green' ? 'var(--green)' : 'var(--red)') + '"></span>' +
+        '<span class="text-sm">' + (a.name || a.id || '?') + '</span>' +
+        '<span class="text-xs text-muted">' + ast + (locks ? ' · ' + locks + ' lock' + (locks > 1 ? 's' : '') : '') + '</span>' +
+        '</div>';
+    }).join('');
+    return '<div class="card">' +
+      '<div class="card-header"><span class="card-title">' + prefix + '</span>' +
+      '<span class="status-badge" style="color:var(--' + statusColor + ')">' + status + '</span></div>' +
+      '<div class="card-body">' +
+      '<div class="text-xs text-muted mb-8">' + p.connection_count + ' accounts · ' + p.active_count + ' active · ' + p.locked_count + ' locked</div>' +
+      rows +
+      '</div></div>';
+  }).join('');
+}
+
 // ── Reactivate Provider ─────────────────────────
 async function reactivateProvider(name, btn) {
   btn.disabled = true;
@@ -1121,6 +1200,8 @@ document.addEventListener('DOMContentLoaded', () => {
 // ── Poll history ──────────────────────────────────
 setInterval(fetchHistory, 5000);
 setInterval(fetchMetrics, 10000);
+setInterval(loadPools, 15000);
+loadPools();
 
 async function fetchMetrics() {
   try {
