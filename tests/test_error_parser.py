@@ -608,3 +608,46 @@ def test_error_pattern_coverage(label, status, body, exp_type, exp_hours, exp_mi
     assert info.get("model_specific") is exp_ms
     assert info.get("permanent") is exp_perm
     assert info.get("recheck") is exp_recheck
+
+
+def test_antigravity_quota_reset_delay_go_duration():
+    """antigravity/google RESOURCE_EXHAUSTED 429: quotaResetDelay Go duration
+    (125h58m35.937114014s) → cooldown must honor the real ~5-day reset, not
+    the 15min unknown_429 fallback."""
+    body = ('{"error": {"code": 429, "message": "Individual quota reached. '
+            'Please upgrade your subscription to increase your limits. Resets in 125h58m35s.", '
+            '"status": "RESOURCE_EXHAUSTED", "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", '
+            '"reason": "QUOTA_EXHAUSTED", "domain": "cloudcode-pa.googleapis.com", '
+            '"metadata": {"quotaResetDelay": "125h58m35.937114014s", '
+            '"quotaResetTimeStamp": "2026-09-02T06:00:00Z"}}]}}')
+    info = parse_error(429, body)
+    cd = _cd(info)
+    assert cd["hours"] == 125
+    assert cd["minutes"] == 58
+
+
+def test_antigravity_resets_in_text_form():
+    """'Resets in 5m 30s' text form → cooldown honors the real reset."""
+    body = "Individual quota reached. Please upgrade your subscription. Resets in 5m 30s."
+    info = parse_error(429, body)
+    cd = _cd(info)
+    assert cd["hours"] == 0
+    assert cd["minutes"] == 5
+
+
+def test_antigravity_resets_in_hours_text_form():
+    """'Resets in 2h' → cooldown honors the real reset (overrides monthly_limit 1h)."""
+    body = "Quota exceeded. Resets in 2h."
+    info = parse_error(429, body)
+    cd = _cd(info)
+    assert cd["hours"] == 2
+    assert cd["minutes"] == 0
+
+
+def test_antigravity_quota_reset_timestamp_iso():
+    """quotaResetTimeStamp ISO (future) → cooldown = remaining seconds."""
+    body = ('{"error": {"message": "quota", "details": [{"metadata": '
+            '{"quotaResetTimeStamp": "2099-01-01T00:00:00Z"}}]}}')
+    info = parse_error(429, body)
+    cd = _cd(info)
+    assert cd["hours"] >= 24  # far-future reset → long cooldown

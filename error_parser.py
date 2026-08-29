@@ -38,12 +38,14 @@ def _extract_retry_after_seconds(body: str) -> Optional[int]:
       - "retry after 77466s" (llm7 seconds)
       - "(reset after 30s)", "(reset after 5m)", "(reset after 2h)"
       - "(reset after 4m 51s)" — compound, as 9router annotates error lines
+      - "Resets in 125h58m35s" (antigravity/google quota)
     JSON forms: retry_after / retryAfter / retry_after_seconds fields
     (top-level or inside error).
     """
     if not body:
         return None
-    m = re.search(r"(?:retry|reset)\s+after\s+((?:\d+\s*[hms]\s*)+)", body, re.IGNORECASE)
+    # "retry after X" / "reset after X" / "Resets in X" — X = compound h/m/s
+    m = re.search(r"(?:resets?\s+in|retry\s+after|reset\s+after)\s+((?:\d+\s*[hms]\s*)+)", body, re.IGNORECASE)
     if m:
         total = 0
         for n_s, unit in re.findall(r"(\d+)\s*([hms])", m.group(1), re.IGNORECASE):
@@ -72,6 +74,57 @@ def _extract_retry_after_seconds(body: str) -> Optional[int]:
             val = err.get(key)
             if isinstance(val, (int, float)) and val > 0:
                 return int(val)
+    # antigravity/google quota: quotaResetDelay (Go duration) + quotaResetTimeStamp (ISO)
+    reset = _extract_quota_reset_seconds(body)
+    if reset is not None:
+        return reset
+    return None
+
+
+def _extract_quota_reset_seconds(body: str) -> Optional[int]:
+    """Extract the provider's real quota reset time in seconds.
+
+    Handles antigravity/google RESOURCE_EXHAUSTED 429 bodies:
+      - "quotaResetDelay": "125h58m35.937114014s"  (Go duration, fractional sec)
+      - "quotaResetTimeStamp": "2026-09-02T06:00:00Z"  (ISO timestamp)
+    Falls back to None if neither is present/parseable.
+    """
+    if not body:
+        return None
+
+    # quotaResetDelay — Go duration like "125h58m35.937114014s" or "30s"
+    m = re.search(r'"quotaResetDelay"\s*:\s*"([^"]+)"', body)
+    if m:
+        dur = m.group(1)
+        total = 0.0
+        for n_s, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", dur, re.IGNORECASE):
+            n = float(n_s)
+            if unit.lower() == "h":
+                total += n * 3600
+            elif unit.lower() == "m":
+                total += n * 60
+            else:
+                total += n
+        if total > 0:
+            return int(total)
+
+    # quotaResetTimeStamp — ISO timestamp; cooldown = remaining seconds
+    m = re.search(r'"quotaResetTimeStamp"\s*:\s*"([^"]+)"', body)
+    if m:
+        from datetime import datetime, timezone
+        try:
+            ts = m.group(1)
+            if ts.endswith("Z"):
+                ts = ts[:-1] + "+00:00"
+            target = datetime.fromisoformat(ts)
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            remaining = (target - datetime.now(timezone.utc)).total_seconds()
+            if remaining > 0:
+                return int(remaining)
+        except (ValueError, TypeError):
+            pass
+
     return None
 
 

@@ -94,7 +94,8 @@ class TestFullStackMocked:
         first = selector.select_router()
         assert first is not None
 
-        selector.on_failure(first.name, "connection_error")
+        for _ in range(3):
+            selector.on_failure(first.name, "connection_error")
         second = selector.select_router()
         assert second is not None
         assert second.name != first.name
@@ -103,7 +104,8 @@ class TestFullStackMocked:
         """When all routers are marked down, selector raises."""
         selector = MetaRouterSelector(registry_with_healthy_routers)
         for r in registry_with_healthy_routers.get_all_routers():
-            registry_with_healthy_routers.mark_unhealthy(r.name, "timeout")
+            for _ in range(3):
+                registry_with_healthy_routers.mark_unhealthy(r.name, "timeout")
 
         with pytest.raises(ServiceUnavailable):
             selector.select_router()

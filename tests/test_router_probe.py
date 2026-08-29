@@ -16,16 +16,25 @@ def registry():
 
 
 def test_probe_router_timeout(registry):
-    """Router that doesn't respond should be marked unhealthy."""
+    """Router que não responde entra em cooldown após as strikes.
+
+    Histerese (2026-08-24): falhas isoladas mantêm o router roteando;
+    o cooldown só vem na ROUTER_UNHEALTHY_STRIKES-ésima falha consecutiva.
+    """
     probe = RouterProbe(registry)
     r = registry.get_router("r1")
-    result = probe.probe_router(r)
-    assert result is False
+    assert r is not None
+    for _ in range(3):
+        assert probe.probe_router(r) is False
     assert registry.get_router("r1").health_status == "cooldown"
 
 
 def test_probe_all_timeout(registry):
-    """Both routers timeout, both marked unhealthy."""
+    """Both routers timeout → ambos em cooldown após as strikes."""
+    probe = RouterProbe(registry)
+    from config import ROUTER_UNHEALTHY_STRIKES
+    for _ in range(ROUTER_UNHEALTHY_STRIKES):
+        probe.probe_all()
     probe = RouterProbe(registry)
     results = probe.probe_all()
     assert results["healthy"] == 0

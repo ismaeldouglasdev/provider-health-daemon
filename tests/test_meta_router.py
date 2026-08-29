@@ -52,7 +52,8 @@ def test_fallback_after_failure(triple_registry):
 
 def test_on_failure_marks_unhealthy(triple_registry):
     sel = MetaRouterSelector(triple_registry)
-    sel.on_failure("r1", "timeout")
+    for _ in range(3):  # histerese: cooldown só após ROUTER_UNHEALTHY_STRIKES
+        sel.on_failure("r1", "timeout")
     assert triple_registry.get_router("r1").health_status == "cooldown"
 
 

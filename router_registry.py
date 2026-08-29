@@ -1,6 +1,6 @@
 import json
 import time
-from config import ROUTER_STATE_FILE
+from config import ROUTER_STATE_FILE, ROUTER_UNHEALTHY_STRIKES, ROUTER_BACKOFF_CAP
 
 
 class RouterState:
@@ -76,14 +76,23 @@ class RouterRegistry:
             r.health_status = "probing"
 
     def mark_unhealthy(self, name, error_type=None):
+        """Histerese: só entra em cooldown após ROUTER_UNHEALTHY_STRIKES falhas
+        consecutivas. Uma falha isolada (timeout de /v1/models lento) mantém o
+        router roteando — mark_healthy zera o contador em qualquer sucesso."""
         r = self._routers.get(name)
         if r is None:
             return
-        r.health_status = "cooldown"
-        r.last_failure = time.time()
         r.failure_count += 1
+        r.last_failure = time.time()
+        if r.failure_count < ROUTER_UNHEALTHY_STRIKES:
+            if r.health_status == "healthy":
+                # isolado: segue saudável e roteando; qualquer sucesso zera
+                r.cooldown_until = None
+            # já em cooldown/probing: mantém até estourar strikes ou recuperar
+            return
         capped = min(r.failure_count, 10)
-        backoff = min(60 * (2 ** (capped - 1)), 86400)
+        backoff = min(60 * (2 ** (capped - ROUTER_UNHEALTHY_STRIKES)), ROUTER_BACKOFF_CAP)
+        r.health_status = "cooldown"
         r.cooldown_until = r.last_failure + backoff
 
     def mark_probing(self, name):

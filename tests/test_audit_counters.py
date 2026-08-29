@@ -53,11 +53,11 @@ def test_handle_error_increments_cooldowns_applied(tmp_path):
     handler._handle_error(
         503,
         '{"error": {"message": "boom", "type": "server_error"}}',
-        {"model": "test-provider/test-model"},
+        {"model": "sample-provider/test-model"},
     )
 
     assert audit.cooldowns_applied == 1
-    assert registry.is_provider_healthy("test-provider") is False
+    assert registry.is_provider_healthy("sample-provider") is False
 
 
 def test_handle_error_combo_body_names_real_provider(tmp_path):

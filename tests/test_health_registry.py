@@ -20,15 +20,15 @@ def tmp_registry(tmp_path: Path) -> HealthRegistry:
 
 
 def test_mark_healthy(tmp_registry: HealthRegistry):
-    tmp_registry.mark_healthy("test-provider")
-    assert tmp_registry.is_provider_healthy("test-provider")
-    entry = tmp_registry.get_provider("test-provider")
+    tmp_registry.mark_healthy("sample-provider")
+    assert tmp_registry.is_provider_healthy("sample-provider")
+    entry = tmp_registry.get_provider("sample-provider")
     assert entry["status"] == "healthy"
     assert entry["failures"] == 0
 
 
 def test_mark_healthy_with_model(tmp_registry: HealthRegistry):
-    tmp_registry.mark_healthy("test-provider", model="test-model")
+    tmp_registry.mark_healthy("sample-provider", model="test-model")
     model_entry = tmp_registry.get_model("test-model")
     assert model_entry["status"] == "healthy"
     assert tmp_registry.is_model_available("test-model")
@@ -40,42 +40,42 @@ def test_is_provider_healthy_unknown(tmp_registry: HealthRegistry):
 
 
 def test_mark_error_provider(tmp_registry: HealthRegistry):
-    tmp_registry.mark_error("test-provider", {
+    tmp_registry.mark_error("sample-provider", {
         "type": "rate_limit",
         "status": 429,
         "model_specific": False,
         "cooldown": {"type": "rate_limit", "hours": 1},
     })
-    assert not tmp_registry.is_provider_healthy("test-provider")
-    entry = tmp_registry.get_provider("test-provider")
+    assert not tmp_registry.is_provider_healthy("sample-provider")
+    entry = tmp_registry.get_provider("sample-provider")
     assert entry["status"] in ("cooldown", "disabled")
     assert entry["failures"] >= 1
 
 
 def test_mark_error_model_specific(tmp_registry: HealthRegistry):
-    tmp_registry.mark_error("test-provider", {
+    tmp_registry.mark_error("sample-provider", {
         "type": "rate_limit",
         "status": 429,
         "model_specific": True,
         "cooldown": {"type": "rate_limit", "hours": 1},
-    }, model="test-provider/some-model")
-    assert tmp_registry.is_provider_healthy("test-provider")  # provider still healthy
-    assert not tmp_registry.is_model_available("test-provider/some-model")  # model in cooldown
+    }, model="sample-provider/some-model")
+    assert tmp_registry.is_provider_healthy("sample-provider")  # provider still healthy
+    assert not tmp_registry.is_model_available("sample-provider/some-model")  # model in cooldown
 
 
 def test_force_healthy(tmp_registry: HealthRegistry):
-    tmp_registry.mark_error("test-provider", {
+    tmp_registry.mark_error("sample-provider", {
         "type": "rate_limit",
         "status": 429,
         "model_specific": False,
         "cooldown": {"type": "rate_limit", "hours": 24},
     })
-    tmp_registry.force_healthy("test-provider")
-    assert tmp_registry.is_provider_healthy("test-provider")
+    tmp_registry.force_healthy("sample-provider")
+    assert tmp_registry.is_provider_healthy("sample-provider")
 
 
 def test_cleanup_expired(tmp_registry: HealthRegistry):
-    tmp_registry.mark_error("test-provider", {
+    tmp_registry.mark_error("sample-provider", {
         "type": "rate_limit",
         "status": 429,
         "model_specific": False,
@@ -83,7 +83,7 @@ def test_cleanup_expired(tmp_registry: HealthRegistry):
     })
     promoted = tmp_registry.cleanup_expired()
     assert promoted >= 1
-    entry = tmp_registry.get_provider("test-provider")
+    entry = tmp_registry.get_provider("sample-provider")
     assert entry["status"] == "probing"
 
 
@@ -92,20 +92,20 @@ def test_cleanup_promotion_sets_fresh_probing_window(tmp_registry: HealthRegistr
     time to test before the next cleanup run would treat it as orphaned."""
     from datetime import datetime, timezone
 
-    tmp_registry.mark_error("test-provider", {
+    tmp_registry.mark_error("sample-provider", {
         "type": "rate_limit",
         "status": 429,
         "model_specific": False,
         "cooldown": {"type": "rate_limit", "duration_hours": 0},
     })
     tmp_registry.cleanup_expired()
-    entry = tmp_registry.get_provider("test-provider")
+    entry = tmp_registry.get_provider("sample-provider")
     assert entry["status"] == "probing"
     until = datetime.fromisoformat(entry["until"])
     assert until > datetime.now(timezone.utc), "probing `until` must be in the future"
 
     removed = tmp_registry.cleanup_expired()
-    assert tmp_registry.get_provider("test-provider")["status"] == "probing"
+    assert tmp_registry.get_provider("sample-provider")["status"] == "probing"
 
 
 def test_cleanup_removes_orphaned_probing(tmp_registry: HealthRegistry):
