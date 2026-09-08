@@ -331,8 +331,6 @@ class TestFindHealthyAlternativeC2:
     def test_combo_model_is_smart_routed(self):
         from smart_router import SmartRouter
 
-        called = {}
-
         class FakeCounter:
             @staticmethod
             def count_tokens(*a, **k):

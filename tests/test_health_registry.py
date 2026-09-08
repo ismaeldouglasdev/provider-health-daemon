@@ -337,13 +337,14 @@ def test_reprobe_disabled_due_after_backoff(tmp_registry: HealthRegistry):
         "last_probe_at": (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(),
     }
     assert tmp_registry.reprobe_disabled_due(
-        tmp_registry.get_provider("sample-provider")
-    )
+tmp_registry.get_provider("sample-provider")
+)
 
 
 def test_record_disabled_probe_stamps_and_delays_reprobe(tmp_registry: HealthRegistry):
     from datetime import datetime, timedelta, timezone
-    from health_registry import HealthRegistry  # noqa: F401 (convention)
+
+    from health_registry import HealthRegistry
     tmp_registry._data["providers"]["sample-provider"] = {
         "status": "disabled", "failures": 10,
         "last_probe_at": (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(),

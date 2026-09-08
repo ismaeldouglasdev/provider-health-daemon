@@ -209,7 +209,7 @@ DEAD_MODELS = {
     "nvidia/nemotron-3-ultra-550b-a55b",  # 404 page not found - verified
     "groq/meta-llama/llama-4-maverick-17b-128e-instruct",  # 404 model_not_found on groq API (listed in 9router catalog, doesn't exist) - verified 2026-08-10
     "groq/gpt-oss-120b",  # 404 model_not_found via 20128 direct test - verified 2026-08-14
-    "groq/openai/gpt-oss-120b",  # rate_limit_rpm: 30 failures, permanently blocked by health daemon - verified 2026-08-26
+    "groq/openai/gpt-oss-120b",  # 404 model_not_found via 20128 direct test - verified 2026-08-14; resposta vazia 2026-09-03 (0.36s, content '') via 20128 — model morto no groq
     # NOTA 2026-09-03: kr/minimax-m2.1 removido daqui — re-verificado ao vivo hoje
     # (1.25s avg, resp 'ok' 2/2 na porta 20128). A entrada antiga (2026-08-14) ficou
     # obsoleta; o modelo é RÁPIDO e confiável e está no PROVIDER_ALLOWLIST do kr.
@@ -218,7 +218,6 @@ DEAD_MODELS = {
     "llm7/deepseek-v4-flash",  # model_not_supported -> 24h cooldown -> combo re-picks when expired -> loop. Verified 2026-08-27
     "cx/gpt-5",  # 400 "The 'gpt-5' model does not exist" (codex) — não existe no provider. Verified 2026-09-03
     "blockrun/moonshot/kimi-k3",  # 402 no_credit (sem crédito no openai-compatible-chat) — não se auto-cura. Verified 2026-09-03
-    "groq/openai/gpt-oss-120b",  # resposta vazia (0.36s, content '') via 20128 — model morto no groq. Verified 2026-09-03
 }
 
 
