@@ -9,6 +9,7 @@
 """
 
 import time
+import urllib.error
 
 import pytest
 
@@ -240,6 +241,69 @@ class TestRecordUsageTTFT:
         )
         rec = h.metrics_store.records[-1]
         assert rec.ttft_ms == rec.duration_ms
+
+
+class TestFallbackRouterPenalty:
+    """Regression: a dead fallback router must be penalized with on_failure()
+    when its connection fails — otherwise the meta-selector keeps it
+    "healthy" and re-selects it on every request needing fallback, burning a
+    failed round-trip each time (previously swallowed with a bare `pass`).
+    Mirrors the primary-router rule: connection_error (URLError) → penalize;
+    HTTPError (router responded) → upstream issue, not a router issue."""
+
+    class _FakeRouter:
+        def __init__(self, name, url):
+            self.name = name
+            self.url = url
+            self.auth = None
+
+    class _FakeSelector:
+        def __init__(self, routers):
+            self._routers = list(routers)
+            self.failures = []
+
+        def select_router(self, model=""):
+            return self._routers.pop(0) if self._routers else None
+
+        def on_failure(self, router_name, error_type=None):
+            self.failures.append((router_name, error_type))
+
+        def on_success(self, router_name):
+            pass
+
+    class _DeadOpener:
+        """opener whose open() always raises — simulates unreachable routers."""
+
+        def open(self, req, timeout=None):
+            raise urllib.error.URLError("Connection refused")
+
+    @staticmethod
+    def _handler(selector, opener):
+        from metrics_store import MetricsStore
+        from proxy_handler import HealthProxyHandler
+
+        handler = HealthProxyHandler.__new__(HealthProxyHandler)
+        handler.metrics_store = MetricsStore()
+        handler.meta_selector = selector
+        handler.opener = opener
+        handler.path = "/v1/chat/completions"
+        handler.command = "POST"
+        handler.headers = {}
+        handler.audit = None
+        handler._respond_unavailable = lambda msg: None  # avoid socket I/O
+        return handler
+
+    def test_fallback_router_is_penalized_on_connection_error(self):
+        selector = self._FakeSelector([
+            self._FakeRouter("primary", "http://router-a:8000"),
+            self._FakeRouter("fallback", "http://router-b:8000"),
+        ])
+        handler = self._handler(selector, self._DeadOpener())
+
+        handler._forward({"model": "groq/llama-3.3-70b-versatile", "stream": False})
+
+        assert ("primary", "connection_error") in selector.failures
+        assert ("fallback", "connection_error") in selector.failures
 
 
 class TestDetectDegeneration:

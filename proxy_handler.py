@@ -766,8 +766,8 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # Router responded — upstream provider failed, NOT a router issue.
             # Do NOT mark router unhealthy; only penalize for connection errors (URLError below).
             # Still attempt fallback to a different router if available.
-            router_fallback_tried = False
             if target_router and self.meta_selector and not fallback_used:
+                fallback_router = None
                 try:
                     fallback_router = self.meta_selector.select_router(model=(body or {}).get("model", "") if body else "")
                     if fallback_router and fallback_router.name != target_router.name:
@@ -780,10 +780,25 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         if body and fallback_resp.status == 200:
                             self._record_upstream_health(body, fb_body, start_time, fb_ttft)
                         return
-                    router_fallback_tried = True
-                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse):
-                    router_fallback_tried = True
-                    pass
+                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse) as fb_err:
+                    # Fallback router failed. Penalize it ONLY on connection
+                    # errors (URLError) — same rule as the primary router
+                    # (connection_error at l.960). HTTPError means it responded
+                    # (upstream issue, not a router issue); ServiceUnavailable
+                    # means no healthy router was left to select;
+                    # EmptyUpstreamResponse means it served an empty 200 (model
+                    # issue). Without the penalty a dead fallback stays
+                    # "healthy" in the selector and burns a failed round-trip
+                    # on every request that needs fallback.
+                    if fallback_router and isinstance(fb_err, urllib.error.URLError):
+                        try:
+                            self.meta_selector.on_failure(fallback_router.name, "connection_error")
+                        except ServiceUnavailable:
+                            pass  # no healthy routers left — global fallback below
+                        log.warning(
+                            f"Fallback router connection failed: {fallback_router.name} — {fb_err.reason}",
+                            extra={"event": "fallback_router_penalized", "router": fallback_router.name},
+                        )
 
             # ── Global fallback: retry 5xx / access-error with next healthy model ──
             # A 5xx here means the router's chosen provider failed at runtime.
@@ -956,6 +971,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
             # Attempt fallback via meta-router
             if target_router and self.meta_selector and not fallback_used:
+                fallback_router = None
                 try:
                     self.meta_selector.on_failure(target_router.name, "connection_error")
                     fallback_router = self.meta_selector.select_router(model=(body or {}).get("model", "") if body else "")
@@ -970,8 +986,21 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         if body and fallback_resp.status == 200:
                             self._record_upstream_health(body, fb_body, start_time, fb_ttft)
                         return
-                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse):
-                    pass
+                except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse) as fb_err:
+                    # The fallback router failed too — penalize it on connection
+                    # errors (URLError) exactly like the primary (l.960).
+                    # Without this a dead fallback stays "healthy" in the
+                    # selector and is retried on every request while the global
+                    # fallback below escalates to the next healthy model.
+                    if fallback_router and isinstance(fb_err, urllib.error.URLError):
+                        try:
+                            self.meta_selector.on_failure(fallback_router.name, "connection_error")
+                        except ServiceUnavailable:
+                            pass  # no healthy routers left — unavailable below
+                        log.warning(
+                            f"Fallback router connection failed: {fallback_router.name} — {fb_err.reason}",
+                            extra={"event": "fallback_router_penalized", "router": fallback_router.name},
+                        )
 
             self._respond_unavailable(f"Connection error: {e.reason}")
             if body:
