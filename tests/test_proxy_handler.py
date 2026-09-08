@@ -240,3 +240,118 @@ class TestRecordUsageTTFT:
         )
         rec = h.metrics_store.records[-1]
         assert rec.ttft_ms == rec.duration_ms
+
+
+class TestDetectDegeneration:
+    """Guard against models that repeat the same sentence endlessly."""
+
+    def test_detects_repeated_sentence(self):
+        from proxy_handler import _detect_degeneration
+        text = "Deixa eu verificar o que o plugin fornece. " * 25
+        hit = _detect_degeneration(text)
+        assert hit is not None
+        assert hit[1] >= 12
+
+    def test_normal_text_no_false_positive(self):
+        from proxy_handler import _detect_degeneration
+        text = " ".join(f"Parágrafo {i} com conteúdo distinto e variado." for i in range(500))
+        assert _detect_degeneration(text) is None
+
+    def test_below_threshold_not_detected(self):
+        from proxy_handler import _detect_degeneration
+        text = "Mesma frase repetida. " * 5  # 5 < 12
+        assert _detect_degeneration(text) is None
+
+    def test_short_sentences_ignored(self):
+        from proxy_handler import _detect_degeneration
+        text = "ok. " * 100  # "ok" (2 chars) < MIN_SENTENCE_LEN (5)
+        assert _detect_degeneration(text) is None
+
+    def test_empty_or_short_text(self):
+        from proxy_handler import _detect_degeneration
+        assert _detect_degeneration("") is None
+        assert _detect_degeneration("abc") is None
+
+    def test_short_phrase_loop_detected(self):
+        # The observed 2026-08-31 loop: short phrases ("Vou rodar", "Executando",
+        # "Rodando") repeated dozens of times — each below the old 15-char MIN.
+        # With MIN_SENTENCE_LEN=5 and REPEAT_THRESHOLD=12 these are caught.
+        from proxy_handler import _detect_degeneration
+        text = ("Vou rodar. " * 30) + "Conteúdo final. "
+        hit = _detect_degeneration(text)
+        assert hit is not None
+        assert "Vou rodar" in hit[0]
+
+    def test_stuck_loop_ratio_detected(self):
+        # Near-identical short phrases dominating the window below the absolute
+        # threshold still trigger via the ratio detector (>= 30% + >= 8).
+        from proxy_handler import _detect_degeneration
+        # 10 "Executando." + 20 distinct sentences → "Executando" is 10/30=33%.
+        text = ("Executando. " * 10) + " ".join(f"Passo {i} único." for i in range(20))
+        hit = _detect_degeneration(text)
+        assert hit is not None
+
+    def test_ratio_no_false_positive_on_balanced_text(self):
+        from proxy_handler import _detect_degeneration
+        # Every sentence unique → no single phrase dominates → no false positive.
+        text = " ".join(f"Frase distinta {i} de exemplo." for i in range(200))
+        assert _detect_degeneration(text) is None
+
+
+class TestFindHealthyAlternativeC2:
+    """Cascade-fix 2026-08-31: SmartRouter must ONLY smart-route combo-family
+    virtual models. Direct agent models (amd/DeepSeek-V4-Flash, kr/claude-*)
+    signal an explicit choice — if unavailable they must return None (→ 503)
+    so the opencode fallback_models chain (big-pickle → deepseek → combo) runs,
+    instead of being silently swapped to a combo model by the proxy."""
+
+    @staticmethod
+    def _handler(smart_router=None, registry=None):
+        from proxy_handler import HealthProxyHandler
+        handler = HealthProxyHandler.__new__(HealthProxyHandler)
+        handler.smart_router = smart_router
+        handler.registry = registry
+        return handler
+
+    def test_direct_model_is_never_smart_routed(self):
+        # smart_router must NOT be consulted for a direct model
+        class NoCallRouter:
+            def best_model(self, *a, **k):
+                raise AssertionError("smart_router must not be called for direct models")
+        h = self._handler(smart_router=NoCallRouter(), registry=object())
+        assert h._find_healthy_alternative({"model": "amd/DeepSeek-V4-Flash"}) is None
+
+    def test_direct_provider_slash_model_is_never_smart_routed(self):
+        class NoCallRouter:
+            def best_model(self, *a, **k):
+                raise AssertionError("must not smart-route a direct model")
+        h = self._handler(smart_router=NoCallRouter(), registry=object())
+        assert h._find_healthy_alternative({"model": "kr/claude-sonnet-4"}) is None
+
+    def test_combo_model_is_smart_routed(self):
+        from smart_router import SmartRouter
+
+        called = {}
+
+        class FakeCounter:
+            @staticmethod
+            def count_tokens(*a, **k):
+                return 10
+
+        h = self._handler(registry=object())
+        h._prompt_tokens = lambda body: 10
+        # _get_combo_models is stubbed to return a fixed pool
+        h._get_combo_models = lambda: ["ollama/gpt-oss:120b", "ag/gemini-3.7-flash-low"]
+        h.smart_router = object.__new__(SmartRouter)
+        h.smart_router.best_model = lambda models, registry, meta: "ag/gemini-3.7-flash-low"
+        out = h._find_healthy_alternative({"model": "combo-round-robin"})
+        assert out == "ag/gemini-3.7-flash-low"
+
+    def test_combo_model_with_no_healthy_alternative_returns_none(self):
+        from smart_router import SmartRouter
+        h = self._handler(registry=object())
+        h._prompt_tokens = lambda body: 10
+        h._get_combo_models = lambda: ["ollama/gpt-oss:120b"]
+        h.smart_router = object.__new__(SmartRouter)
+        h.smart_router.best_model = lambda models, registry, meta: None
+        assert h._find_healthy_alternative({"model": "combo-round-robin"}) is None

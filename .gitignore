@@ -4,6 +4,8 @@ __pycache__/
 __init__.py
 # Local sublevel-fix backups
 *.bak-sublevelfix-*
+# Local cascade-fix backups
+*.bak-cascade-*
 
 # Agent working files (plans, evidence, drafts)
 .omo/

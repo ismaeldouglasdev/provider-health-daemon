@@ -115,6 +115,23 @@ BLOCKED_MODEL_SUBSTRINGS = {
     # the "combo quebrado" report. Blocked here at the source (verified 2026-08-13).
     "exec-agent",  # github execution agents: same problem — not general chat models
     # (exec-agent-a/b/c; exec-agent-c already DEAD_MODELS: empty body). Verified 2026-08-13.
+    "claude-opus-5",  # kiro 400 "Invalid model ID or insufficient subscription" (genuine Kiro rejection,
+    # não é transient) — contamina o provider kr e adia a seleção dos modelos rápidos
+    # (claude-haiku-4.5 1.8s, minimax-m2.1 1.9s). Verificado 2026-09-03.
+    "claude-sonnet-5",  # kiro 400 "Invalid model ID..." (mesma causa). Verificado 2026-09-03.
+    "claude-opus-4.8",  # kiro 400 Invalid model ID. Verificado 2026-09-03.
+    "gemini-3.5-flash",  # Google descontinuou o Gemini 3.5 Flash (retired). Variantes
+    # (ag/cu/rw/gemini/blockrun/bai) retornam "Gemini 3.5 Flash is no longer available",
+    # 404 NOT_FOUND ou timeout de 60s+ — não entram cooldown (sem status model-level no
+    # health), então o combo os re-seleciona indefinidamente, causando stall de ~2min
+    # ("só carrega e não responde"). Bloqueado aqui na fonte. Verificado 2026-09-03:
+    # gemini/gemini-3.5-flash-lite timeout 60s, ag/gemini-3.5-flash-high 404, rw 429.
+    # Alternativa viva: gemini-3.6-flash / 3.7-flash (200 OK).
+    "gemini-3.7-flash-high",  # ag: lento (11-17s real, avg ~16s verified 2026-09-03) — gera picos
+    # de latência no combo. Bloqueado pra manter consistência rápida (kr/haiku 1.8s).
+    "gemini-3.7-flash-medium",  # ag: lento (~12.6s). Mesma causa. Verificado 2026-09-03.
+    "gemini-3.1-pro",  # ag: lento (13.6s). Verificado 2026-09-03.
+    "gemini-pro-agent",  # ag: resposta vazia em stress test. Verificado 2026-09-03.
 }
 
 # Per-provider allowlists: when a provider is listed, ONLY these model ids are
@@ -148,6 +165,24 @@ PROVIDER_ALLOWLIST = {
         "samba/gemma-4-31B-it",
         "samba/DeepSeek-V3.1",
     },
+    "kr": {
+        # Kiro — RÁPIDO e confiável, melhor latência do pool. Verified 2026-09-03
+        # via live tests 20128: minimax-m2.1 (1.25s), claude-haiku-4.5 (2.5s),
+        # auto (1.6s). NOT include mortos/lentos: opus-5/sonnet-5/opus-4.8 (400),
+        # qwen3-coder-next*/minimax-m2.5/deepseek-3.2/glm-5 (erros ou falhas).
+        "kr/claude-haiku-4.5",
+        "kr/minimax-m2.1",
+        "kr/auto",
+    },
+    "ali": {
+        # Alibaba Cloud MaaS (ali) — MUITO rápido e confiável, key sk-ws-* adicionada
+        # 2026-09-03 (endpoint compatible-mode/v1). Verified 20128: qwen3.8-flash
+        # (1.15s), qwen-plus (1.7s), qwen3.8-max (2.5s). Agora o provider mais rápido
+        # do pool — ótimo p/ priorizar no combo.
+        "ali/qwen-plus",
+        "ali/qwen3.8-flash",
+        "ali/qwen3.8-max",
+    },
 }
 
 # Models that NO LONGER EXIST on their provider's API (verified against the
@@ -175,10 +210,15 @@ DEAD_MODELS = {
     "groq/meta-llama/llama-4-maverick-17b-128e-instruct",  # 404 model_not_found on groq API (listed in 9router catalog, doesn't exist) - verified 2026-08-10
     "groq/gpt-oss-120b",  # 404 model_not_found via 20128 direct test - verified 2026-08-14
     "groq/openai/gpt-oss-120b",  # rate_limit_rpm: 30 failures, permanently blocked by health daemon - verified 2026-08-26
-    "kr/minimax-m2.1",  # kiro_api_error "Invalid model ID or insufficient subscription level" (genuine Kiro rejection) - verified 2026-08-14
+    # NOTA 2026-09-03: kr/minimax-m2.1 removido daqui — re-verificado ao vivo hoje
+    # (1.25s avg, resp 'ok' 2/2 na porta 20128). A entrada antiga (2026-08-14) ficou
+    # obsoleta; o modelo é RÁPIDO e confiável e está no PROVIDER_ALLOWLIST do kr.
     "deepseek-v4-flash-free",  # 429 FreeUsageLimitError (rate limit) on EVERY request -> opencode retry loop, corruption. Verified 2026-08-27
     "opencode/deepseek-v4-flash-free",  # does not match substring below; same 429 loop ("AMD Radeon DeepSeek-V4-Flash"). Verified 2026-08-27
     "llm7/deepseek-v4-flash",  # model_not_supported -> 24h cooldown -> combo re-picks when expired -> loop. Verified 2026-08-27
+    "cx/gpt-5",  # 400 "The 'gpt-5' model does not exist" (codex) — não existe no provider. Verified 2026-09-03
+    "blockrun/moonshot/kimi-k3",  # 402 no_credit (sem crédito no openai-compatible-chat) — não se auto-cura. Verified 2026-09-03
+    "groq/openai/gpt-oss-120b",  # resposta vazia (0.36s, content '') via 20128 — model morto no groq. Verified 2026-09-03
 }
 
 
@@ -186,8 +226,11 @@ DEAD_MODELS = {
 # Verified 2026-08-10 via live tests against 9router:20128
 # Expanded 2026-08-26: added rw (498 free models), gemini, llm7, openrouter, any
 PROVIDER_PRIORITY = {
-    "ag": 10,        # Antigravity — 5/5 models OK, 4 accounts, fast (1.2s)
-    "kr": 15,        # Kiro — 4/4 models OK, 2 accounts
+    "ali": 5,        # Alibaba Cloud MaaS — MUITO rápido e confiável, provider mais rápido
+    # do pool. Verified 2026-09-03 via 20128: qwen3.8-flash (1.15s), qwen-plus (1.7s),
+    # qwen3.8-max (2.5s). Key sk-ws-* adicionada hoje. Benigno: modelos qwen em pt-br ok.
+    "kr": 8,         # Kiro — modelos RÁPIDOS e confiáveis comprovados: claude-haiku-4.5 (1.8s), minimax-m2.1 (1.9s), auto (8.7s). Melhor latência do pool (verified 2026-09-03). Mortos (opus-5/sonnet-5) bloqueados.
+    "ag": 18,        # Antigravity — MIX: gemini-3.7-flash-low (5.2s) bom, mas 3.1-pro-low (13.6s) e 3.7-flash-medium (12.6s) LENTOS, 3.5-flash morto. Rebaixado pra não dominar o ranking com modelos lentos (verified 2026-09-03).
     "cu": 20,        # Cursor — 3/3 models OK
     "rw": 22,        # Replicate/Runway — 498 free models, DeepSeek/Qwen/Llama/Gemma all 200 OK (verified 2026-08-26)
     "amd": 23,       # AMD Radeon — DeepSeek-V4-Flash (1M ctx), GLM-5.2, MinerU2.5-Pro free (verified 2026-08-26)
@@ -201,9 +244,9 @@ PROVIDER_PRIORITY = {
     "any": 38,       # AnyAPI — 7 free nvidia models, free tier (verified 2026-08-26)
     "groq": 40,      # Groq — gpt-oss-120b OK, llama-3.3 429
     "gh": 45,        # GitHub Copilot — only gpt-4o-mini-2024-07-18 verified OK
-    "cx": 50,        # Codex — 429 usage limit (temporary, self-heals)
+    "cx": 55,        # Codex — gpt-5 morto (400), gpt-5.5 lento (~12s+). Rebaixado (verified 2026-09-03)
     "nvidia": 60,    # NVIDIA — 429/410 (minimax-m3 retired)
-    "ollama": 70,    # Ollama Cloud — 429 weekly limit
+    "ollama": 75,    # Ollama Cloud — 429 weekly limit + gpt-oss:120b lento. Rebaixado (verified 2026-09-03)
     "kc": 100,       # Kilocode — no credits
     "anthropic": 100,
 }
@@ -250,6 +293,12 @@ _STATIC_COMBOS = [
 PER_PROVIDER_LIMIT = 30
 MAX_COMBO_MODELS = 500
 NO_DATA_PENALTY = 30  # prefer tested+healthy providers over never-seen ones
+# Minimum pool size worth persisting to the combo disk cache. A genuine
+# /v1/models catalog fetch returns 300+ models; a timed-out fetch falls back
+# to the existing (possibly tiny) disk cache. Persisting that fallback would
+# overwrite a good cache with a 1-model list, so the daemon only writes when
+# the pool is a real catalog (>= MIN_COMBO_WRITE).
+MIN_COMBO_WRITE = 20
 # Load-spread band: models within this many points of the best score are
 # rotation candidates. Must cover the no-data tier (NO_DATA_PENALTY=30) so a
 # top provider with base 30 (e.g. ollama=60) doesn't monopolize the combo —
@@ -682,6 +731,20 @@ class SmartRouter:
         if cls._combo_cache and now - cls._combo_cache_time < COMBO_REFRESH_INTERVAL:
             if not skip_disabled:
                 return cls._combo_cache
+
+        # Fast-path (cascade-fix 2026-08-31): if a fresh disk cache exists,
+        # use it immediately instead of waiting up to CATALOG_TIMEOUT on the
+        # slow /v1/models fetch. Only hit the network when the cache is stale
+        # or absent. This unblocks combo requests that previously hung 5-15s
+        # waiting for the catalog fetch to time out.
+        disk = cls._read_combo_cache()
+        if disk and not skip_disabled:
+            disk = cls._filter_static_models(disk)
+            disk = cls._filter_disabled_models(disk)
+            if disk:
+                cls._combo_cache = disk
+                cls._combo_cache_time = now
+                return disk
 
         models = cls._fetch_catalog_models()
         if models:

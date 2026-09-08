@@ -79,3 +79,56 @@ class TestComboCache:
     def test_filter_dedupes_preserving_order(self):
         ids = ["groq/llama-3.3-70b-versatile", "groq/llama-3.3-70b-versatile"]
         assert SmartRouter._filter_static_models(ids) == ["groq/llama-3.3-70b-versatile"]
+
+
+class TestComboBackgroundRefresh:
+    """Background combo-refresh keeps the disk cache fresh so on-demand
+    requests (short CATALOG_TIMEOUT) never fall back to a stale 1-model cache."""
+
+    def test_background_refresh_writes_full_catalog_to_disk(
+        self, _reset_cache, tmp_path, monkeypatch
+    ):
+        full_catalog = [
+            "groq/llama-3.3-70b-versatile",
+            "any/qwen3.8-max",
+            "cu/kimi-k3-max",
+            "ollama/gpt-oss:120b",
+        ]
+        # Background thread (long timeout) fetches the full catalog, then
+        # explicitly writes it to disk (mirrors daemon combo_refresh_loop)
+        monkeypatch.setattr(SmartRouter, "_fetch_catalog_models", lambda: full_catalog)
+        models = SmartRouter.get_default_combos(skip_disabled=True)
+        assert models == full_catalog
+        SmartRouter._write_combo_cache(models)
+        cache_file = tmp_path / "combo_cache.json"
+        assert json.loads(cache_file.read_text()) == full_catalog
+
+    def test_on_demand_uses_fresh_disk_cache_not_stale(
+        self, _reset_cache, tmp_path, monkeypatch
+    ):
+        # Background refresh already wrote a rich cache
+        fresh = ["groq/llama-3.3-70b-versatile", "any/qwen3.8-max"]
+        (tmp_path / "combo_cache.json").write_text(json.dumps(fresh))
+        # On-demand fetch (short timeout) fails -> must use the FRESH disk cache
+        monkeypatch.setattr(SmartRouter, "_fetch_catalog_models", lambda: [])
+        combos = SmartRouter.get_default_combos()
+        assert combos == fresh
+
+    def test_degraded_fallback_not_persisted_over_good_cache(
+        self, _reset_cache, tmp_path, monkeypatch
+    ):
+        # A good 300+ model cache is on disk. A timed-out/truncated fetch
+        # returns a tiny fallback (1 model). The daemon guard must NOT
+        # overwrite the good cache with the tiny fallback.
+        good = [f"rw/model-{i}" for i in range(300)]
+        (tmp_path / "combo_cache.json").write_text(json.dumps(good))
+        # Simulate the daemon combo_refresh_loop: with skip_disabled=True the
+        # fast-path disk cache is bypassed, so a truncated fetch yields a tiny
+        # pool (the actual self-destructive trigger).
+        monkeypatch.setattr(SmartRouter, "_fetch_catalog_models", lambda: ["rw/model-0"])
+        fallback = SmartRouter.get_default_combos(skip_disabled=True)
+        assert len(fallback) < smart_router.MIN_COMBO_WRITE
+        # daemon guard: only write when pool >= MIN_COMBO_WRITE
+        if len(fallback) >= smart_router.MIN_COMBO_WRITE:
+            SmartRouter._write_combo_cache(fallback)
+        assert json.loads((tmp_path / "combo_cache.json").read_text()) == good

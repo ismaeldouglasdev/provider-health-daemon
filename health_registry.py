@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Optional
 
 from cooldown import CooldownCalculator
-from config import HEALTH_FILE, PROBER_INTERVAL_MINUTES, PROVIDER_DENYLIST
+from config import (
+    DISABLED_REPROBE_INTERVAL_HOURS,
+    HEALTH_FILE,
+    PROBER_INTERVAL_MINUTES,
+    PROVIDER_DENYLIST,
+)
 from provider_aliases import normalize_provider
 
 log = logging.getLogger(__name__)
@@ -210,6 +215,36 @@ class HealthRegistry:
             self._data[self.PROVIDERS][provider] = entry
             self._save()
             log.debug(f"✓ {provider}{'/' + model if model else ''} → healthy")
+
+    def reprobe_disabled_due(self, entry: dict) -> bool:
+        """Whether a `disabled` provider is due for a re-integration probe.
+
+        Only status `disabled` qualifies. Probes are rate-limited by
+        DISABLED_REPROBE_INTERVAL_HOURS since the last probe attempt (or since
+        disablement, if never probed). No last_probe_at/updated_at → due once.
+        """
+        if entry.get("status") != "disabled":
+            return False
+        last = entry.get("last_probe_at") or entry.get("updated_at")
+        if not last:
+            return True
+        try:
+            last_dt = datetime.fromisoformat(str(last))
+        except ValueError:
+            return True
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=DISABLED_REPROBE_INTERVAL_HOURS)
+        return last_dt <= cutoff
+
+    def record_disabled_probe(self, provider: str) -> None:
+        """Stamp a disabled provider as probed now, so it is not re-probed early."""
+        provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return
+        with self._lock:
+            entry = self._data[self.PROVIDERS].get(provider)
+            if entry and entry.get("status") == "disabled":
+                entry["last_probe_at"] = datetime.now(timezone.utc).isoformat()
+                self._save()
 
     def mark_error(
         self,

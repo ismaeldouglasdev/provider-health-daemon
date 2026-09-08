@@ -38,7 +38,7 @@ from config import (
     HEALTH_PROXY_PORT, PROBER_INTERVAL_MINUTES, ACCESS_LOG_PATH, DASHBOARD_PORT,
     DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE, NINEROUTER_URL, NINEROUTER_KEY,
     PROBE_TIMEOUT, DISCOVERY_INTERVAL_SECONDS, PROXY_CHECK_INTERVAL_SECONDS,
-    POOL_DEGRADED_THRESHOLD,
+    POOL_DEGRADED_THRESHOLD, COMBO_REFRESH_INTERVAL, CATALOG_TIMEOUT,
 )
 from smart_router import SmartRouter
 from catalog_sync import sync_disable_dead_model
@@ -315,36 +315,65 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
     threading.Thread(target=prober, daemon=True, name="prober").start()
 
     def recovery_prober():
-        """Periodically test cooldown/probing providers to auto-recover them."""
-        combo_models = SmartRouter.get_default_combos()
-        provider_models: dict[str, list[str]] = {}
-        for cm in combo_models:
-            p = cm.split("/")[0]
-            provider_models.setdefault(p, []).append(cm)
+        """Periodically test cooldown/probing/disabled providers to auto-recover them.
 
+        Bug fix (2026-09-03): combo_models is now refreshed each cycle instead
+        of being fetched once at startup.  Disabled providers whose models were
+        filtered out of the combo cache use the ``models`` list stored in their
+        health-registry entry as a fallback, breaking the cycle-vicious bug where
+        disabled providers could never be probed because they were absent from
+        the combo cache.
+        """
         interval = max(PROBER_INTERVAL_MINUTES * 60, 60)
         while not shutdown_event.is_set():
             if shutdown_event.wait(interval):
                 break
             try:
+                # Refresh combo models each cycle so newly-healthy providers
+                # are picked up and stale entries are dropped.
+                combo_models = SmartRouter.get_default_combos()
+                provider_models: dict[str, list[str]] = {}
+                for cm in combo_models:
+                    p = cm.split("/")[0]
+                    provider_models.setdefault(p, []).append(cm)
+
+                snapshot = registry.snapshot()
                 summary = registry.status_summary()
                 cooldown_count = summary["by_status"].get("cooldown", 0)
                 probing_count = summary["by_status"].get("probing", 0)
-                if cooldown_count + probing_count == 0:
+                disabled_provider_snapshot = snapshot.get("providers", {})
+
+                # Count disabled providers that are due for reprobe.
+                # A disabled provider qualifies even if absent from
+                # provider_models — we'll fall back to its registry models.
+                disabled_due = sum(
+                    1
+                    for _p, e in disabled_provider_snapshot.items()
+                    if e.get("status") == "disabled"
+                    and registry.reprobe_disabled_due(e)
+                )
+                if cooldown_count + probing_count + disabled_due == 0:
                     continue
 
                 import urllib.request, json as _json
 
-                for provider, entry in list(registry.snapshot().get("providers", {}).items()):
+                for provider, entry in list(disabled_provider_snapshot.items()):
                     status = entry.get("status", "")
-                    if status not in ("cooldown", "probing"):
+                    if status == "disabled":
+                        if not registry.reprobe_disabled_due(entry):
+                            continue
+                        registry.record_disabled_probe(provider)
+                    elif status not in ("cooldown", "probing"):
                         continue
-                    if entry.get("failures", 0) >= HealthRegistry.MAX_FAILURES:
+                    if status != "disabled" and entry.get("failures", 0) >= HealthRegistry.MAX_FAILURES:
                         continue  # don't probe permanently disabled
-                    if provider not in provider_models:
-                        continue  # don't know what model to test
 
-                    test_models = provider_models[provider]
+                    # Resolve test models: prefer live combo cache, fall back
+                    # to the models list stored in the health-registry entry
+                    # (breaks the disabled→filtered→unprobed cycle).
+                    test_models = provider_models.get(provider) or entry.get("models", [])
+                    if not test_models:
+                        continue  # truly no model to test
                     for test_model in test_models:
                         probe_body = _json.dumps({
                             "model": test_model,
@@ -361,7 +390,9 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                                 },
                                 method="POST",
                             )
-                            with urllib.request.urlopen(probe_req, timeout=10) as probe_resp:
+                            # timeout 60: OmniRoute mede ~25s de latência no
+                            # /v1/models; 10s gerava "Recovery prober error: timed out"
+                            with urllib.request.urlopen(probe_req, timeout=60) as probe_resp:
                                 if probe_resp.status == 200:
                                     probe_body = probe_resp.read()
                                     if _is_empty_chat_response(probe_body):
@@ -895,6 +926,51 @@ def main():
         args=(shared_metrics,),
         daemon=True,
         name="access-log-monitor",
+    ).start()
+
+    # ── Background combo-cache refresh ───────────────────────────────
+    # The on-demand combo fetch uses CATALOG_TIMEOUT (5s) which is too short
+    # for the slow OmniRoute /v1/models (14-120s), so it times out and falls
+    # back to a stale disk cache (was: only ollama/gpt-oss:120b → subagents
+    # failed with "all providers in cooldown"). This thread refreshes the
+    # combo cache in the background with a long timeout so requests never
+    # hang AND the cache stays fresh across all healthy providers.
+    def combo_refresh_loop():
+        import smart_router as _sr
+        while not shutdown_event.is_set():
+            if shutdown_event.wait(COMBO_REFRESH_INTERVAL):
+                break
+            try:
+                old = _sr.CATALOG_TIMEOUT
+                _sr.CATALOG_TIMEOUT = max(old, 90.0)
+                try:
+                    models = _sr.SmartRouter.get_default_combos(skip_disabled=True)
+                    # Only persist a genuine fresh catalog. When the /v1/models
+                    # fetch times out, get_default_combos falls back to the
+                    # existing disk cache (possibly a tiny stale list); writing
+                    # that fallback back would overwrite a good 300+ model cache
+                    # with a 1-model list (self-destructive cache). A real
+                    # catalog fetch always returns far more than MIN_COMBO_WRITE.
+                    if len(models) >= _sr.MIN_COMBO_WRITE:
+                        _sr.SmartRouter._write_combo_cache(models)
+                        log.info(
+                            "Combo cache refreshed",
+                            extra={"event": "combo_refreshed", "models": len(models)},
+                        )
+                    else:
+                        log.warning(
+                            "Combo refresh skipped (degraded fallback)",
+                            extra={"event": "combo_refresh_skipped", "models": len(models)},
+                        )
+                finally:
+                    _sr.CATALOG_TIMEOUT = old
+            except Exception as e:
+                log.error(f"Combo refresh error: {e}")
+
+    threading.Thread(
+        target=combo_refresh_loop,
+        daemon=True,
+        name="combo-refresh",
     ).start()
 
     # ── Start error log monitor ──────────────────────────────────────

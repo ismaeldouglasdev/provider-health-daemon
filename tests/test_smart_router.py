@@ -245,6 +245,7 @@ class TestDisabledModelFilter:
         fake = {"groq": ["groq/meta-llama/llama-4-maverick-17b-128e-instruct"]}
         with (
             patch("catalog_sync.get_disabled_models", return_value=fake),
+            patch.object(SmartRouter, "_read_combo_cache", return_value=[]),
             patch.object(SmartRouter, "_fetch_catalog_models", return_value=[
                 "groq/meta-llama/llama-4-maverick-17b-128e-instruct",
                 "groq/llama-3.3-70b-versatile",
@@ -338,7 +339,8 @@ class TestNoDataPenalty:
     def test_never_seen_provider_gets_penalty(self):
         score = _make_router()._compute_score("openrouter", None)
         assert score["no_data"] is True
-        assert score["total"] == 80  # 50 base + 30 penalty
+        # openrouter priority is 31 (re-ranked 2026-08-26) → 31 base + 30 penalty
+        assert score["total"] == 61
 
     def test_tested_provider_beats_never_seen(self):
         router = _make_router()
@@ -350,12 +352,12 @@ class TestNoDataPenalty:
         store = MetricsStore()
         now = time.time()  # fresh: must fall inside the 300s stats window
         store.record_request(RequestRecord(
-            timestamp=now, provider="groq", model="groq/llama-3.3-70b-versatile",
+            timestamp=now, provider="groq", model="groq/gpt-oss-120b",
             duration_ms=800, success=True,
         ))
         reg = _FakeHealthRegistry()
         for mid in [
-            "groq/llama-3.3-70b-versatile",
+            "groq/gpt-oss-120b",
             "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
         ]:
             reg.available.add(mid)
@@ -364,11 +366,11 @@ class TestNoDataPenalty:
         ranked = SmartRouter(store).rank_models(
             [
                 "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
-                "groq/llama-3.3-70b-versatile",
+                "groq/gpt-oss-120b",
             ],
             reg,
         )
-        assert ranked[0][0] == "groq/llama-3.3-70b-versatile"
+        assert ranked[0][0] == "groq/gpt-oss-120b"
 
 
 class TestHealthFailurePenalty:
@@ -663,7 +665,7 @@ class TestConnectionWeighting:
             classmethod(lambda cls: {}),  # 1 conn default → limit 30 each
         )
         items = []
-        for p in ["rw", "cu", "hf", "kr", "ag", "cf", "bzl", "cx", "glm", "groq"]:
+        for p in ["rw", "cu", "hf", "bai", "ag", "cf", "bzl", "cx", "glm", "groq"]:
             for i in range(30):
                 items.append({"id": f"{p}/model-{i}", "capabilities": {"contextWindow": 1000000}})
         out = SmartRouter._filter_catalog_models(items)

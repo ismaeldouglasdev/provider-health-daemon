@@ -146,7 +146,9 @@ def sanitize_router_config(config: dict) -> dict:
     # Integer fields with safe defaults
     result["priority"] = max(1, min(100, int(config.get("priority", 1))))
     result["weight"] = max(1, min(100, int(config.get("weight", 1))))
-    result["timeout"] = max(0.5, min(30.0, float(config.get("timeout", 2.0))))
+    # Cap 60.0 (não 30.0): OmniRoute mede ~25s de latência no /v1/models;
+    # 30s causava probes falsos → "all routers unavailable" (config.py l.135).
+    result["timeout"] = max(0.5, min(60.0, float(config.get("timeout", 2.0))))
 
     # Optional fields
     result["health_check_path"] = str(config.get("health_check_path", "/v1/models"))

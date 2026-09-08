@@ -24,7 +24,7 @@ from pathlib import Path
 # daemon.py inserts prompt-limiter at sys.path[0], which shadows our
 # local modules (smart_router.py, metrics_store.py, etc.).
 # Fix: put our directory at [0], prompt-limiter at [1].
-from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT, STREAM_HEAD_WINDOW_LINES
+from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT, STREAM_UPSTREAM_TIMEOUT, STREAM_HEAD_WINDOW_LINES
 
 _local_dir = str(Path(__file__).parent)
 _prompt_dir = str(PROMPT_LIMITER_DIR)
@@ -66,6 +66,59 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+# ── Degeneration guard (repetition loop) ──────────────────────────────
+# The opencode/9router stack occasionally serves a model that degenerates
+# into repeating the SAME sentence hundreds of times in one response
+# (observed: 981x / 2346x the same phrase). This poisons the session and
+# burns tokens. We detect it mid-stream and abort the response before the
+# client receives the garbage. Mirrors the guard in opencode-pwa/server.js.
+DEGEN_REPEAT_THRESHOLD = int(os.environ.get("DEGEN_REPEAT_THRESHOLD", "12"))
+DEGEN_MIN_SENTENCE_LEN = int(os.environ.get("DEGEN_MIN_SENTENCE_LEN", "5"))
+DEGEN_CHECK_INTERVAL = int(os.environ.get("DEGEN_CHECK_INTERVAL", "2000"))  # chars grown between checks
+DEGEN_MAX_CHECK_TEXT = int(os.environ.get("DEGEN_MAX_CHECK_TEXT", "40000"))  # window analyzed per check
+# Secondary "stuck-loop" detector: if the single most-repeated sentence makes up
+# at least this fraction of all non-trivial sentences in the window AND appears
+# at least DEGEN_RATIO_FLOOR times, it's degeneration — even if the absolute
+# count is below REPEAT_THRESHOLD. Catches loops of near-identical short
+# phrases (e.g. "Vou rodar." / "Executando.") that degenerate prose produces.
+DEGEN_RATIO_MAX = float(os.environ.get("DEGEN_RATIO_MAX", "0.30"))
+DEGEN_RATIO_FLOOR = int(os.environ.get("DEGEN_RATIO_FLOOR", "8"))
+DEGEN_NOTICE = "\n\n[⚠️ resposta interrompida pelo proxy — repetição degenerada detectada]"
+
+
+def _detect_degeneration(text: str):
+    """Return the repeated sentence if the tail of `text` shows degeneration.
+
+    Splits the trailing window into sentences. Two detectors:
+      1. Absolute: ONE sentence (>= MIN_LEN) repeats >= REPEAT_THRESHOLD times.
+      2. Ratio ("stuck loop"): the single most-repeated sentence is >=
+         DEGEN_RATIO_MAX of all non-trivial sentences AND appears >=
+         DEGEN_RATIO_FLOOR times. Catches short-phrase loops that a high
+         absolute threshold would miss.
+    Returns (sentence, count) or None. O(1) amortized: only runs every
+    DEGEN_CHECK_INTERVAL chars on a bounded window.
+    """
+    if not text or len(text) < DEGEN_MIN_SENTENCE_LEN:
+        return None
+    window = text[-DEGEN_MAX_CHECK_TEXT:]
+    parts = re.split(r"[.!?\n;]+", window)
+    counts: dict[str, int] = {}
+    total = 0
+    for s in parts:
+        s = s.strip()
+        if len(s) < DEGEN_MIN_SENTENCE_LEN:
+            continue
+        total += 1
+        counts[s] = counts.get(s, 0) + 1
+        if counts[s] >= DEGEN_REPEAT_THRESHOLD:
+            return (s[:80], counts[s])
+    # Stuck-loop (ratio) check: one phrase dominating the window.
+    if total >= DEGEN_RATIO_FLOOR:
+        top, top_count = max(counts.items(), key=lambda kv: kv[1])
+        if top_count >= DEGEN_RATIO_FLOOR and (top_count / total) >= DEGEN_RATIO_MAX:
+            return (top[:80], top_count)
+    return None
 
 
 def _strip_anthropic_caching(obj):
@@ -523,8 +576,39 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             if stream_live:
                 try:
+                    # Degeneration guard: accumulate streamed text and abort
+                    # if the model starts repeating the same sentence.
+                    _degen_buf = ""
+                    _degen_check_at = 0
                     for raw in resp:
                         line = _normalize_sse_line(raw)
+                        # Feed the guard from SSE data payloads (skip [DONE]).
+                        if line.startswith(b"data: "):
+                            payload = line[6:].strip()
+                            if payload and payload != b"[DONE]":
+                                try:
+                                    _degen_buf += json.loads(payload).get("choices", [{}])[0].get("delta", {}).get("content", "") or ""
+                                except Exception:
+                                    pass
+                                if len(_degen_buf) - _degen_check_at >= DEGEN_CHECK_INTERVAL:
+                                    _degen_check_at = len(_degen_buf)
+                                    hit = _detect_degeneration(_degen_buf)
+                                    if hit:
+                                        log.warning(
+                                            "Degeneration guard: %s repeated %dx — aborting stream",
+                                            hit[0], hit[1],
+                                        )
+                                        # Emit a notice then close the chunked
+                                        # response cleanly so the client's
+                                        # parser finishes (no 500).
+                                        notice = _normalize_sse_line(
+                                            f'data: {json.dumps({"choices":[{"delta":{"content":DEGEN_NOTICE},"finish_reason":"stop"}]})}'.encode()
+                                        )
+                                        self.wfile.write(f"{len(notice):X}\r\n".encode() + notice + b"\r\n")
+                                        self.wfile.flush()
+                                        self.wfile.write(b"0\r\n\r\n")
+                                        self.wfile.flush()
+                                        return b"".join(sent), ttft_ms
                         self.wfile.write(f"{len(line):X}\r\n".encode() + line + b"\r\n")
                         self.wfile.flush()
                 except (socket.timeout, TimeoutError, OSError) as e:
@@ -629,9 +713,16 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         req = urllib.request.Request(url, data=data, headers=headers, method=self.command)
         req.add_header("Accept", "text/event-stream, application/json")
 
+        # Streaming chat requests get STREAM_UPSTREAM_TIMEOUT (generous idle
+        # cap) so slow-but-real generation isn't killed by the 30s
+        # UPSTREAM_TIMEOUT; non-streaming keeps the tighter timeout for fast
+        # failure on dead/empty upstreams.
+        _streaming = bool(body.get("stream")) if body else False
+        _sock_timeout = STREAM_UPSTREAM_TIMEOUT if _streaming else UPSTREAM_TIMEOUT
+
         try:
             opener = self.opener if self.opener is not None else urllib.request.build_opener()
-            with opener.open(req, timeout=UPSTREAM_TIMEOUT) as resp:
+            with opener.open(req, timeout=_sock_timeout) as resp:
                 is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                 resp_body, ttft_ms = self._emit_upstream_response(resp, is_chat, fallback_used, start_time)
 
@@ -683,7 +774,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_url = fallback_router.url.rstrip("/") + path
                         fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
-                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=UPSTREAM_TIMEOUT)
+                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=_sock_timeout)
                         is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                         fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
                         if body and fallback_resp.status == 200:
@@ -832,7 +923,31 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         self._router_selected = True
                         self._forward(body)
                         return
-                self._respond_unavailable(f"Upstream timeout after {UPSTREAM_TIMEOUT:.0f}s")
+                # Loop guard: a timed-out model must NOT stay in rotation.
+                # opencode retries the same request on 5xx, and without a
+                # cooldown the retry hits the SAME slow model → infinite
+                # retry loop (access.log showed identical requests ×3/×7).
+                # Mark model-specific 5m cooldown so the next request picks
+                # a different model, then fail loudly with 504 (Gateway
+                # Timeout) instead of a retryable 503.
+                if body and self.registry:
+                    model = body.get("model", "")
+                    provider = model.split("/")[0] if "/" in model else model
+                    self.registry.mark_error(
+                        provider=provider,
+                        error_info={
+                            "minutes": 5,
+                            "type": "timeout",
+                            "model_specific": True,
+                            "recheck": True,
+                        },
+                        model=model,
+                    )
+                    log.warning(
+                        f"Timeout cooldown applied: {model} → 5m (loop guard)",
+                        extra={"event": "timeout_cooldown", "provider": provider, "model": model},
+                    )
+                self._respond_timeout(f"Upstream timeout after {_sock_timeout:.0f}s")
                 if body:
                     model = body.get("model", "")
                     provider = model.split("/")[0] if "/" in model else model
@@ -849,7 +964,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
                         opener = self.opener if self.opener is not None else urllib.request.build_opener()
-                        fallback_resp = opener.open(fallback_req, timeout=UPSTREAM_TIMEOUT)
+                        fallback_resp = opener.open(fallback_req, timeout=_sock_timeout)
                         is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
                         fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
                         if body and fallback_resp.status == 200:
@@ -1116,12 +1231,23 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             return 0
 
     def _find_healthy_alternative(self, body: dict) -> str | None:
-        """Smart routing: find the best performing model from combo."""
+        """Smart routing: find the best performing model from combo.
+
+        Scoped to COMBO model requests ONLY (cascade-fix 2026-08-31). Direct
+        agent models (e.g. amd/DeepSeek-V4-Flash, kr/claude-sonnet-4) signal
+        an explicit choice — if unavailable we must NOT silently swap in a
+        combo model here; instead return None so the request 503s and the
+        opencode fallback_models chain (big-pickle -> deepseek -> combo) runs.
+        """
         if not self.registry or not self.smart_router:
             return None
 
         current = body.get("model", "")
         if not current:
+            return None
+
+        # Only combo-family virtual models get smart-routed for themselves
+        if "/" in current and "combo" not in current and "main-rr" not in current:
             return None
 
         # For combo models, use smart router to pick the best
@@ -1353,7 +1479,17 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if x_router == "combo-round-robin" and self.path in ["/v1/models", "/models"]:
             self._respond_combo_models()
             return
-        
+
+        # ── Local catalog fast-path (2026-09-07) ─────────────────────────
+        # The upstream /v1/models build takes ~107s (1417 models) — beyond
+        # UPSTREAM_TIMEOUT (30s) and CATALOG_TIMEOUT (5s), so every model
+        # listing through this proxy timed out (HTTP 000) and the opencode
+        # model picker never loaded. Serve the daemon's persisted catalog
+        # snapshot locally instead of forwarding upstream.
+        if self.path in ["/v1/models", "/models"]:
+            self._respond_local_models()
+            return
+
         self._forward()
 
     def _respond_status(self):
@@ -1421,6 +1557,115 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             "object": "list",
             "data": all_models
         }
+        payload = json.dumps(response).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    # ── Local catalog fast-path (2026-09-07) ────────────────────────────
+    # The upstream /v1/models build takes ~107s (1417 models) — beyond
+    # UPSTREAM_TIMEOUT (30s) and CATALOG_TIMEOUT (5s), so every model
+    # listing through this proxy timed out (HTTP 000) and the opencode
+    # model picker never loaded. Serve the catalog snapshots the daemon
+    # already keeps on disk (~/.9router/model-catalog*.json) instead of
+    # forwarding upstream.
+    _local_models_cache: list = []
+    _local_models_cache_time: float = 0.0
+    _LOCAL_MODELS_TTL: float = 60.0
+    _COMBO_VIRTUAL_IDS = ("combo-round-robin", "main-rr", "combo-fast", "combo-thinking", "free-combo")
+
+    def _load_local_catalog_ids(self) -> list[str]:
+        """Read catalog ids from local snapshots, best-first.
+
+        Tries model-catalog.json (models dict), then model-catalog-raw.json
+        (provider → {model_id: traits}), then combo_cache.json (bare ids).
+        Ids without a provider prefix get one prepended so the list matches
+        the OpenAI-style "provider/model" ids the proxy routes on. Returns
+        [] if no snapshot exists → caller falls back to upstream forward.
+        """
+        now = time.time()
+        if self._local_models_cache_time and now - self._local_models_cache_time < self._LOCAL_MODELS_TTL:
+            return self._local_models_cache
+
+        ids: list[str] = []
+        seen: set[str] = set()
+        base = Path.home() / ".9router"
+
+        def _add(mid: str) -> None:
+            if mid and mid not in seen:
+                seen.add(mid)
+                ids.append(mid)
+
+        # 1) model-catalog-raw.json: {provider: {model_id: traits}} — ids
+        #    já com prefixo provider/model, o formato que o proxy roteia.
+        try:
+            raw = json.loads((base / "model-catalog-raw.json").read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for provider, models in raw.items():
+                    if not isinstance(models, dict):
+                        continue
+                    for mid in models:
+                        mid = str(mid)
+                        if "/" in mid:
+                            _add(mid)
+                        else:
+                            _add(f"{provider}/{mid}")
+        except (OSError, ValueError):
+            pass
+
+        # 2) model-catalog.json: {"models": {id: traits}} (ids sem prefixo)
+        if not ids:
+            try:
+                data = json.loads((base / "model-catalog.json").read_text(encoding="utf-8"))
+                models = data.get("models") if isinstance(data, dict) else None
+                if isinstance(models, dict):
+                    for mid in models:
+                        _add(str(mid))
+            except (OSError, ValueError):
+                pass
+
+        # 3) combo_cache.json: [provider/model, ...]
+        if not ids:
+            try:
+                combo = json.loads((base / "combo_cache.json").read_text(encoding="utf-8"))
+                if isinstance(combo, list):
+                    for mid in combo:
+                        _add(str(mid))
+            except (OSError, ValueError):
+                pass
+
+        # Virtual combo ids are always selectable — expose them too.
+        for virtual in self._COMBO_VIRTUAL_IDS:
+            _add(virtual)
+
+        if ids:
+            ids.sort()
+            self._local_models_cache = ids
+            self._local_models_cache_time = now
+        return ids
+
+    def _respond_local_models(self):
+        """Serve the local catalog snapshot in OpenAI-list format (fast)."""
+        ids = self._load_local_catalog_ids()
+        if not ids:
+            ids = self._get_combo_models()  # still fast, health-filtered
+        if not ids:
+            self._forward()  # nothing local at all — original behavior
+            return
+
+        now = int(time.time())
+        all_models = [
+            {
+                "id": mid,
+                "object": "model",
+                "created": now,
+                "owned_by": mid.split("/")[0] if "/" in mid else "combo",
+            }
+            for mid in ids
+        ]
+        response = {"object": "list", "data": all_models}
         payload = json.dumps(response).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -1573,6 +1818,23 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             self.audit.requests_blocked += 1
         payload = json.dumps({"error": {"message": message, "type": "provider_unavailable"}}).encode()
         self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _respond_timeout(self, message: str):
+        """Return 504 Gateway Timeout — upstream did not answer in time.
+
+        Distinct from 503 (provider_unavailable): 504 signals the request was
+        valid but the upstream timed out. The caller applies a model cooldown
+        BEFORE emitting this, so opencode's retry picks a different model
+        instead of re-hitting the same slow one (loop guard).
+        """
+        if self.audit:
+            self.audit.requests_blocked += 1
+        payload = json.dumps({"error": {"message": message, "type": "upstream_timeout"}}).encode()
+        self.send_response(504)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()

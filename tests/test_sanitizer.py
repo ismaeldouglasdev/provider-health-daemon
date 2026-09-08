@@ -156,7 +156,7 @@ class TestSanitizeRouterConfig:
         cfg = {"name": "Extreme", "url": "https://api.example.com", "priority": 999, "timeout": 999}
         result = sanitize_router_config(cfg)
         assert result["priority"] == 100
-        assert result["timeout"] == 30.0
+        assert result["timeout"] == 60.0
 
     def test_keeps_valid_auth(self):
         cfg = {"name": "Auth", "url": "https://api.example.com", "auth": {"header": "X-Key", "value": "abc"}}

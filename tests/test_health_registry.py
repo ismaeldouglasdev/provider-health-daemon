@@ -298,3 +298,60 @@ def test_atomic_write_no_corruption(tmp_path: Path):
     # New registry instance should still read the original
     r2 = HealthRegistry(filepath=fp)
     assert r2.is_provider_healthy("original")
+
+
+# ── Disabled-provider re-integration (2026-08-31) ───────────────────
+
+
+def test_reprobe_disabled_ignores_non_disabled(tmp_registry: HealthRegistry):
+    tmp_registry.mark_healthy("sample-provider")
+    entry = tmp_registry.get_provider("sample-provider")
+    assert not tmp_registry.reprobe_disabled_due(entry)
+
+
+def test_reprobe_disabled_due_when_no_timestamp(tmp_registry: HealthRegistry):
+    # Simulate a disabled entry with no last_probe_at/updated_at -> due once
+    tmp_registry._data["providers"]["sample-provider"] = {
+        "status": "disabled", "failures": 10, "reason": "no_credit",
+    }
+    assert tmp_registry.reprobe_disabled_due(
+        tmp_registry.get_provider("sample-provider")
+    )
+
+
+def test_reprobe_disabled_not_due_after_recent_probe(tmp_registry: HealthRegistry):
+    from datetime import datetime, timedelta, timezone
+    tmp_registry._data["providers"]["sample-provider"] = {
+        "status": "disabled", "failures": 10,
+        "last_probe_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+    }
+    assert not tmp_registry.reprobe_disabled_due(
+        tmp_registry.get_provider("sample-provider")
+    )
+
+
+def test_reprobe_disabled_due_after_backoff(tmp_registry: HealthRegistry):
+    from datetime import datetime, timedelta, timezone
+    tmp_registry._data["providers"]["sample-provider"] = {
+        "status": "disabled", "failures": 10,
+        "last_probe_at": (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(),
+    }
+    assert tmp_registry.reprobe_disabled_due(
+        tmp_registry.get_provider("sample-provider")
+    )
+
+
+def test_record_disabled_probe_stamps_and_delays_reprobe(tmp_registry: HealthRegistry):
+    from datetime import datetime, timedelta, timezone
+    from health_registry import HealthRegistry  # noqa: F401 (convention)
+    tmp_registry._data["providers"]["sample-provider"] = {
+        "status": "disabled", "failures": 10,
+        "last_probe_at": (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat(),
+    }
+    assert tmp_registry.reprobe_disabled_due(
+        tmp_registry.get_provider("sample-provider")
+    )
+    tmp_registry.record_disabled_probe("sample-provider")
+    entry = tmp_registry.get_provider("sample-provider")
+    assert "last_probe_at" in entry
+    assert not tmp_registry.reprobe_disabled_due(entry)

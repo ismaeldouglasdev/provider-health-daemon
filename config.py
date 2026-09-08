@@ -33,7 +33,18 @@ KRI_KEY = os.environ.get("KRI_KEY", "").strip() or _load_opencode_api_key("kiro"
 
 # Must stay BELOW typical client timeouts so the proxy can time out a slow
 # upstream, fall back, and still answer (regression guard: bugs-erros-opencode.md 2026-08-14).
-UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "60"))
+# 30s (was 60s): a dead upstream now fails twice as fast, so opencode's retry
+# cycle (60s × 3 attempts = 3min) is halved — less time stuck in a retry loop.
+UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "30"))
+
+# Socket idle timeout for STREAMING chat requests. urllib's timeout applies per
+# blocking socket read, so UPSTREAM_TIMEOUT=30s kills slow-but-real generation
+# (e.g. gemini-3.7-flash takes 22-25s+ to first byte and up to 60-90s total),
+# surfacing to the client as "socket connection was closed unexpectedly" mid-
+# stream. Streaming gets a much more generous idle cap so slow models survive;
+# a genuinely stalled stream still times out per-read. Non-streaming keeps the
+# tighter UPSTREAM_TIMEOUT for fast failure on dead/empty upstreams.
+STREAM_UPSTREAM_TIMEOUT = float(os.environ.get("STREAM_UPSTREAM_TIMEOUT", "300"))
 
 # SSE head-window (lines) drained before committing a streaming response.
 # Empty-200 upstreams finish inside the window (EOF → model fallback still
@@ -68,8 +79,22 @@ PROMPT_LIMITER_DIR = Path.home() / "Desktop" / "code_study" / "MeusProjetos" / "
 PROBER_INTERVAL_MINUTES = 5  # how often to probe cooled-down providers (deprecated, use PROBER_INTERVAL_SECONDS)
 MAX_COOLDOWN_HOURS = 24  # cap exponential backoff
 
+# ── Disabled-provider re-integration (2026-08-31) ────────────────────
+# Providers que atingem `disabled` (max_failures / no_credit / paid_required /
+# invalid_subscription) ficavam PERMANENTEMENTE mortos — o recovery prober só
+# sondava `cooldown`/`probing`. Agora `disabled` também é re-sondado, mas com
+# backoff LONGO para não queimar o quota em loop: só reprobe após este intervalo
+# desde a última tentativa. Quando o motivo passar (quota reset, crédito
+# recarregado, assinatura renovada), o provider volta sozinho via mark_healthy.
+DISABLED_REPROBE_INTERVAL_HOURS = float(
+    os.environ.get("DISABLED_REPROBE_INTERVAL_HOURS", "8")
+)
+
 # ── Smart Router ─────────────────────────────────────────────────────
-COMBO_REFRESH_INTERVAL = 60  # seconds between combo list refresh
+# 300s (was 60): /v1/models do 9router é lento (14-120s); refetch a cada 60s
+# travava requests no fetch por até CATALOG_TIMEOUT. Refresh a cada 5min e
+# confia no combo_cache.json fresco do disco entre ciclos (cascade-fix 2026-08-31).
+COMBO_REFRESH_INTERVAL = 300  # seconds between combo list refresh
 COMBO_CACHE_FILE = Path.home() / ".9router" / "combo_cache.json"  # last-good catalog fallback
 
 # ── Provider Discovery (auto-detect new providers from the 9router hub) ──
@@ -130,7 +155,7 @@ PROBE_MAX_WORKERS = 5              # thread pool size for parallel probes
 # /v1/models do 9router varia 14s-120s (catálogo ~400KB). O SmartRouter
 # usa um timeout DEDICADO e curto para o catálogo: se o fetch demorar,
 # cai rápido no COMBO_CACHE_FILE em disco em vez de travar o ranking.
-CATALOG_TIMEOUT = 15.0             # seconds per /v1/models catalog fetch
+CATALOG_TIMEOUT = 5.0              # seconds per /v1/models catalog fetch (15 -> 5, cascade-fix 2026-08-31)
 
 # ── Router hysteresis (2026-08-24) ───────────────────────────────────
 # /v1/models do 9router varia 14s-120s (catálogo ~400KB); um único timeout
