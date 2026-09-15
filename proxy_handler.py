@@ -424,11 +424,21 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         return self.smart_router.fallback_chain(catalog, self.registry)
 
     def _next_fallback_model(self, tried: set) -> str | None:
-        """Best catalog model not yet tried, or None when catalog exhausted."""
+        """Best catalog model not yet tried, or None when catalog exhausted.
+
+        Also skips models whose PROVIDER already failed in this request
+        (a 503 from seek/kimi-k3 almost always means seek/host is down —
+        retrying seek/gemini-3.8-flash just burns another UPSTREAM_TIMEOUT).
+        """
         chain = self._global_fallback_chain()
+        tried_providers = set(getattr(self, "_tried_providers", set()))
         for m in chain:
-            if m not in tried:
-                return m
+            if m in tried:
+                continue
+            p = m.split("/")[0] if "/" in m else m
+            if p in tried_providers:
+                continue
+            return m
         return None
 
     def _cache_key(self, body: dict) -> str:
@@ -534,7 +544,16 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # Upstreams sometimes advertise text/event-stream but return a
             # plain JSON body (9router->glm glues "data: [DONE]" onto it).
             # Detect real SSE by the "data: " prefix of the first line.
-            first_line = resp.readline()
+            try:
+                first_line = resp.readline()
+            except (socket.timeout, TimeoutError, OSError) as read_err:
+                # A bare socket timeout on the first SSE line (upstream sent
+                # the event-stream header but never a body line) is NOT a
+                # URLError — it would escape the fallback ladder and crash
+                # do_POST (curl sees HTTP=000, no retry). Normalize so the
+                # ladder's is_pure_timeout path (cooldown + next healthy
+                # model) handles it like any other upstream timeout.
+                raise urllib.error.URLError(read_err)
             if start_time is not None:
                 ttft_ms = int((time.time() - start_time) * 1000)
             if not first_line.startswith(b"data: "):
@@ -571,12 +590,24 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     raise EmptyUpstreamResponse(head)
                 stream_live = not head_eof
             else:
-                body = first_line + resp.read()
+                try:
+                    body = first_line + resp.read()
+                except (socket.timeout, TimeoutError, OSError) as read_err:
+                    # A bare socket timeout from resp.read() is NOT
+                    # urllib.error.URLError — it would escape the fallback
+                    # ladder in _forward entirely and crash do_POST (curl sees
+                    # HTTP=000, no fallback retry). Normalize so the ladder's
+                    # is_pure_timeout path (5m/15m cooldown + next model)
+                    # can handle it like any other upstream timeout.
+                    raise urllib.error.URLError(read_err)
                 body = self._normalize_response_body(body, content_type)
                 if _is_pollinations_budget_error(body) or _is_empty_chat_response(body):
                     raise EmptyUpstreamResponse(body)
         elif not is_streaming:
-            body = first_line + resp.read()
+            try:
+                body = first_line + resp.read()
+            except (socket.timeout, TimeoutError, OSError) as read_err:
+                raise urllib.error.URLError(read_err)
 
         self.send_response(resp.status)
         for k, v in resp.headers.items():
@@ -780,7 +811,13 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             return
 
         except urllib.error.HTTPError as e:
-            resp_body = e.read()
+            try:
+                resp_body = e.read()
+            except (socket.timeout, TimeoutError, OSError) as read_err:
+                # Same bare-timeout normalization as _emit_upstream_response:
+                # a stalled error body is not a URLError, so without this it
+                # would escape both this handler and the URLError ladder below.
+                raise urllib.error.URLError(read_err)
 
             # Router responded — upstream provider failed, NOT a router issue.
             # Do NOT mark router unhealthy; only penalize for connection errors (URLError below).
@@ -850,6 +887,14 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 tried = set(getattr(self, "_tried_models", set()))
                 tried.add(body.get("model", ""))
                 self._tried_models = tried
+                # 5xx/access on one model ≈ whole provider down — exclude its
+                # other models from the fallback chain (avoid burning an
+                # UPSTREAM_TIMEOUT on seek/gemini after seek/kimi failed).
+                fail_provider = (body.get("model") or "").split("/")[0]
+                if fail_provider:
+                    tp = set(getattr(self, "_tried_providers", set()))
+                    tp.add(fail_provider)
+                    self._tried_providers = tp
                 next_model = self._next_fallback_model(tried)
                 if next_model:
                     self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
@@ -946,6 +991,13 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     tried = set(getattr(self, "_tried_models", set()))
                     tried.add(body.get("model", ""))
                     self._tried_models = tried
+                    # A timeout on one model ≈ provider-level slowness — exclude
+                    # its other models from this request's fallback chain too.
+                    fail_provider = (body.get("model") or "").split("/")[0]
+                    if fail_provider:
+                        tp = set(getattr(self, "_tried_providers", set()))
+                        tp.add(fail_provider)
+                        self._tried_providers = tp
                     next_model = self._next_fallback_model(tried)
                     if next_model:
                         self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
@@ -1780,6 +1832,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # — a retry sends the same combo name, so it must map to the same key.
             self._fallback_attempts = 0
             self._tried_models = set()
+            self._tried_providers = set()
             self._router_selected = False
             self._request_cache_key = "" if body.get("stream") else self._cache_key(body)
 

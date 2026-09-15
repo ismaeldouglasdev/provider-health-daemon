@@ -949,9 +949,14 @@ def main():
     # hang AND the cache stays fresh across all healthy providers.
     def combo_refresh_loop():
         import smart_router as _sr
+        # Prime the combo cache at boot: the first iteration runs immediately
+        # so the first combo request after a restart does not pay the slow
+        # 9router /v1/models catalog fetch inline (~10-18s).
+        first = True
         while not shutdown_event.is_set():
-            if shutdown_event.wait(COMBO_REFRESH_INTERVAL):
+            if not first and shutdown_event.wait(COMBO_REFRESH_INTERVAL):
                 break
+            first = False
             try:
                 old = _sr.CATALOG_TIMEOUT
                 _sr.CATALOG_TIMEOUT = max(old, 90.0)
