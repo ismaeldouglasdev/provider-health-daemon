@@ -145,12 +145,45 @@ def _apply_cooldown_fields(result: dict, hours: int, minutes: int) -> None:
         result["minutes"] = minutes
 
 
+# Structural error types: the cooldown encodes a durable account/model state
+# (subscription tier, credit balance, credentials, model existence) that a
+# short "(reset after X)" retry annotation cannot resolve — 9router annotates
+# error lines with reset hints that are meaningless for these (e.g. an
+# invalid_subscription won't clear in 4m51s). For structural types the
+# retry_after may only EXTEND the cooldown (max), never shrink it.
+# Permanent errors ignore retry_after entirely (they never clear).
+_STRUCTURAL_COOLDOWN_TYPES = frozenset({
+    "invalid_subscription",
+    "subscription_level",
+    "no_credit",
+    "no_credentials",
+    "payment_required",
+    "paid_required",
+    "auth_invalid",
+    "model_not_found",
+    "model_deprecated",
+    "model_not_supported",
+})
+
+
 def _postprocess_error_result(result: dict, body: str) -> dict:
-    """Apply retry_after overrides and free-tier 429 model scoping."""
+    """Apply retry_after overrides and free-tier 429 model scoping.
+
+    retry_after is honored for TRANSIENT errors (rate limits, quota resets)
+    but must never shrink a structural cooldown or override a permanent error.
+    """
     retry = _extract_retry_after_seconds(body)
-    if retry is not None:
+    if retry is not None and not result.get("permanent", False):
         h_m = _seconds_to_cooldown(retry)
-        _apply_cooldown_fields(result, h_m["hours"], h_m["minutes"])
+        cd = result.get("cooldown") or result
+        if str(cd.get("type", "")) in _STRUCTURAL_COOLDOWN_TYPES:
+            # max(structural, retry) — retry_after may only extend, never shrink
+            cur_min = (cd.get("hours") or 0) * 60 + (cd.get("minutes") or 0)
+            retry_min = h_m["hours"] * 60 + h_m["minutes"]
+            if retry_min > cur_min:
+                _apply_cooldown_fields(result, h_m["hours"], h_m["minutes"])
+        else:
+            _apply_cooldown_fields(result, h_m["hours"], h_m["minutes"])
 
     cd = result.get("cooldown") or result
     err_type = str(cd.get("type", ""))
@@ -214,7 +247,7 @@ ERROR_PATTERNS = [
     ),
     (
         r"exceeded your rate limit|session usage limit|sending requests too quickly",
-        lambda m: {"hours": 0, "minutes": 5, "type": "generic_429"},
+        lambda m: {"hours": 0, "minutes": 15, "type": "generic_429"},
     ),
     # groq 429: "Rate limit reached for model X in organization..." (sem try again in)
     (
@@ -397,16 +430,16 @@ ERROR_PATTERNS = [
     # Mistral 429 rate_limited, nvidia 529 overload
     (
         r"Rate limit exceeded|rate_limited|Service temporarily overloaded",
-        lambda m: {"hours": 0, "minutes": 5, "type": "generic_429"},
+        lambda m: {"hours": 0, "minutes": 15, "type": "generic_429"},
     ),
     # Generic
     (
         r"experiencing high demand|high demand|Please try again later",
-        lambda m: {"hours": 0, "minutes": 5, "type": "generic_429"},
+        lambda m: {"hours": 0, "minutes": 15, "type": "generic_429"},
     ),
     (
         r"Too Many Requests",
-        lambda m: {"hours": 0, "minutes": 5, "type": "generic_429"},
+        lambda m: {"hours": 0, "minutes": 15, "type": "generic_429"},
     ),
     (
         r"fetch failed",
@@ -504,7 +537,7 @@ def parse_error(status: int, body: str) -> dict:
     # Empty/near-empty body with 429: still a rate limit (antigravity/gemini send `{` or empty)
     if status == 429 and len(body.strip()) < 10:
         result = {
-            "cooldown": {"hours": 0, "minutes": 5, "type": "generic_429"},
+            "cooldown": {"hours": 0, "minutes": 15, "type": "generic_429"},
             "permanent": False,
             "model_specific": False,
             "provider_hint": provider,
@@ -527,7 +560,7 @@ def parse_error(status: int, body: str) -> dict:
             # If no hours/minutes from handler, derive from status
             if "hours" not in result and "minutes" not in result:
                 if status == 429:
-                    result["hours"], result["minutes"] = 0, 5
+                    result["hours"], result["minutes"] = 0, 15
                 elif status == 403:
                     result["hours"], result["minutes"] = 0, 0
                     result["permanent"] = True
@@ -569,7 +602,7 @@ _COMBO_STATUS_BODY = {
     402: "Monthly request limit exceeded. Account has reached its monthly quota.",
     404: "model not found",
     410: "model has been deprecated",
-    429: "",  # empty body → generic_429 5min
+    429: "",  # empty body → generic_429 15min
     500: "Internal Server Error",
     502: "Internal Server Error",
     503: "Internal Server Error",

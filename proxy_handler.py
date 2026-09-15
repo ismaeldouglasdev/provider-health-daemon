@@ -942,25 +942,29 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 # opencode retries the same request on 5xx, and without a
                 # cooldown the retry hits the SAME slow model → infinite
                 # retry loop (access.log showed identical requests ×3/×7).
-                # Mark model-specific 5m cooldown so the next request picks
-                # a different model, then fail loudly with 504 (Gateway
-                # Timeout) instead of a retryable 503.
+                # First timeout → model-specific 5m cooldown. If we ALREADY
+                # fell back to another model and THAT also timed out
+                # (_fallback_attempts > 0), the whole provider is slow → widen
+                # to a provider-wide ~15m cooldown. Then fail loudly with 504
+                # (Gateway Timeout) instead of a retryable 503.
                 if body and self.registry:
                     model = body.get("model", "")
                     provider = model.split("/")[0] if "/" in model else model
+                    repeated = getattr(self, "_fallback_attempts", 0) > 0
                     self.registry.mark_error(
                         provider=provider,
                         error_info={
-                            "minutes": 5,
+                            "minutes": 15 if repeated else 5,
                             "type": "timeout",
-                            "model_specific": True,
+                            "model_specific": not repeated,
                             "recheck": True,
                         },
-                        model=model,
+                        model=model if not repeated else None,
                     )
                     log.warning(
-                        f"Timeout cooldown applied: {model} → 5m (loop guard)",
-                        extra={"event": "timeout_cooldown", "provider": provider, "model": model},
+                        f"Timeout cooldown applied: {model} → "
+                        f"{'15m provider-wide' if repeated else '5m model'} (loop guard)",
+                        extra={"event": "timeout_cooldown", "provider": provider, "model": model, "repeated": repeated},
                     )
                 self._respond_timeout(f"Upstream timeout after {_sock_timeout:.0f}s")
                 if body:

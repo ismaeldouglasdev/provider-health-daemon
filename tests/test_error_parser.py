@@ -151,7 +151,7 @@ def test_generic_429_empty_body():
     info = parse_error(429, "")
     cd = _cd(info)
     assert cd["type"] == "generic_429"
-    assert cd["minutes"] == 5
+    assert cd["minutes"] == 15
 
 
 def test_model_deprecated_is_model_specific():
@@ -241,7 +241,7 @@ def test_combo_429_generic_429():
     assert info is not None
     cd = _cd(info)
     assert cd["type"] == "generic_429"
-    assert cd["minutes"] == 5
+    assert cd["minutes"] == 15
     assert info["provider_hint"] == "cf"
     assert info["model_hint"] == "cf/@cf/moonshotai/kimi-k2.6"
 
@@ -363,7 +363,7 @@ def test_request_detail_429_openrouter_rate_limit():
     assert info is not None
     cd = _cd(info)
     assert cd["type"] == "generic_429"
-    assert cd["minutes"] == 5
+    assert cd["minutes"] == 15
     assert info["provider_hint"] == "openrouter"
     assert info["model_hint"] == "nvidia/nemotron-3-super-120b-a12b:free"
     assert info["model_specific"] is True
@@ -529,7 +529,7 @@ _COVERAGE_CASES = [
     ("usage_limit_reached", 429, "The usage limit has been reached",
      "monthly_limit", 1, 0, False, False, True),
     ("exceeded_rate_limit", 429, "You have exceeded your rate limit. Slow down.",
-     "generic_429", 0, 5, False, False, False),
+     "generic_429", 0, 15, False, False, False),
     ("rate_limit_for_model", 429, "Rate limit reached for model gpt-4o in organization",
      "rate_limit_rpm", 0, 5, True, False, False),
     ("invalid_subscription", 400, '{"error":{"message":"InvalidSubscription: account does not have a valid subscription"}}',
@@ -571,9 +571,9 @@ _COVERAGE_CASES = [
     ("request_too_large", 413, "Request too large for model gpt-4o",
      "context_length", None, 15, True, False, False),
     ("too_many_requests", 429, "Too Many Requests",
-     "generic_429", 0, 5, False, False, False),
+     "generic_429", 0, 15, False, False, False),
     ("high_demand_429", 429, "gpt-oss-120b-128k is currently experiencing high demand. Please try again later!",
-     "generic_429", 0, 5, False, False, False),
+     "generic_429", 0, 15, False, False, False),
     ("model_unavailable_transient", 400, "Model 'deepseek-v4-flash' is currently unavailable.",
      "model_unavailable", 0, 15, True, False, True),
     ("model_unavailable_json_code", 400, '{"error":{"message":"Model \'deepseek-v4-flash\' is currently unavailable.","type":"invalid_request_error","param":null,"code":"model_unavailable"}}',
@@ -651,3 +651,35 @@ def test_antigravity_quota_reset_timestamp_iso():
     info = parse_error(429, body)
     cd = _cd(info)
     assert cd["hours"] >= 24  # far-future reset → long cooldown
+
+
+# ── Fix A: structural cooldowns immune to short retry_after ──────────
+# invalid_subscription/subscription_level/no_credit/auth_invalid/
+# model_not_found/etc. encode durable account/model state. A short
+# "(reset after X)" annotation must never SHRINK a 24h/1h/permanent
+# structural cooldown — retry_after may only EXTEND it (max).
+
+
+def test_structural_cooldown_not_shrunk_by_short_retry_after():
+    body = "No registered providers found for this model. Please check the model you provided. (reset after 60s)"
+    info = parse_error(404, body)
+    cd = _cd(info)
+    assert cd["type"] == "model_not_found"
+    assert cd["hours"] == 24
+
+
+def test_structural_cooldown_extended_by_long_retry_after():
+    body = "Your balance is insufficient. Please add funds. (reset after 30h)"
+    info = parse_error(402, body)
+    cd = _cd(info)
+    assert cd["type"] == "no_credit"
+    assert cd["hours"] == 30
+
+
+def test_structural_permanent_ignores_retry_after():
+    body = "Your bearer token is invalid or expired (reset after 4m 51s)"
+    info = parse_error(401, body)
+    cd = _cd(info)
+    assert cd["type"] == "auth_invalid"
+    assert info["permanent"] is True
+    assert cd["hours"] == 0

@@ -44,7 +44,7 @@ UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "30"))
 # stream. Streaming gets a much more generous idle cap so slow models survive;
 # a genuinely stalled stream still times out per-read. Non-streaming keeps the
 # tighter UPSTREAM_TIMEOUT for fast failure on dead/empty upstreams.
-STREAM_UPSTREAM_TIMEOUT = float(os.environ.get("STREAM_UPSTREAM_TIMEOUT", "300"))
+STREAM_UPSTREAM_TIMEOUT = float(os.environ.get("STREAM_UPSTREAM_TIMEOUT", "120"))
 
 # SSE head-window (lines) drained before committing a streaming response.
 # Empty-200 upstreams finish inside the window (EOF → model fallback still
