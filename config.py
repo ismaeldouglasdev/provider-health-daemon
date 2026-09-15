@@ -147,9 +147,9 @@ _RAW_DOWNSTREAM_ROUTERS = [
 ]
 
 # ── Meta-Router: Probe Settings ──────────────────────────────────────
-PROBER_INTERVAL_SECONDS = 30       # how often to probe routers for health
+PROBER_INTERVAL_SECONDS = 90       # how often to probe routers for health (was 30s — cycle ≈ probe(≤60s)+30s left the /v1/models of 9router hammered on a 2-core host; 90s keeps the adapter cycle ≈ 2min, plenty for health)
 PROBE_TIMEOUT = 60.0              # seconds per health check request (must be > /v1/models latency with 1000+ models; 15s falsely failed OmniRoute at 13.5s latency - 2026-08-14)
-PROBE_MAX_WORKERS = 5              # thread pool size for parallel probes
+PROBE_MAX_WORKERS = 3              # thread pool size for parallel probes (was 5 — 2 routers only; fewer concurrent /v1/models hits on slow host)
 
 # ── Combo catalog fetch (2026-08-29) ─────────────────────────────────
 # /v1/models do 9router varia 14s-120s (catálogo ~400KB). O SmartRouter
