@@ -50,7 +50,7 @@ from model_catalog import ModelCatalog
 from provider_discovery import ProviderDiscovery
 from proxy_manager import ProxyManager
 from error_parser import parse_log_line, parse_request_detail_row
-from proxy_handler import HealthProxyServer, _is_empty_chat_response
+from proxy_handler import HealthProxyServer, _is_empty_chat_response, _is_pollinations_budget_error
 from access_parser import parse_line as parse_access_line
 from dashboard import DashboardServer
 from metrics_store import MetricsStore, RequestRecord
@@ -402,6 +402,18 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                                             test_model,
                                             extra={
                                                 "event": "empty_200_probe",
+                                                "provider": provider,
+                                                "model": test_model,
+                                            },
+                                        )
+                                        continue
+                                    if _is_pollinations_budget_error(probe_body):
+                                        log.warning(
+                                            "Auto-recovery: budget fake 200 for model=%s — "
+                                            "keeping provider-wide cooldown (key budget exhausted)",
+                                            test_model,
+                                            extra={
+                                                "event": "pollinations_budget_200_probe",
                                                 "provider": provider,
                                                 "model": test_model,
                                             },

@@ -238,6 +238,24 @@ def _is_airforce_fake_response(resp_body: bytes) -> bool:
     return AIRFORCE_FAKE_MARKER in resp_body.decode("utf-8", errors="replace")
 
 
+POLLINATIONS_BUDGET_MARKER = "enter.pollinations.ai/edit-key"
+
+
+def _is_pollinations_budget_error(resp_body: bytes) -> bool:
+    """Detect Pollinations' fake 200 'key budget exhausted' (raw JSON or SSE).
+
+    Pollinations answers HTTP 200 + plain assistant content with the budget
+    message for key-budget exhaustion (the body always links the wallet
+    'edit-key' URL, which never appears in real completions). The health gate
+    only inspects status, so these 200s were recorded as healthy and the
+    provider stayed in the combo rotation forever — same class of bug as the
+    airforce fake 200, but provider-wide (the whole key is over budget).
+    """
+    if not resp_body:
+        return False
+    return POLLINATIONS_BUDGET_MARKER in resp_body.decode("utf-8", errors="replace")
+
+
 def _is_empty_chat_response(resp_body: bytes) -> bool:
     """Detect HTTP 200 with no usable content (dead model / exhausted quota).
 
@@ -548,13 +566,14 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     head_lines.append(line)
                 head_eof = len(head_lines) < STREAM_HEAD_WINDOW_LINES
                 sent = [_normalize_sse_line(line) for line in head_lines]
-                if head_eof and _is_empty_chat_response(b"".join(sent)):
-                    raise EmptyUpstreamResponse(b"".join(sent))
+                head = b"".join(sent)
+                if _is_pollinations_budget_error(head) or (head_eof and _is_empty_chat_response(head)):
+                    raise EmptyUpstreamResponse(head)
                 stream_live = not head_eof
             else:
                 body = first_line + resp.read()
                 body = self._normalize_response_body(body, content_type)
-                if _is_empty_chat_response(body):
+                if _is_pollinations_budget_error(body) or _is_empty_chat_response(body):
                     raise EmptyUpstreamResponse(body)
         elif not is_streaming:
             body = first_line + resp.read()
@@ -1034,6 +1053,24 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             )
             self._handle_error(404, fake_text, body)
             self._record_usage(body, resp_body, start_time, provider, model, False, "model_not_found", ttft_ms)
+            return
+
+        if _is_pollinations_budget_error(resp_body):
+            log.warning(
+                "Budget fake 200 from Pollinations for model=%s — applying "
+                "provider-wide payment_required cooldown (key budget exhausted)",
+                model,
+                extra={"event": "pollinations_budget_200", "provider": provider, "model": model},
+            )
+            error_info = {
+                "hours": 12, "minutes": 0, "type": "payment_required",
+                "model_specific": False, "recheck": True
+            }
+            if self.registry:
+                self.registry.mark_error(provider=provider, error_info=error_info)
+            if self.audit:
+                self.audit.cooldowns_applied += 1
+            self._record_usage(body, resp_body, start_time, provider, model, False, "payment_required", ttft_ms)
             return
 
         if _is_empty_chat_response(resp_body):
