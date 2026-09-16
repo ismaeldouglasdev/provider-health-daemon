@@ -216,20 +216,42 @@ def test_402_no_credit_streaming_triggers_global_fallback(tmp_path):
     assert b"provider temporarily unavailable" not in out
 
 
-def test_429_generic_rate_limit_does_not_fallback(tmp_path):
-    """Negative: generic 429 (rate limit) is transient — never falls back."""
+def test_429_generic_rate_limit_fallbacks(tmp_path):
+    """429 (rate limit) triggers fallback to next healthy model."""
+    registry = HealthRegistry(filepath=tmp_path / "health.json")
+    opener = _FakeOpener([
+        ("error", 429, b'{"error":{"message":"Rate limit exceeded.","type":"rate_limit_exceeded"}}'),
+        ("ok", _sse_ok()),
+    ])
+    handler, wfile = _stub_handler(registry, opener)
+    handler.smart_router = MagicMock()
+    handler.smart_router.fallback_chain.return_value = ["healthy/model-b"]
+
+    body = _stream_body()
+    with _fallback_env(handler.smart_router):
+        handler._forward(body)
+
+    # Retry — 429 now triggers fallback
+    assert handler._fallback_attempts == 1
+    assert len(opener.calls) == 2
+    assert b"hello from healthy" in wfile.getvalue()
+
+
+def test_429_no_fallback_when_exhausted(tmp_path):
+    """429 with no healthy fallback returns 429 (not shielded 503)."""
     registry = HealthRegistry(filepath=tmp_path / "health.json")
     opener = _FakeOpener([
         ("error", 429, b'{"error":{"message":"Rate limit exceeded.","type":"rate_limit_exceeded"}}'),
     ])
     handler, wfile = _stub_handler(registry, opener)
     handler.smart_router = MagicMock()
+    handler.smart_router.fallback_chain.return_value = []
 
     body = _stream_body()
     with _fallback_env(handler.smart_router):
         handler._forward(body)
 
-    # No retry — generic_429 is not in _ACCESS_ERROR_TYPES
+    # No fallback attempted (no alternatives)
     assert handler._fallback_attempts == 0
     assert len(opener.calls) == 1
     assert wfile.getvalue() != b""

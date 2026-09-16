@@ -29,12 +29,26 @@ class HealthRegistry:
     PROVIDERS = "providers"
     MODELS = "models"
     ACCOUNTS = "accounts"
+    CIRCUIT_BREAKERS = "circuit_breakers"
 
-    MAX_FAILURES = 10  # after this many consecutive failures, permanently disable (reduced from 30: gpt-oss-120b accumulated 30 rate_limit failures before being blocked, wasting user prompts)
+    MAX_FAILURES = 30  # after this many consecutive failures, permanently disable (increased from 10: prevents cascade disabling from transient errors)
     # Fresh window granted when cooldown → probing: the recovery prober runs
     # every PROBER_INTERVAL_MINUTES, so 2x that interval guarantees it has a
     # chance to test the provider before the entry becomes orphan-cleanup eligible.
     PROBING_WINDOW_MINUTES = max(PROBER_INTERVAL_MINUTES * 2, 10)
+
+    # ── Circuit Breaker Config ─────────────────────────────────
+    # States: "closed" (normal), "open" (failing, reject requests), "half_open" (testing recovery)
+    CB_FAILURE_THRESHOLD = 5       # failures in window to trip open
+    CB_SUCCESS_THRESHOLD = 3       # successes in half_open to close
+    CB_WINDOW_SECONDS = 600        # 10min sliding window for failure counting
+    CB_OPEN_TIMEOUT_SECONDS = 300  # 5min before half_open attempt
+    CB_HALF_OPEN_MAX_REQUESTS = 3  # max concurrent requests in half_open
+
+    # 429 tracking — providers with many recent 429s are deprioritized
+    # even if they're technically "healthy". Window: 10 minutes.
+    _429_WINDOW = 600  # seconds
+    _429_THRESHOLD = 3  # 429s in window → penalty applied
 
     def __init__(self, filepath=None):
         self.filepath = Path(filepath) if filepath else HEALTH_FILE
@@ -43,7 +57,7 @@ class HealthRegistry:
         self._data = self._load()
 
     def _empty_state(self) -> dict:
-        return {self.PROVIDERS: {}, self.MODELS: {}, self.ACCOUNTS: {}}
+        return {self.PROVIDERS: {}, self.MODELS: {}, self.ACCOUNTS: {}, self.CIRCUIT_BREAKERS: {}}
 
     def _load(self) -> dict:
         if not self.filepath.exists():
@@ -54,6 +68,7 @@ class HealthRegistry:
             data.setdefault(self.PROVIDERS, {})
             data.setdefault(self.MODELS, {})
             data.setdefault(self.ACCOUNTS, {})
+            data.setdefault(self.CIRCUIT_BREAKERS, {})
             self._migrate_duplicate_keys(data)
             denied = [k for k in data.get(self.PROVIDERS, {}) if PROVIDER_DENYLIST.match(k)]
             for k in denied:
@@ -164,11 +179,180 @@ class HealthRegistry:
         smart router would reject every candidate of a probing provider and
         fall through to the downstream combo router, which then fails with
         no_credentials/monthly_limit ("provider temporarily unavailable").
+
+        Also checks circuit breaker: open circuit = unhealthy.
         """
+        # Circuit breaker check first - applies even to unknown providers
+        if not self.can_execute_cb(name):
+            return False
+
         entry = self.get_provider(name)
-        if not entry:
-            return True  # unknown = assume healthy
+        # Empty dict means provider not tracked; unknown = assume healthy
+        if not entry or "status" not in entry:
+            return True
         return self._entry_is_healthy(entry)
+
+    # ── Circuit Breaker API ──────────────────────────────────────────────
+
+    def _get_cb(self, provider: str) -> dict:
+        """Get or create circuit breaker state for provider."""
+        provider = normalize_provider(provider)
+        with self._lock:
+            cbs = self._data.setdefault(self.CIRCUIT_BREAKERS, {})
+            if provider not in cbs:
+                cbs[provider] = {
+                    "state": "closed",
+                    "failures": [],
+                    "successes": 0,
+                    "last_failure": None,
+                    "last_state_change": datetime.now(timezone.utc).isoformat(),
+                    "half_open_requests": 0,
+                }
+            return cbs[provider]
+
+    def _clean_old_failures(self, cb: dict) -> None:
+        """Remove failures older than CB_WINDOW_SECONDS."""
+        now = time.time()
+        cutoff = now - self.CB_WINDOW_SECONDS
+        cb["failures"] = [ts for ts in cb["failures"] if ts > cutoff]
+
+    def record_cb_failure(self, provider: str) -> None:
+        """Record a failure for circuit breaker."""
+        provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return
+        with self._lock:
+            cb = self._get_cb(provider)
+            now = time.time()
+            self._clean_old_failures(cb)
+            cb["failures"].append(now)
+            cb["last_failure"] = now
+
+            # Check if should trip to open
+            if cb["state"] == "closed" and len(cb["failures"]) >= self.CB_FAILURE_THRESHOLD:
+                cb["state"] = "open"
+                cb["last_state_change"] = datetime.now(timezone.utc).isoformat()
+                log.warning(f"Circuit breaker OPEN for {provider} ({len(cb['failures'])} failures in window)")
+            elif cb["state"] == "half_open":
+                # Any failure in half_open trips back to open
+                cb["state"] = "open"
+                cb["last_state_change"] = datetime.now(timezone.utc).isoformat()
+                cb["successes"] = 0
+                cb["half_open_requests"] = 0
+                log.warning(f"Circuit breaker RE-OPEN for {provider} (failure in half_open)")
+
+            self._save()
+
+    def record_cb_success(self, provider: str) -> None:
+        """Record a success for circuit breaker."""
+        provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return
+        with self._lock:
+            cb = self._get_cb(provider)
+
+            if cb["state"] == "half_open":
+                cb["successes"] += 1
+                cb["half_open_requests"] = max(0, cb["half_open_requests"] - 1)
+                if cb["successes"] >= self.CB_SUCCESS_THRESHOLD:
+                    cb["state"] = "closed"
+                    cb["failures"] = []
+                    cb["successes"] = 0
+                    cb["last_state_change"] = datetime.now(timezone.utc).isoformat()
+                    log.info(f"Circuit breaker CLOSED for {provider} (recovered)")
+            elif cb["state"] == "closed":
+                # In closed state, clean old failures on success
+                self._clean_old_failures(cb)
+
+            self._save()
+
+    def can_execute_cb(self, provider: str) -> bool:
+        """Check if request can proceed per circuit breaker."""
+        provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return True  # unknown = allow
+        with self._lock:
+            cb = self._get_cb(provider)
+            now = time.time()
+
+            if cb["state"] == "closed":
+                return True
+
+            if cb["state"] == "open":
+                # Check if timeout expired to transition to half_open
+                try:
+                    last_change = datetime.fromisoformat(cb["last_state_change"].replace("Z", "+00:00"))
+                    if (now - last_change.timestamp()) >= self.CB_OPEN_TIMEOUT_SECONDS:
+                        cb["state"] = "half_open"
+                        cb["successes"] = 0
+                        cb["half_open_requests"] = 0
+                        cb["last_state_change"] = datetime.now(timezone.utc).isoformat()
+                        log.info(f"Circuit breaker HALF_OPEN for {provider} (timeout expired)")
+                        self._save()
+                        return True
+                except (ValueError, KeyError):
+                    pass
+                return False  # still open
+
+            if cb["state"] == "half_open":
+                # Limit concurrent requests in half_open
+                if cb["half_open_requests"] >= self.CB_HALF_OPEN_MAX_REQUESTS:
+                    return False
+                cb["half_open_requests"] += 1
+                self._save()
+                return True
+
+            return False
+
+    # ── 429 Rate Limit Tracking ──────────────────────────────
+
+    def record_cb_429(self, provider: str) -> None:
+        """Record a 429 (rate limit) for a provider."""
+        provider = normalize_provider(provider)
+        if PROVIDER_DENYLIST.match(provider):
+            return
+        with self._lock:
+            cbs = self._data.setdefault(self.CIRCUIT_BREAKERS, {})
+            if provider not in cbs:
+                cbs[provider] = {
+                    "state": "closed",
+                    "failures": [],
+                    "successes": 0,
+                    "last_failure": None,
+                    "last_state_change": datetime.now(timezone.utc).isoformat(),
+                    "half_open_requests": 0,
+                }
+            cb = cbs[provider]
+            now = time.time()
+            # Clean old 429s
+            cutoff = now - self._429_WINDOW
+            if "429s" not in cb:
+                cb["429s"] = []
+            cb["429s"] = [ts for ts in cb["429s"] if ts > cutoff]
+            cb["429s"].append(now)
+            self._save()
+
+    def get_429_penalty(self, provider: str) -> float:
+        """Return a score penalty based on recent 429 count."""
+        provider = normalize_provider(provider)
+        with self._lock:
+            cb = self._data.get(self.CIRCUIT_BREAKERS, {}).get(provider)
+            if not cb or "429s" not in cb or not cb["429s"]:
+                return 0
+            now = time.time()
+            cutoff = now - self._429_WINDOW
+            recent = [ts for ts in cb["429s"] if ts > cutoff]
+            count = len(recent)
+            if count >= self._429_THRESHOLD:
+                # Linear penalty: 100 per excess 429 in window
+                return min((count - self._429_THRESHOLD + 1) * 100, 500)
+            return 0
+
+    # ── Read API ─────────────────────────────────────────────
+
+    def get_model(self, model_id: str) -> dict:
+        with self._lock:
+            return self._data[self.MODELS].get(model_id, {})
 
     def is_model_available(self, model_id: str) -> bool:
         """Model is usable right now (checks both model-specific and parent provider)."""
@@ -215,6 +399,10 @@ class HealthRegistry:
             self._data[self.PROVIDERS][provider] = entry
             self._save()
             log.debug(f"✓ {provider}{'/' + model if model else ''} → healthy")
+            try:
+                self.record_cb_success(provider)
+            except Exception:
+                pass
 
     def reprobe_disabled_due(self, entry: dict) -> bool:
         """Whether a `disabled` provider is due for a re-integration probe.
@@ -309,6 +497,10 @@ class HealthRegistry:
                 log.info(f"⚠ {provider} → cooldown {result['duration_hours']:.1f}h ({result['type']})")
 
             self._save()
+            try:
+                self.record_cb_failure(provider)
+            except Exception:
+                pass
 
     @staticmethod
     def _healthy_entry(provider: str, model: Optional[str] = None) -> dict:

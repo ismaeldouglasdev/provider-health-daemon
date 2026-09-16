@@ -218,6 +218,20 @@ DEAD_MODELS = {
     "llm7/deepseek-v4-flash",  # model_not_supported -> 24h cooldown -> combo re-picks when expired -> loop. Verified 2026-08-27
     "cx/gpt-5",  # 400 "The 'gpt-5' model does not exist" (codex) — não existe no provider. Verified 2026-09-03
     "blockrun/moonshot/kimi-k3",  # 402 no_credit (sem crédito no openai-compatible-chat) — não se auto-cura. Verified 2026-09-03
+    "pk/gemini-2.5-flash",  # 400 model does not exist (pixian). Verified 2026-09-09
+    "llm7/kimi-k3",  # 401 auth (llm7) — erros em toda request, combo re-picka em loop. Verified 2026-09-09
+    "seek/glm-5.3-flash",  # 403 forbidden (seek). Verified 2026-09-09
+    "cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast",  # 429 daily_free_exhausted (cloudflare) — reativar se a cota resetar. Verified 2026-09-09
+    # KIRA: key1 é free-tier (só modelos `-free`); keys 2/3 → 402 vnd_balance_exhausted (0 VND).
+    # Pagos sempre falham (403/402) e derrubavam o pool inteiro via CB open. Verified 2026-09-14.
+    "kira/mimo-v2.5",           # 403 model_not_allowed
+    "kira/glm-5.3-flash",       # 403 model_not_allowed
+    "kira/deepseek-v4.1-flash", # 403 key1 / 402 keys 2-3
+    "kira/hy3",                 # 403 (só hy3-free na allowlist)
+    "kira/ling-3.0-flash-sante",# 403 (só ling-3.0-flash-sante-free)
+    "kira/mercury-2",           # 403 key1 / 402 keys 2-3
+    "kira/mercury-2.5",         # 403 key1 / 402 keys 2-3
+    "kira/qwen3.8-flash",       # 403 (só qwen3.8-flash-free)
 }
 
 
@@ -429,7 +443,18 @@ class SmartRouter:
                     score["health_fail_penalty"] = fail_penalty
                     score["total"] = round(score["total"] + fail_penalty, 1)
 
-            # 4b. Fallback-only providers (PERMANENTLY_BLOCKED without a
+            # 4b. 429 rate limit penalty — providers rate-limiting us get heavy
+            # penalty so traffic shifts to healthier providers immediately.
+            if health_registry:
+                try:
+                    penalty = health_registry.get_429_penalty(provider)
+                    if penalty > 0:
+                        score["rate_limit_penalty"] = penalty
+                        score["total"] = round(score["total"] + penalty, 1)
+                except Exception:
+                    pass
+
+            # 4c. Fallback-only providers (PERMANENTLY_BLOCKED without a
             # healthy registry entry) sink to the bottom of the pool — they
             # stay eligible as last-resort fallbacks instead of being excluded.
             if fallback_only:
@@ -852,10 +877,9 @@ class SmartRouter:
     def _filter_static_models(model_ids: list[str]) -> list[str]:
         """Drop @-prefixed/bare ids and dead/locked models from cached lists.
 
-        PERMANENTLY_BLOCKED providers are intentionally KEPT: they become
-        last-resort fallbacks (rank_models applies FALLBACK_ONLY_PENALTY) and
-        automatically rejoin the ranking if the health registry later proves
-        the account was reloaded — no code edits needed.
+        PERMANENTLY_BLOCKED providers are EXCLUDED entirely — they have proven
+        subscription/credit/auth issues that won't self-heal. Other providers
+        are allowed but ranked by priority (PROVIDER_ALLOWLIST gets priority boost).
         """
         out: list[str] = []
         for mid in model_ids:
@@ -868,12 +892,17 @@ class SmartRouter:
             provider = mid.split("/")[0]
             if provider.startswith("@"):
                 continue
+            # HARD BLOCK: permanently blocked providers are excluded at source
+            if provider in PERMANENTLY_BLOCKED:
+                continue
             if mid in SmartRouter._get_locked_model_ids():
                 continue  # actively locked by modelLock_* (rate-limited account)
             if provider in FREE_TIER_SUFFIX_ONLY and ":free" not in mid:
                 continue  # paid tier of a free-tier-only provider
             if provider in FREE_TIER_AUTO_SUFFIX_ONLY and "-free-auto" not in mid:
                 continue  # paid tier of a -free-auto-only provider (gh)
+            # ALLOWLIST: if provider has an allowlist, only those models pass
+            # Otherwise, all models from non-blocked providers pass
             allow = PROVIDER_ALLOWLIST.get(provider)
             if allow is not None and mid not in allow:
                 continue  # not on the verified allowlist for this provider
@@ -908,10 +937,9 @@ class SmartRouter:
     def _filter_catalog_models(items: list) -> list[str]:
         """Keep real models — bounded, priority-ordered, connection-weighted.
 
-        PERMANENTLY_BLOCKED providers are intentionally KEPT: they become
-        last-resort fallbacks (rank_models applies FALLBACK_ONLY_PENALTY) and
-        automatically rejoin the ranking if the health registry later proves
-        the account was reloaded — no code edits needed.
+        PERMANENTLY_BLOCKED providers are EXCLUDED entirely — they have proven
+        subscription/credit/auth issues that won't self-heal. Other providers
+        are allowed but ranked by priority (PROVIDER_ALLOWLIST gets priority boost).
         """
         per_provider: dict[str, list[tuple[int, str]]] = {}
         for it in items:
@@ -927,12 +955,13 @@ class SmartRouter:
             provider = model_id.split("/")[0]
             if provider.startswith("@"):
                 continue
+            # HARD BLOCK: permanently blocked providers are excluded at source
+            if provider in PERMANENTLY_BLOCKED:
+                continue
             if model_id in SmartRouter._get_locked_model_ids():
                 continue  # actively locked by modelLock_* (rate-limited account)
-            if provider in FREE_TIER_SUFFIX_ONLY and ":free" not in model_id:
-                continue  # paid tier of a free-tier-only provider
-            if provider in FREE_TIER_AUTO_SUFFIX_ONLY and "-free-auto" not in model_id:
-                continue  # paid tier of a -free-auto-only provider (gh)
+            # ALLOWLIST: if provider has an allowlist, only those models pass
+            # Otherwise, all models from non-blocked providers pass
             allow = PROVIDER_ALLOWLIST.get(provider)
             if allow is not None and model_id not in allow:
                 continue  # not on the verified allowlist for this provider

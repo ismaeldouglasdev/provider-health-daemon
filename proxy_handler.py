@@ -863,23 +863,35 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # around them via the catalog is safe and required — otherwise the
             # error leaks to the agent (e.g. 402 insufficient_balance on a dead
             # provider stalls opencode's compaction with "provider temporarily
-            # unavailable"). Generic/transient 429 (rate limit) never triggers
-            # fallback. HTTPError is raised by opener.open() BEFORE any SSE is
+            # unavailable"). 429 (rate limit) ALSO triggers fallback — when a
+            # provider rate-limits us, immediately trying another provider
+            # avoids burning quota in a loop and dramatically reduces blocked
+            # requests. After fallback, the provider still gets a cooldown
+            # (applied by _handle_error) so we don't hammer it again.
+            # HTTPError is raised by opener.open() BEFORE any SSE is
             # emitted, so streaming requests CAN be retried with another model —
             # only mid-stream connection failures (URLError inside
             # _emit_upstream_response) can't be replayed.
             raw_body_text = resp_body.decode(errors="replace")
             error_info = self._handle_error(e.code, raw_body_text, body)
+            # Track 429s for smart router deprioritization
+            if e.code == 429 and self.registry:
+                provider = body.get("model", "").split("/")[0] if body else ""
+                if provider:
+                    try:
+                        self.registry.record_cb_429(provider)
+                    except Exception:
+                        pass
             fallback_etype = (error_info.get("cooldown") or error_info).get("type", "")
             if (
                 body
                 and (
                     500 <= e.code <= 599
                     or fallback_etype in self._ACCESS_ERROR_TYPES
+                    or e.code == 429
                     or (
                         getattr(self, "_router_selected", False)
                         and 400 <= e.code <= 499
-                        and fallback_etype not in self._RATE_LIMIT_ERROR_TYPES
                     )
                 )
                 and getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES
@@ -944,7 +956,6 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 shielded = (
                     getattr(self, "_router_selected", False)
                     and 400 <= e.code <= 499
-                    and fallback_etype not in self._RATE_LIMIT_ERROR_TYPES
                 )
                 if shielded:
                     log.warning(
@@ -1242,6 +1253,38 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             if not provider or provider == model:
                 return error_info
             model = None
+
+        # Fast-fail escalation: a provider-selected 4xx that is NOT a rate
+        # limit, context error, or account/access problem means the model is
+        # broken at that provider (e.g. 400 "does not exist", 401 auth-for-
+        # this-model, 403 not supported). parse_error gives these SHORT
+        # provider-wide cooldowns (unknown_4xx 15m) or a provider-wide 1h —
+        # the combo then re-picks the SAME dead model → retry loop, or the
+        # whole provider freezes for one bad model. Escalate to a 1h
+        # model-specific cooldown: combo skips the model, provider stays up.
+        if (
+            model
+            and isinstance(status, int)
+            and 400 <= status < 500
+            and status not in (408, 413, 429)
+        ):
+            cd = error_info.get("cooldown") or error_info
+            cd_mins = (cd.get("hours") or 0) * 60 + (cd.get("minutes") or 0)
+            err_type = str(cd.get("type") or "")
+            if (
+                cd_mins < 60
+                and not error_info.get("model_specific")
+                and not error_info.get("permanent")
+                and err_type
+                and err_type not in self._ACCESS_ERROR_TYPES
+                and not err_type.startswith(("rate_limit_", "context_length"))
+            ):
+                error_info["model_specific"] = True
+                error_info["cooldown"] = {
+                    "hours": 1,
+                    "minutes": 0,
+                    "type": f"dead_{status}",
+                }
 
         if provider:
             self.registry.mark_error(

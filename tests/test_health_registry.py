@@ -323,7 +323,7 @@ def test_reprobe_disabled_not_due_after_recent_probe(tmp_registry: HealthRegistr
     from datetime import datetime, timedelta, timezone
     tmp_registry._data["providers"]["sample-provider"] = {
         "status": "disabled", "failures": 10,
-        "last_probe_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        "last_probe_at": (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
     }
     assert not tmp_registry.reprobe_disabled_due(
         tmp_registry.get_provider("sample-provider")

@@ -311,13 +311,13 @@ class TestForwardGlobalFallback:
         sent = json.loads(second_req.data)
         assert sent["model"] == "nvidia/minimaxai/minimax-m3"
 
-    def test_non_5xx_never_retried(self):
-        h = self._forward_stub([_http_error(429)])
+    def test_non_5xx_non_429_never_retried(self):
+        h = self._forward_stub([_http_error(400)])
 
         h._forward(_chat_body())
 
         assert h.opener.open.call_count == 1
-        assert h.send_response.call_args[0][0] == 429
+        assert h.send_response.call_args[0][0] == 400
 
     def test_429_access_error_retries_with_next_model(self):
         ok = b'{"id":"1","choices":[{"message":{"role":"assistant","content":"retried ok"},"finish_reason":"stop"}]}'

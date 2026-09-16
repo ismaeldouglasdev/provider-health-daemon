@@ -87,7 +87,7 @@ MAX_COOLDOWN_HOURS = 24  # cap exponential backoff
 # desde a última tentativa. Quando o motivo passar (quota reset, crédito
 # recarregado, assinatura renovada), o provider volta sozinho via mark_healthy.
 DISABLED_REPROBE_INTERVAL_HOURS = float(
-    os.environ.get("DISABLED_REPROBE_INTERVAL_HOURS", "8")
+    os.environ.get("DISABLED_REPROBE_INTERVAL_HOURS", "1")
 )
 
 # ── Smart Router ─────────────────────────────────────────────────────
@@ -101,6 +101,10 @@ COMBO_CACHE_FILE = Path.home() / ".9router" / "combo_cache.json"  # last-good ca
 DISCOVERY_INTERVAL_SECONDS = 120  # seconds between new-provider discovery passes
 
 # ── Proxy auto-management (renew pool + apply to new providers/accounts) ──
+# Kill-switch: set PROXY_MANAGER_DISABLED=1 to prevent the proxy_loop from
+# re-assigning proxies to all connections (which was the root cause of dead
+# proxies sabotaging every provider operation). 2026-09-16.
+PROXY_MANAGER_DISABLED = os.environ.get("PROXY_MANAGER_DISABLED", "0").strip() in ("1", "true", "yes")
 PROXY_CHECK_INTERVAL_SECONDS = 300      # tick: detect connections missing a proxy
 PROXY_REFRESH_INTERVAL_SECONDS = 6 * 3600  # full pool refetch + reassign cadence
 PROXY_SOURCES = [
@@ -155,7 +159,7 @@ PROBE_MAX_WORKERS = 3              # thread pool size for parallel probes (was 5
 # /v1/models do 9router varia 14s-120s (catálogo ~400KB). O SmartRouter
 # usa um timeout DEDICADO e curto para o catálogo: se o fetch demorar,
 # cai rápido no COMBO_CACHE_FILE em disco em vez de travar o ranking.
-CATALOG_TIMEOUT = 5.0              # seconds per /v1/models catalog fetch (15 -> 5, cascade-fix 2026-08-31)
+CATALOG_TIMEOUT = 90.0              # seconds per /v1/models catalog fetch (was 5s, too short for 9router 14-120s latency)
 
 # ── Router hysteresis (2026-08-24) ───────────────────────────────────
 # /v1/models do 9router varia 14s-120s (catálogo ~400KB); um único timeout

@@ -39,6 +39,7 @@ from config import (
     DOWNSTREAM_ROUTERS, ROUTER_STATE_FILE, NINEROUTER_URL, NINEROUTER_KEY,
     PROBE_TIMEOUT, DISCOVERY_INTERVAL_SECONDS, PROXY_CHECK_INTERVAL_SECONDS,
     POOL_DEGRADED_THRESHOLD, COMBO_REFRESH_INTERVAL, CATALOG_TIMEOUT,
+    PROXY_MANAGER_DISABLED,
 )
 from smart_router import SmartRouter
 from catalog_sync import sync_disable_dead_model
@@ -55,6 +56,7 @@ from access_parser import parse_line as parse_access_line
 from dashboard import DashboardServer
 from metrics_store import MetricsStore, RequestRecord
 from metrics_persistence import MetricsPersistence
+from model_prober import start_model_prober
 
 try:
     from alerter import Alerter
@@ -369,9 +371,27 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                         continue  # don't probe permanently disabled
 
                     # Resolve test models: prefer live combo cache, fall back
-                    # to the models list stored in the health-registry entry
-                    # (breaks the disabled→filtered→unprobed cycle).
+                    # to the models list stored in the health-registry entry.
+                    # If empty, discover from 9router catalog (breaks the
+                    # disabled→filtered→unprobed cycle for providers that
+                    # have no stored models but are connected in 9router).
                     test_models = provider_models.get(provider) or entry.get("models", [])
+                    if not test_models:
+                        try:
+                            import urllib.request as _urllib
+                            _req = _urllib.Request(
+                                f"{NINEROUTER_URL}/v1/models",
+                                headers={"Authorization": f"Bearer {NINEROUTER_KEY}"},
+                            )
+                            with _urllib.urlopen(_req, timeout=15) as _resp:
+                                _data = json.loads(_resp.read())
+                                _all = _data.get("models", []) if isinstance(_data, dict) else _data
+                                test_models = [
+                                    m.get("id", "") for m in _all
+                                    if m.get("id", "").startswith(provider + "/")
+                                ][:3]
+                        except Exception:
+                            pass
                     if not test_models:
                         continue  # truly no model to test
                     for test_model in test_models:
@@ -432,7 +452,7 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                                     break
                         except (urllib.error.URLError, urllib.error.HTTPError):
                             pass
-                        time.sleep(2)  # rate limit between probes
+                        time.sleep(0.5)  # rate limit between probes (was 2s, faster recovery)
 
             except Exception as e:
                 log.error(f"Recovery prober error: {e}")
@@ -883,6 +903,18 @@ def main():
     # Used by proxy handler, access log monitor, and dashboard
     shared_metrics = MetricsStore()
 
+    # ── Model prober (fractionated per-model recovery testing) ───────
+    # Re-tests cooldown models in small batches once their rate-limit window
+    # expires — otherwise expired cooldowns stay broken silently until a real
+    # request redisovers them (recovery-until-tested gap).
+    start_model_prober(
+        registry,
+        NINEROUTER_URL,
+        NINEROUTER_KEY,
+        metrics=shared_metrics,
+        stop_event=shutdown_event,
+    )
+
     # ── Metrics persistence (snapshot history for charts) ────────────
     metrics_persist = MetricsPersistence()
 
@@ -990,6 +1022,108 @@ def main():
         name="combo-refresh",
     ).start()
 
+    # ── Warmup: test top-N models on startup to build preferred list ────
+    def warmup_top_models():
+        """Test top candidate models on startup; boost priority for responsive ones."""
+        import urllib.request
+        import json as _json
+        import time as _time
+        from smart_router import SmartRouter
+
+        # Wait for proxy to be ready
+        _time.sleep(3)
+
+        try:
+            log.info("Warmup: testing top models for responsiveness...", extra={"event": "warmup_start"})
+
+            # Get top 15 candidates from smart router ranking
+            catalog = SmartRouter.get_default_combos(skip_disabled=True)
+            if not catalog:
+                log.warning("Warmup: no catalog available")
+                return
+
+            # Quick rank without health filter first (we'll check health per-model)
+            metrics_store = shared_metrics
+            temp_router = SmartRouter(metrics_store)
+            ranked = temp_router.rank_models(catalog, registry)
+            top_candidates = [r[0] for r in ranked[:15]]
+
+            responsive = []
+            for model in top_candidates:
+                if shutdown_event.is_set():
+                    break
+                provider = model.split("/")[0]
+                if not registry.is_provider_healthy(provider):
+                    continue
+                if not registry.is_model_available(model):
+                    continue
+
+                # Quick ping test
+                test_body = _json.dumps({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                }).encode()
+
+                try:
+                    req = urllib.request.Request(
+                        f"{NINEROUTER_URL}/v1/chat/completions",
+                        data=test_body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {NINEROUTER_KEY}",
+                        },
+                        method="POST",
+                    )
+                    t0 = _time.monotonic()
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        resp.read()
+                    latency = _time.monotonic() - t0
+
+                    if resp.status == 200 and latency < 10:
+                        responsive.append(model)
+                        # Boost priority: tell smart router this model is preferred
+                        # by recording a synthetic successful request
+                        metrics_store.record_request(
+                            type('obj', (object,), {
+                                'timestamp': _time.time(),
+                                'provider': provider,
+                                'model': model,
+                                'duration_ms': int(latency * 1000),
+                                'ttft_ms': int(latency * 1000),
+                                'tokens_in': 5,
+                                'tokens_out': 2,
+                                'tokens_cache': 0,
+                                'success': True,
+                                'error_type': None,
+                            })()
+                        )
+                        log.info(f"Warmup: {model} responsive ({latency:.1f}s) — boosted",
+                                extra={"event": "warmup_model_ok", "model": model, "latency": latency})
+                    else:
+                        log.debug(f"Warmup: {model} slow/failed ({latency:.1f}s)")
+                except Exception as e:
+                    log.debug(f"Warmup: {model} failed: {type(e).__name__}")
+
+                _time.sleep(0.3)  # rate limit
+
+            if responsive:
+                log.info(f"Warmup complete: {len(responsive)}/{len(top_candidates)} models responsive: {responsive}",
+                        extra={"event": "warmup_done", "responsive": responsive})
+            else:
+                log.warning("Warmup: no responsive models found",
+                           extra={"event": "warmup_empty"})
+
+        except Exception as e:
+            log.error(f"Warmup error: {e}")
+
+    # Run warmup in background so it doesn't block daemon startup
+    threading.Thread(
+        target=warmup_top_models,
+        daemon=True,
+        name="warmup",
+    ).start()
+
     # ── Start error log monitor ──────────────────────────────────────
     router_names = {r["name"].lower() for r in DOWNSTREAM_ROUTERS}
     threading.Thread(
@@ -1016,11 +1150,21 @@ def main():
     ).start()
 
     # ── Start proxy auto-manager (new provider/account → auto-proxy) ──
-    threading.Thread(
-        target=proxy_loop,
-        daemon=True,
-        name="proxy-manager",
-    ).start()
+    # Kill-switch: PROXY_MANAGER_DISABLED=1 prevents the proxy_loop from
+    # re-assigning proxies to ALL connections, which was the root cause of
+    # dead proxies sabotaging every provider operation (2026-09-16).
+    if PROXY_MANAGER_DISABLED:
+        log.warning(
+            "PROXY_MANAGER_DISABLED=1 — proxy_loop will NOT run. "
+            "Proxies will NOT be auto-assigned to connections.",
+            extra={"event": "proxy_manager_disabled"},
+        )
+    else:
+        threading.Thread(
+            target=proxy_loop,
+            daemon=True,
+            name="proxy-manager",
+        ).start()
 
     # ── Start alerter (desktop notifications) ────────────────────────
     if HAS_ALERTER:
