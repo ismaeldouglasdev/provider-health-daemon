@@ -1903,6 +1903,19 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     self.wfile.write(cached)
                     return
 
+            # Global gate: a gateway-wide rate limit ("Rate limit exceeded.
+            # Please try again later.") means EVERY model of that provider
+            # fails. Short-circuit the whole request here instead of walking
+            # the combo pool and marking each model into cooldown (which
+            # cascades into "no healthy combo models available"). Trivial
+            # replies and cache hits above still pass unblocked.
+            if self.registry and self.registry.is_global_gated():
+                gate = self.registry.get_global_gate() or {}
+                self._respond_unavailable(
+                    f"provider gateway rate limited (global gate: {gate.get('reason', 'unknown')})"
+                )
+                return
+
             # Router-level health gate: if all routers are down, return 503
             if self.meta_selector:
                 try:

@@ -18,7 +18,7 @@ from config import (
     PROBER_INTERVAL_MINUTES,
     PROVIDER_DENYLIST,
 )
-from provider_aliases import normalize_provider
+from provider_aliases import PROVIDER_ALIAS_MAP, normalize_provider
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ class HealthRegistry:
     MODELS = "models"
     ACCOUNTS = "accounts"
     CIRCUIT_BREAKERS = "circuit_breakers"
+    GLOBAL_GATE = "global_gate"
 
     MAX_FAILURES = 30  # after this many consecutive failures, permanently disable (increased from 10: prevents cascade disabling from transient errors)
     # Fresh window granted when cooldown → probing: the recovery prober runs
@@ -57,7 +58,7 @@ class HealthRegistry:
         self._data = self._load()
 
     def _empty_state(self) -> dict:
-        return {self.PROVIDERS: {}, self.MODELS: {}, self.ACCOUNTS: {}, self.CIRCUIT_BREAKERS: {}}
+        return {self.PROVIDERS: {}, self.MODELS: {}, self.ACCOUNTS: {}, self.CIRCUIT_BREAKERS: {}, self.GLOBAL_GATE: None}
 
     def _load(self) -> dict:
         if not self.filepath.exists():
@@ -69,7 +70,10 @@ class HealthRegistry:
             data.setdefault(self.MODELS, {})
             data.setdefault(self.ACCOUNTS, {})
             data.setdefault(self.CIRCUIT_BREAKERS, {})
+            data.setdefault(self.GLOBAL_GATE, None)
+            data[self.GLOBAL_GATE] = self._migrate_global_gate(data[self.GLOBAL_GATE])
             self._migrate_duplicate_keys(data)
+            self._migrate_disabled_rate_limits(data)
             denied = [k for k in data.get(self.PROVIDERS, {}) if PROVIDER_DENYLIST.match(k)]
             for k in denied:
                 del data[self.PROVIDERS][k]
@@ -120,6 +124,68 @@ class HealthRegistry:
             merged["updated_at"] = b["updated_at"]
         return merged
 
+    @staticmethod
+    def _base_error_type(reason) -> str:
+        """Strip suffixes like ' (max_failures)' or ' (probing)' to get the raw error type."""
+        r = str(reason or "")
+        for suffix in (" (max_failures)", " (probing)"):
+            if r.endswith(suffix):
+                return r[: -len(suffix)]
+        return r
+
+    @staticmethod
+    def _is_phantom_provider(name: str) -> bool:
+        """True for catalog entries that are not real provider connections.
+
+        Phantom providers (e.g. an ``openai-compatible-chat-<uuid>`` connection
+        that 9router lists but that has no alias in PROVIDER_ALIAS_MAP, or a
+        name containing a model-like separator) must not receive provider-wide
+        cooldowns: they are retried every cycle and would cascade-disable.
+        """
+        if not name:
+            return True
+        if ":" in name or "/" in name:
+            return True
+        if name.startswith("openai-compatible-chat-") and name not in PROVIDER_ALIAS_MAP:
+            return True
+        return False
+
+    def _migrate_global_gate(self, raw) -> Optional[dict]:
+        """Validate/normalize a persisted global gate; drop it if expired or malformed."""
+        if not isinstance(raw, dict):
+            return None
+        until = raw.get("until")
+        if until is None:
+            return None
+        try:
+            if datetime.fromisoformat(str(until).replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+                return None
+        except ValueError:
+            return None
+        return {"reason": str(raw.get("reason", "unknown")), "until": str(until),
+                "updated_at": str(raw.get("updated_at", ""))}
+
+    def _migrate_disabled_rate_limits(self, data: dict) -> None:
+        """Self-heal wrongly-permanent disabled entries whose cause is a rate-limit.
+
+        Before fix#1, rate-limit errors hitting MAX_FAILURES became permanent
+        ``disabled`` with reason "<type> (max_failures)". Rate limits expire, so
+        promote those back to ``probing`` (semi-available) on load.
+        """
+        now = datetime.now(timezone.utc)
+        for bucket, kind in ((self.PROVIDERS, "provider"), (self.MODELS, "model")):
+            for key in list(data.get(bucket, {})):
+                entry = data[bucket][key]
+                if entry.get("status") != "disabled":
+                    continue
+                base = self._base_error_type(entry.get("reason"))
+                if base in CooldownCalculator.RATE_LIMIT_TYPES:
+                    entry["status"] = "probing"
+                    entry["reason"] = f"{base} (probing)"
+                    entry["until"] = (now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)).isoformat()
+                    entry["updated_at"] = now.isoformat()
+                    log.info(f"Promoted disabled {kind} {key} -> probing (rate-limit {base})")
+
     def _save(self) -> None:
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(self._data, indent=2, default=str)
@@ -169,6 +235,60 @@ class HealthRegistry:
     def get_model(self, model_id: str) -> dict:
         with self._lock:
             return self._data[self.MODELS].get(model_id, {})
+
+    # ── Global Gate API ────────────────────────────────────────────────
+    # A gateway-wide rate limit ("Rate limit exceeded. Please try again
+    # later.") means EVERY model of that provider fails, not just one.
+    # Instead of hammering each model into cooldown, open a global gate:
+    # the proxy short-circuits all combo requests until it expires.
+
+    def set_global_gate(self, reason: str, until_iso: Optional[str]) -> None:
+        with self._lock:
+            if until_iso is None:
+                return
+            self._data[self.GLOBAL_GATE] = {
+                "reason": str(reason),
+                "until": str(until_iso),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save()
+            log.warning(f"GLOBAL GATE set: {reason} until {until_iso}")
+
+    def clear_global_gate(self) -> None:
+        with self._lock:
+            if self._data.get(self.GLOBAL_GATE) is not None:
+                self._data[self.GLOBAL_GATE] = None
+                self._save()
+                log.info("Global gate cleared")
+
+    def get_global_gate(self) -> Optional[dict]:
+        with self._lock:
+            return self._migrate_global_gate(self._data.get(self.GLOBAL_GATE))
+
+    def is_global_gated(self) -> bool:
+        with self._lock:
+            gate = self._data.get(self.GLOBAL_GATE)
+            if not isinstance(gate, dict) or not gate.get("until"):
+                return False
+            try:
+                until = datetime.fromisoformat(str(gate["until"]).replace("Z", "+00:00"))
+                return datetime.now(timezone.utc) < until
+            except ValueError:
+                return False
+
+    def _open_gate_from_error(self, error_info: dict, provider: str) -> None:
+        """Convert a parsed gateway-wide error into a global gate.
+
+        Uses the same cooldown calculation as mark_error so the gate honors
+        exponential backoff on repeated gateway-quota errors.
+        """
+        current = self.get_provider(provider)
+        result = self.cooldown.calculate(
+            error_info,
+            current.get("failures", 0),
+            None,
+        )
+        self.set_global_gate(f"{result['type']} ({provider})", result.get("until"))
 
     def is_provider_healthy(self, name: str) -> bool:
         """Provider is usable right now (probing counts as semi-available).
@@ -397,6 +517,9 @@ class HealthRegistry:
 
             entry = self._healthy_entry(provider)
             self._data[self.PROVIDERS][provider] = entry
+            if self._data.get(self.GLOBAL_GATE) is not None:
+                self._data[self.GLOBAL_GATE] = None
+                log.info(f"Global gate cleared by successful request ({provider})")
             self._save()
             log.debug(f"✓ {provider}{'/' + model if model else ''} → healthy")
             try:
@@ -444,6 +567,13 @@ class HealthRegistry:
         provider = normalize_provider(provider)
         if PROVIDER_DENYLIST.match(provider):
             return
+        if error_info.get("global"):
+            # Gateway-wide error (FreeUsageLimitError): EVERY model of this
+            # provider fails, so per-provider/per-model cooldown entries would
+            # just churn the file and cascade. Open the global gate instead and
+            # stop here.
+            self._open_gate_from_error(error_info, provider)
+            return
         with self._lock:
             if error_info.get("model_specific") and model:
                 current = self.get_model(model)
@@ -471,6 +601,9 @@ class HealthRegistry:
                 log.info(f"⚠ {model} → cooldown {result['duration_hours']:.1f}h ({result['type']})")
             else:
                 # Provider-wide
+                if self._is_phantom_provider(provider):
+                    log.info(f"Skip provider-wide cooldown for phantom provider {provider!r}")
+                    return
                 current = self.get_provider(provider)
                 current_failures = current.get("failures", 0)
                 current_until = None
@@ -633,14 +766,27 @@ class HealthRegistry:
                     entry.get("until")
                 ):
                     failures = entry.get("failures", 0)
+                    base = self._base_error_type(entry.get("reason"))
                     if failures >= self.MAX_FAILURES:
-                        entry["status"] = "disabled"
-                        entry["reason"] = f"{entry.get('reason')} (max_failures)"
-                        entry["until"] = None
-                        log.info(f"Lock {provider} cooldown expired -> disabled ({failures} failures)")
+                        if base in CooldownCalculator.RATE_LIMIT_TYPES:
+                            # Rate-limit cooldown expired: rate limits pass, so
+                            # never lock the provider permanently (fix#1). Rotate
+                            # to probing so the prober re-tests it.
+                            entry["status"] = "probing"
+                            entry["reason"] = f"{base} (probing)"
+                            entry["until"] = (
+                                now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)
+                            ).isoformat()
+                            entry["updated_at"] = now.isoformat()
+                            log.info(f"Rotate {provider} rate-limit max_failures -> probing ({failures} failures)")
+                        else:
+                            entry["status"] = "disabled"
+                            entry["reason"] = f"{base} (max_failures)"
+                            entry["until"] = None
+                            log.info(f"Lock {provider} cooldown expired -> disabled ({failures} failures)")
                     else:
                         entry["status"] = "probing"
-                        entry["reason"] = f"{entry.get('reason')} (probing)"
+                        entry["reason"] = f"{base} (probing)"
                         entry["until"] = (
                             now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)
                         ).isoformat()
@@ -670,14 +816,24 @@ class HealthRegistry:
                     entry.get("until")
                 ):
                     failures = entry.get("failures", 0)
+                    base = self._base_error_type(entry.get("reason"))
                     if failures >= self.MAX_FAILURES:
-                        entry["status"] = "disabled"
-                        entry["reason"] = f"{entry.get('reason')} (max_failures)"
-                        entry["until"] = None
-                        log.info(f"Lock {model_id} cooldown expired -> disabled ({failures} failures)")
+                        if base in CooldownCalculator.RATE_LIMIT_TYPES:
+                            entry["status"] = "probing"
+                            entry["reason"] = f"{base} (probing)"
+                            entry["until"] = (
+                                now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)
+                            ).isoformat()
+                            entry["updated_at"] = now.isoformat()
+                            log.info(f"Rotate {model_id} rate-limit max_failures -> probing ({failures} failures)")
+                        else:
+                            entry["status"] = "disabled"
+                            entry["reason"] = f"{base} (max_failures)"
+                            entry["until"] = None
+                            log.info(f"Lock {model_id} cooldown expired -> disabled ({failures} failures)")
                     else:
                         entry["status"] = "probing"
-                        entry["reason"] = f"{entry.get('reason')} (probing)"
+                        entry["reason"] = f"{base} (probing)"
                         entry["until"] = (
                             now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)
                         ).isoformat()

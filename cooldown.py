@@ -7,6 +7,19 @@ from typing import Optional
 class CooldownCalculator:
     """Calculate cooldown duration based on error type and failure history."""
 
+    RATE_LIMIT_TYPES = frozenset({
+        "generic_429",
+        "rate_limit_rpm",
+        "rate_limit_until",
+        "rate_limit_tpd",
+        "gateway_quota",
+        "daily_free_exhausted",
+        "daily_quota_exceeded",
+        "worker_request_limit",
+        "weekly_limit",
+        "monthly_limit",
+    })
+
     def __init__(self, max_hours: int = 24, max_failures: int = 30):
         self.max_cooldown = timedelta(hours=max_hours)
         self.max_failures = max_failures
@@ -47,6 +60,18 @@ class CooldownCalculator:
         failures = current_failures + 1
 
         if failures >= self.max_failures:
+            if error_type in self.RATE_LIMIT_TYPES:
+                until = datetime.now(timezone.utc) + timedelta(seconds=self.max_cooldown.total_seconds())
+                return {
+                    "until": until.isoformat(),
+                    "duration_hours": self.max_cooldown.total_seconds() / 3600,
+                    "type": f"{error_type} (max_failures)",
+                    "permanent": False,
+                    "model_specific": model_specific,
+                    "backoff_applied": False,
+                    "failures": failures,
+                    "recheck": False,
+                }
             return {
                 "until": None,
                 "duration_hours": float("inf"),

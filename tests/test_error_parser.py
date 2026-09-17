@@ -399,6 +399,22 @@ def test_free_model_generic_429_is_model_specific():
     assert info["model_specific"] is True
 
 
+def test_free_usage_limit_error_is_gateway_quota_global():
+    body = '{"error": {"message": "Rate limit exceeded. Please try again later."}}'
+    info = parse_error(429, body)
+    assert _cd(info)["type"] == "gateway_quota"
+    assert _cd(info)["minutes"] == 15
+    assert info["global"] is True
+    assert info["permanent"] is False
+
+
+def test_generic_rate_limit_does_not_get_global_flag():
+    body = "Rate limit exceeded for model groq/openai/gpt-oss-120b"
+    info = parse_error(429, body)
+    assert _cd(info)["type"] == "generic_429"
+    assert info.get("global") is None
+
+
 def test_request_detail_metadata_raw_unwrapped():
     """SQLite row com message genérica + metadata.raw (double-encoded) deve usar
     a mensagem real do upstream — ex: duplicate tool ids → request_invalid, 0 cooldown."""

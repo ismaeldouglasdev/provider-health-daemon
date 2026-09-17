@@ -427,6 +427,15 @@ ERROR_PATTERNS = [
         r"Request too large for model|estimated number of input and maximum output tokens",
         lambda m: {"minutes": 15, "type": "context_length", "model_specific": True},
     ),
+    # FreeUsageLimitError (api-airforce, deepseek, kiro): o gateway inteiro do
+    # provider estourou cota ("Rate limit exceeded. Please try again later.") —
+    # afeta TODOS os modelos do provider, nao so um. Deve casar ANTES do
+    # generic_429 abaixo (que nao diferencia). global=True → mark_error vira
+    # GLOBAL_GATE em vez de cooldown por provider.
+    (
+        r"Rate limit exceeded\.\s*Please try again later",
+        lambda m: {"hours": 0, "minutes": 15, "type": "gateway_quota", "global": True},
+    ),
     # Mistral 429 rate_limited, nvidia 529 overload
     (
         r"Rate limit exceeded|rate_limited|Service temporarily overloaded",
