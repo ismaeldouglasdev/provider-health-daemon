@@ -118,6 +118,10 @@ PROXY_TEST_TIMEOUT = 8.0              # seconds per proxy probe
 PROXY_MIN_POOL = 10                   # minimum alive proxies before applying a pool
 PROXY_PROBE_MAX_WORKERS = 50          # thread pool for parallel proxy probes
 
+# ── Happy-Eyeballs race (parallel multi-provider) ───────────────────
+RACE_DEADLINE_SEC = 1.5        # max seconds to wait for the first 200 in a race
+DEGRADED_POOL_THRESHOLD = 5    # if healthy providers ≤ this, race top-2 instead of top-1
+
 # ── Global fallback (exhaust the full catalog on 5xx) ────────────────
 MAX_FALLBACK_RETRIES = 2  # catalog fallback attempts per request (bounded: avoids latency bombs)
 GLOBAL_REFRESH_MIN_INTERVAL = 15.0  # seconds between forced catalog refetches (GET /v1/models is expensive)

@@ -356,3 +356,41 @@ def test_record_disabled_probe_stamps_and_delays_reprobe(tmp_registry: HealthReg
     entry = tmp_registry.get_provider("sample-provider")
     assert "last_probe_at" in entry
     assert not tmp_registry.reprobe_disabled_due(entry)
+
+
+def test_is_provider_healthy_does_not_consume_half_open_slot(tmp_registry: HealthRegistry):
+    cb = tmp_registry._get_cb("sample-provider")
+    cb["state"] = "half_open"
+    cb["half_open_requests"] = 0
+
+    assert tmp_registry.is_provider_healthy("sample-provider")
+    assert cb["half_open_requests"] == 0
+
+    assert tmp_registry.acquire_cb("sample-provider")
+    assert cb["half_open_requests"] == 1
+
+    tmp_registry.release_cb("sample-provider")
+    assert cb["half_open_requests"] == 0
+
+
+def test_load_resets_stale_half_open_leases(tmp_path):
+    fp = tmp_path / "health.json"
+    fp.write_text(json.dumps({
+        "circuit_breakers": {
+            "sample-provider": {
+                "state": "half_open",
+                "failures": [],
+                "successes": 2,
+                "last_failure": None,
+                "last_state_change": "2026-09-17T00:00:00+00:00",
+                "half_open_requests": 3,
+            }
+        }
+    }))
+
+    registry = HealthRegistry(filepath=fp)
+    cb = registry._get_cb("sample-provider")
+
+    assert cb["state"] == "half_open"
+    assert cb["successes"] == 0
+    assert cb["half_open_requests"] == 0

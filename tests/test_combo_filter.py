@@ -51,21 +51,21 @@ def test_combo_skips_cooldown_model_when_provider_healthy(tmp_path):
     handler._combo_cache = ["groq/openai/gpt-oss-120b", "groq/llama-3.3-70b-versatile"]
 
     router = MagicMock()
-    router.best_model.return_value = None  # smart router finds nothing usable
+    router.rank_models.return_value = None  # smart router finds nothing usable
     router.fallback_chain.return_value = []  # global catalog also exhausted
     handler.smart_router = router
 
     with patch.dict("os.environ", {"OPENCODE_FALLBACK_MODEL": ""}, clear=False), \
          patch.object(
-             SmartRouter,
-             "get_default_combos",
-             return_value=["groq/openai/gpt-oss-120b", "groq/llama-3.3-70b-versatile"],
+              SmartRouter,
+              "get_default_combos",
+              return_value=["groq/openai/gpt-oss-120b", "groq/llama-3.3-70b-versatile"],
          ):
         result = handler._filter_combo_providers({"model": "main-rr"})
 
     # No healthy candidate → pass through (None), NEVER available[0] (cooldown model)
     assert result is None
-    router.best_model.assert_not_called()
+    router.rank_models.assert_not_called()
 
 
 def test_combo_picks_healthy_model_over_cooldown_one(tmp_path):
@@ -77,25 +77,25 @@ def test_combo_picks_healthy_model_over_cooldown_one(tmp_path):
     handler._combo_cache = ["groq/openai/gpt-oss-120b", "nvidia/minimaxai/minimax-m3"]
 
     router = MagicMock()
-    router.best_model.return_value = "nvidia/minimaxai/minimax-m3"
+    router.rank_models.return_value = [("nvidia/minimaxai/minimax-m3", "nvidia", {})]
     handler.smart_router = router
 
     with patch.dict("os.environ", {"OPENCODE_FALLBACK_MODEL": ""}, clear=False):
         result = handler._filter_combo_providers({"model": "main-rr"})
 
-    assert result == "nvidia/minimaxai/minimax-m3"
-    router.best_model.assert_called_once()
+    assert result == ["nvidia/minimaxai/minimax-m3"]
+    router.rank_models.assert_called_once()
 
 
 def test_combo_passthrough_when_smart_router_finds_nothing(tmp_path):
-    """best_model None must pass through, not blindly return available[0]."""
+    """rank_models None must pass through, not blindly return available[0]."""
     registry = HealthRegistry(filepath=tmp_path / "health.json")
 
     handler = _stub_handler(registry)
     handler._combo_cache = ["groq/openai/gpt-oss-120b", "nvidia/minimaxai/minimax-m3"]
 
     router = MagicMock()
-    router.best_model.return_value = None
+    router.rank_models.return_value = None
     handler.smart_router = router
 
     with patch.dict("os.environ", {"OPENCODE_FALLBACK_MODEL": ""}, clear=False):

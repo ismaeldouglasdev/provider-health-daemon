@@ -74,6 +74,7 @@ class HealthRegistry:
             data[self.GLOBAL_GATE] = self._migrate_global_gate(data[self.GLOBAL_GATE])
             self._migrate_duplicate_keys(data)
             self._migrate_disabled_rate_limits(data)
+            self._migrate_circuit_breakers(data)
             denied = [k for k in data.get(self.PROVIDERS, {}) if PROVIDER_DENYLIST.match(k)]
             for k in denied:
                 del data[self.PROVIDERS][k]
@@ -303,7 +304,7 @@ class HealthRegistry:
         Also checks circuit breaker: open circuit = unhealthy.
         """
         # Circuit breaker check first - applies even to unknown providers
-        if not self.can_execute_cb(name):
+        if not self.can_execute_cb(name, acquire=False):
             return False
 
         entry = self.get_provider(name)
@@ -335,6 +336,52 @@ class HealthRegistry:
         now = time.time()
         cutoff = now - self.CB_WINDOW_SECONDS
         cb["failures"] = [ts for ts in cb["failures"] if ts > cutoff]
+
+    def _migrate_circuit_breakers(self, data: dict) -> None:
+        """Normalize persisted circuit breakers and discard process-local leases."""
+        cbs = data.setdefault(self.CIRCUIT_BREAKERS, {})
+        now = datetime.now(timezone.utc).isoformat()
+        for provider, cb in list(cbs.items()):
+            if not isinstance(cb, dict):
+                cbs[provider] = {
+                    "state": "closed",
+                    "failures": [],
+                    "successes": 0,
+                    "last_failure": None,
+                    "last_state_change": now,
+                    "half_open_requests": 0,
+                }
+                continue
+
+            cb.setdefault("state", "closed")
+            cb.setdefault("failures", [])
+            cb.setdefault("successes", 0)
+            cb.setdefault("last_failure", None)
+            cb.setdefault("last_state_change", now)
+            cb.setdefault("half_open_requests", 0)
+
+            if not isinstance(cb["failures"], list):
+                cb["failures"] = []
+            try:
+                cb["successes"] = max(0, int(cb["successes"]))
+            except (TypeError, ValueError):
+                cb["successes"] = 0
+            try:
+                cb["half_open_requests"] = max(0, int(cb["half_open_requests"]))
+            except (TypeError, ValueError):
+                cb["half_open_requests"] = 0
+
+            if cb["state"] == "half_open":
+                # These counters describe in-flight requests in one process.
+                # They cannot remain valid after a restart or an abandoned probe.
+                cb["successes"] = 0
+                cb["half_open_requests"] = 0
+            elif cb["state"] not in ("closed", "open"):
+                cb["state"] = "closed"
+                cb["failures"] = []
+                cb["successes"] = 0
+                cb["half_open_requests"] = 0
+                cb["last_state_change"] = now
 
     def record_cb_failure(self, provider: str) -> None:
         """Record a failure for circuit breaker."""
@@ -386,11 +433,11 @@ class HealthRegistry:
 
             self._save()
 
-    def can_execute_cb(self, provider: str) -> bool:
-        """Check if request can proceed per circuit breaker."""
+    def can_execute_cb(self, provider: str, acquire: bool = True) -> bool:
+        """Check circuit-breaker availability and optionally reserve a probe slot."""
         provider = normalize_provider(provider)
         if PROVIDER_DENYLIST.match(provider):
-            return True  # unknown = allow
+            return True
         with self._lock:
             cb = self._get_cb(provider)
             now = time.time()
@@ -399,7 +446,6 @@ class HealthRegistry:
                 return True
 
             if cb["state"] == "open":
-                # Check if timeout expired to transition to half_open
                 try:
                     last_change = datetime.fromisoformat(cb["last_state_change"].replace("Z", "+00:00"))
                     if (now - last_change.timestamp()) >= self.CB_OPEN_TIMEOUT_SECONDS:
@@ -409,20 +455,36 @@ class HealthRegistry:
                         cb["last_state_change"] = datetime.now(timezone.utc).isoformat()
                         log.info(f"Circuit breaker HALF_OPEN for {provider} (timeout expired)")
                         self._save()
+                        if acquire:
+                            cb["half_open_requests"] += 1
+                            self._save()
                         return True
                 except (ValueError, KeyError):
                     pass
-                return False  # still open
+                return False
 
             if cb["state"] == "half_open":
-                # Limit concurrent requests in half_open
                 if cb["half_open_requests"] >= self.CB_HALF_OPEN_MAX_REQUESTS:
                     return False
-                cb["half_open_requests"] += 1
-                self._save()
+                if acquire:
+                    cb["half_open_requests"] += 1
+                    self._save()
                 return True
 
             return False
+
+    def acquire_cb(self, provider: str) -> bool:
+        """Reserve one request slot for a provider circuit breaker."""
+        return self.can_execute_cb(provider, acquire=True)
+
+    def release_cb(self, provider: str) -> None:
+        """Release a reserved half-open slot without recording success or failure."""
+        provider = normalize_provider(provider)
+        with self._lock:
+            cb = self._get_cb(provider)
+            if cb["state"] == "half_open" and cb["half_open_requests"] > 0:
+                cb["half_open_requests"] -= 1
+                self._save()
 
     # ── 429 Rate Limit Tracking ──────────────────────────────
 

@@ -10,6 +10,8 @@
 
 import time
 import urllib.error
+from io import BytesIO
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -417,3 +419,96 @@ class TestFindHealthyAlternativeC2:
         h.smart_router = object.__new__(SmartRouter)
         h.smart_router.best_model = lambda models, registry, meta: None
         assert h._find_healthy_alternative({"model": "combo-round-robin"}) is None
+
+
+class TestCircuitBreakerForwarding:
+    class _RaceRegistry:
+        def __init__(self):
+            self.acquired = []
+            self.released = []
+
+        def acquire_cb(self, provider):
+            self.acquired.append(provider)
+            return True
+
+        def release_cb(self, provider):
+            self.released.append(provider)
+
+    class _FailingOpener:
+        def open(self, req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+
+    @staticmethod
+    def _handler(registry=None, opener=None):
+        from proxy_handler import HealthProxyHandler
+
+        handler = HealthProxyHandler.__new__(HealthProxyHandler)
+        handler.registry = registry
+        handler.opener = opener
+        handler.meta_selector = None
+        handler.path = "/v1/chat/completions"
+        handler.command = "POST"
+        handler.headers = {}
+        handler.audit = None
+        handler.metrics_store = None
+        handler._respond_unavailable = MagicMock()
+        handler._record_usage = MagicMock()
+        return handler
+
+    def test_forward_releases_half_open_slot_on_connection_error(self):
+        registry = self._RaceRegistry()
+        handler = self._handler(registry=registry, opener=self._FailingOpener())
+
+        handler._forward({"model": "ali/qwen", "stream": False})
+
+        assert registry.acquired == ["ali"]
+        assert registry.released == ["ali"]
+
+    def test_race_records_winner_model_and_releases_loser_slot(self):
+        from proxy_handler import HealthProxyHandler
+
+        registry = self._RaceRegistry()
+        handler = self._handler(registry=registry)
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler._record_upstream_health = MagicMock()
+
+        def forward_one_shot(body, timeout):
+            if body["model"].startswith("ali/"):
+                return 200, b"ok", None, time.time()
+            return 503, b"failed", "http_error", time.time()
+
+        handler._forward_one_shot = forward_one_shot
+
+        handler._race_forward(
+            {"model": "main-rr", "messages": [{"role": "user", "content": "hello"}]},
+            ["ali/qwen", "groq/llama-3.3-70b-versatile"],
+        )
+
+        assert registry.acquired == ["ali", "groq"]
+        assert registry.released == ["groq"]
+        winner_body = handler._record_upstream_health.call_args.args[0]
+        assert winner_body["model"] == "ali/qwen"
+        assert handler.wfile.getvalue() == b"ok"
+
+    def test_race_releases_slots_when_all_candidates_fail(self):
+        registry = self._RaceRegistry()
+        handler = self._handler(registry=registry)
+        handler._record_race_failure = MagicMock()
+        handler._forward_one_shot = lambda body, timeout: (
+            503,
+            b"failed",
+            "http_error",
+            time.time(),
+        )
+
+        handler._race_forward(
+            {"model": "main-rr", "messages": []},
+            ["ali/qwen", "groq/llama-3.3-70b-versatile"],
+        )
+
+        assert registry.acquired == ["ali", "groq"]
+        assert registry.released == ["ali", "groq"]
+        assert handler._record_race_failure.call_count == 2

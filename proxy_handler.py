@@ -63,6 +63,8 @@ from config import (
     RESPONSE_CACHE_MAX_BYTES,
     QUOTA_AWARE_ROTATION,
     DOWNSTREAM_ROUTERS,
+    RACE_DEADLINE_SEC,
+    DEGRADED_POOL_THRESHOLD,
 )
 
 log = logging.getLogger(__name__)
@@ -719,8 +721,10 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
     def _forward(self, body=None):
         path = self.path
+        request_path = path.split("?", 1)[0]
         headers = {"Content-Type": "application/json"}
         start_time = time.time()
+        is_chat = request_path in ("/v1/chat/completions", "/chat/completions")
 
         auth = self.headers.get("Authorization", "")
         if auth:
@@ -762,6 +766,15 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         req = urllib.request.Request(url, data=data, headers=headers, method=self.command)
         req.add_header("Accept", "text/event-stream, application/json")
+
+        cb_acquired = False
+        if is_chat and body and "/" in (body.get("model", "") or ""):
+            provider = body["model"].split("/")[0]
+            acquire_cb = getattr(self.registry, "acquire_cb", None)
+            if callable(acquire_cb) and not acquire_cb(provider):
+                self._respond_unavailable(f"Provider '{provider}' circuit breaker is open")
+                return
+            cb_acquired = callable(acquire_cb)
 
         # Streaming chat requests get STREAM_UPSTREAM_TIMEOUT (generous idle
         # cap) so slow-but-real generation isn't killed by the 30s
@@ -1093,6 +1106,206 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 model = body.get("model", "")
                 provider = model.split("/")[0] if "/" in model else model
                 self._record_usage(body, b"", start_time, provider, model, False, "connection_error")
+
+        finally:
+            if cb_acquired:
+                release_cb = getattr(self.registry, "release_cb", None)
+                if callable(release_cb):
+                    release_cb(provider)
+
+    def _forward_one_shot(
+        self,
+        body: dict,
+        timeout: float,
+    ) -> tuple[int, bytes, str | None, float]:
+        """Forward one race candidate without writing to the client."""
+        import urllib.request as _urllib_req
+
+        request_start = time.time()
+        path = self.path
+        headers = {"Content-Type": "application/json"}
+
+        auth = self.headers.get("Authorization", "")
+        if auth:
+            headers["Authorization"] = auth
+        elif NINEROUTER_KEY:
+            headers["Authorization"] = f"Bearer {NINEROUTER_KEY}"
+
+        if body:
+            body = dict(body)
+            body.pop("_original_model", None)
+            body.pop("_smart_routed", None)
+            _strip_anthropic_caching(body)
+
+        data = json.dumps(body).encode()
+        url = f"{NINEROUTER_URL}{path}"
+        if self.meta_selector:
+            try:
+                target_router = self.meta_selector.select_router(model=body.get("model", ""))
+                if target_router:
+                    url = target_router.url.rstrip("/") + path
+                    if target_router.auth and target_router.auth.get("value"):
+                        headers[target_router.auth["header"]] = target_router.auth["value"]
+            except ServiceUnavailable:
+                pass
+
+        req = _urllib_req.Request(url, data=data, headers=headers, method=self.command)
+        req.add_header("Accept", "text/event-stream, application/json")
+
+        try:
+            opener = self.opener if self.opener is not None else _urllib_req.build_opener()
+            with opener.open(req, timeout=timeout) as resp:
+                resp_body = resp.read()
+                if resp.status == 200 and _is_empty_chat_response(resp_body):
+                    return 503, b'{"error":{"message":"empty upstream response","type":"provider_unavailable"}}', "empty_response", request_start
+                return resp.status, resp_body, None, request_start
+        except urllib.error.HTTPError as e:
+            try:
+                resp_body = e.read()
+            except Exception:
+                resp_body = b""
+            return e.code, resp_body, "http_error", request_start
+        except Exception:
+            return 503, b'{"error":{"message":"race candidate failed","type":"provider_unavailable"}}', "connection_error", request_start
+
+    def _record_race_failure(
+        self,
+        body: dict,
+        status: int,
+        resp_body: bytes,
+        error_type: str | None,
+        start_time: float,
+    ) -> None:
+        if not body or not body.get("model"):
+            return
+        model = body["model"]
+        provider = model.split("/")[0]
+        if error_type == "connection_error":
+            if self.registry:
+                self.registry.mark_error(
+                    provider=provider,
+                    error_info={
+                        "type": "connection_error",
+                        "minutes": 5,
+                        "model_specific": True,
+                        "recheck": True,
+                    },
+                    model=model,
+                )
+        elif error_type == "empty_response":
+            if self.registry:
+                self.registry.mark_error(
+                    provider=provider,
+                    error_info={
+                        "hours": 0,
+                        "minutes": 15,
+                        "type": "empty_response",
+                        "model_specific": True,
+                        "recheck": True,
+                    },
+                    model=model,
+                )
+        elif status != 200:
+            self._handle_error(status, resp_body.decode("utf-8", errors="replace"), body)
+        self._record_usage(
+            body,
+            resp_body,
+            start_time,
+            provider,
+            model,
+            False,
+            error_type or f"http_{status}",
+        )
+
+    def _race_forward(self, body: dict, candidates: list[str]):
+        """Race top-N candidates in parallel and return the first successful response."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        deadline = RACE_DEADLINE_SEC
+        candidates = candidates[:2]
+
+        log.info(f"Happy-eyeballs race: {len(candidates)} candidates, deadline={deadline}s")
+
+        futures = {}
+        candidate_bodies = {}
+        acquired = {}
+        acquire_cb = getattr(self.registry, "acquire_cb", None) if self.registry else None
+        release_cb = getattr(self.registry, "release_cb", None) if self.registry else None
+        can_acquire = callable(acquire_cb)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for model_name in candidates:
+                candidate_body = {**body, "model": model_name, "_original_model": body.get("model", "")}
+                candidate_bodies[model_name] = candidate_body
+                provider = model_name.split("/")[0] if "/" in model_name else model_name
+                if can_acquire:
+                    try:
+                        if not acquire_cb(provider):
+                            log.debug(f"Race candidate {model_name} blocked by circuit breaker")
+                            continue
+                    except Exception as exc:
+                        log.debug(f"Race candidate {model_name} circuit-breaker acquisition failed: {exc}")
+                        continue
+                    acquired[model_name] = provider
+                futures[pool.submit(self._forward_one_shot, candidate_body, deadline)] = model_name
+
+            results = {}
+            winner = None
+            try:
+                for future in as_completed(futures, timeout=deadline + 0.5):
+                    model_name = futures[future]
+                    try:
+                        status, resp_body, error_type, request_start = future.result(timeout=0.1)
+                        results[model_name] = (status, resp_body, error_type, request_start)
+                        if status == 200 and winner is None:
+                            winner = model_name
+                            log.info(f"Happy-eyeballs winner: {model_name} ({len(resp_body)} bytes)")
+                    except Exception as exc:
+                        log.debug(f"Race candidate {model_name} exception: {exc}")
+            except TimeoutError:
+                log.warning(f"Happy-eyeballs race timed out after {deadline}s")
+
+        if winner is not None:
+            winner_status, winner_body, _winner_error, winner_start = results[winner]
+            try:
+                self._record_upstream_health(
+                    candidate_bodies[winner],
+                    winner_body,
+                    winner_start,
+                    None,
+                )
+            finally:
+                for model_name, provider in acquired.items():
+                    if model_name != winner and callable(release_cb):
+                        try:
+                            release_cb(provider)
+                        except Exception as exc:
+                            log.debug(f"Race candidate {model_name} circuit-breaker release failed: {exc}")
+            self.send_response(winner_status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(winner_body)))
+            self.send_header("X-Happy-Eyeballs", winner)
+            self.end_headers()
+            self.wfile.write(winner_body)
+            return
+
+        for model_name, (status, resp_body, error_type, request_start) in results.items():
+            self._record_race_failure(
+                candidate_bodies[model_name],
+                status,
+                resp_body,
+                error_type,
+                request_start,
+            )
+        for model_name, provider in acquired.items():
+            if (winner is None or model_name not in results) and callable(release_cb):
+                try:
+                    release_cb(provider)
+                except Exception as exc:
+                    log.debug(f"Race candidate {model_name} circuit-breaker release failed: {exc}")
+
+        log.warning(f"Happy-eyeballs race exhausted: all {len(candidates)} candidates failed")
+        self._respond_unavailable("happy-eyeballs race exhausted — all candidates failed")
 
     def _record_upstream_health(self, body, resp_body, start_time, ttft_ms=0):
         """Record provider health + usage after a 200, with airforce-fake guard.
@@ -1429,7 +1642,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         return None
 
-    def _filter_combo_providers(self, body: dict) -> str | None:
+    def _filter_combo_providers(self, body: dict) -> list[str] | None:
         """Filter combo model to skip permanently disabled providers."""
         if not self.registry:
             return None
@@ -1444,7 +1657,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             provider = forced.split("/")[0]
             if self.registry.is_provider_healthy(provider):
                 log.info(f"Watchdog forced fallback: {model} → {forced}")
-                return forced
+                return [forced]
             log.info(f"Watchdog forced fallback '{forced}' unavailable, using smart filter")
 
         # Thinking combos must resolve to a reasoning model; the candidate
@@ -1505,26 +1718,34 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             broad_models = self._get_combo_models(force_broad=True)
             broad_available = [m for m in broad_models if self.registry.is_model_available(m)]
             if broad_available:
-                best = self.smart_router.best_model(
-                    broad_available,
-                    self.registry,
-                    {"prompt_tokens": prompt_tokens},
-                ) if self.smart_router else broad_available[0]
-                log.info(f"Combo '{model}': broad pool fallback → {best} ({len(broad_available)} healthy)")
-                return best
+                if self.smart_router:
+                    ranked = self.smart_router.rank_models(
+                        broad_available,
+                        self.registry,
+                        {"prompt_tokens": prompt_tokens},
+                    )
+                    if ranked:
+                        log.info(f"Combo '{model}': broad pool fallback → {ranked[0][0]} ({len(broad_available)} healthy)")
+                        return [r[0] for r in ranked[:2]]
+                log.info(f"Combo '{model}': broad pool fallback → {broad_available[0]} ({len(broad_available)} healthy)")
+                return [broad_available[0]]
 
             # Global fallback: the combo's candidates are all dead — try the
             # FULL catalog before giving up (pass-through returns a 503 from
             # the 9router combo router, which the client retries in a loop).
             chain = self._global_fallback_chain(force_refresh=True, force_broad=True)
             if chain:
-                best = self.smart_router.best_model(
-                    chain,
-                    self.registry,
-                    {"prompt_tokens": prompt_tokens},
-                ) if self.smart_router else chain[0]
-                log.info(f"Combo '{model}': global fallback → {best} (full catalog, {len(chain)} healthy)")
-                return best
+                if self.smart_router:
+                    ranked = self.smart_router.rank_models(
+                        chain,
+                        self.registry,
+                        {"prompt_tokens": prompt_tokens},
+                    )
+                    if ranked:
+                        log.info(f"Combo '{model}': global fallback → {ranked[0][0]} (full catalog, {len(chain)} healthy)")
+                        return [r[0] for r in ranked[:2]]
+                log.info(f"Combo '{model}': global fallback → {chain[0]} (full catalog, {len(chain)} healthy)")
+                return [chain[0]]
             return None
 
         if skipped:
@@ -1534,14 +1755,18 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             )
 
         if self.smart_router:
-            best = self.smart_router.best_model(
+            ranked = self.smart_router.rank_models(
                 available,
                 self.registry,
                 {"prompt_tokens": prompt_tokens},
             )
-            if best:
-                return best
-            # best_model found nothing usable (e.g. all remaining candidates
+            if ranked:
+                # Count unique healthy providers to detect degraded pool
+                healthy_providers = len(set(r[0].split("/")[0] for r in ranked))
+                if healthy_providers <= DEGRADED_POOL_THRESHOLD and len(ranked) >= 2:
+                    return [r[0] for r in ranked[:3]]
+                return [ranked[0][0]]
+            # rank_models found nothing usable (e.g. all remaining candidates
             # permanently blocked) — pass through instead of blindly returning
             # available[0]: that model may be in cooldown → 503 → retry loop.
             log.warning(
@@ -1549,7 +1774,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 f"{len(available)} candidates, passing through to downstream router"
             )
             return None
-        return available[0] if available else None
+        return [available[0]] if available else None
 
     def _apply_prompt_limit(self, body: dict) -> dict | None:
         """Check if request exceeds model context or TPM limits, truncate if needed."""
@@ -1928,14 +2153,19 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # Match on model name (combo-round-robin/combo-fast/combo-thinking/
             # main-rr) — `provider == "combo"` never matched these.
             if self.registry and ("combo" in model or "main-rr" in model):
-                healthy_model = self._filter_combo_providers(body)
-                if healthy_model:
-                    body["_original_model"] = model
-                    body["model"] = healthy_model
-                    self._router_selected = True
-                    log.info(f"Combo {model} → {healthy_model} (skipped dead providers)")
-                    model = healthy_model
-                    provider = healthy_model.split("/")[0]
+                candidates = self._filter_combo_providers(body)
+                if candidates:
+                    if len(candidates) == 1:
+                        body["_original_model"] = model
+                        body["model"] = candidates[0]
+                        self._router_selected = True
+                        log.info(f"Combo {model} → {candidates[0]} (skipped dead providers)")
+                        model = candidates[0]
+                        provider = candidates[0].split("/")[0]
+                    else:
+                        log.info(f"Combo {model} → race {len(candidates)} candidates: {', '.join(candidates)}")
+                        self._race_forward(body, candidates)
+                        return
                 else:
                     log.warning(
                         f"Combo '{model}': no healthy model in pool "
