@@ -127,7 +127,7 @@ MAX_FALLBACK_RETRIES = 2  # catalog fallback attempts per request (bounded: avoi
 GLOBAL_REFRESH_MIN_INTERVAL = 15.0  # seconds between forced catalog refetches (GET /v1/models is expensive)
 
 # ── Response cache (retry dedup) ─────────────────────────────────────
-RESPONSE_CACHE_TTL = 30  # seconds a cached response is served
+RESPONSE_CACHE_TTL = 60  # seconds a cached response is served
 RESPONSE_CACHE_MAX_BYTES = 8 * 1024 * 1024  # 8MB cap on total cached bytes
 
 # ── Meta-Router: Downstream Routers ──────────────────────────────────

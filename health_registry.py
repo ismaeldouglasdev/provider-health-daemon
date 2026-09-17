@@ -43,7 +43,7 @@ class HealthRegistry:
     CB_FAILURE_THRESHOLD = 5       # failures in window to trip open
     CB_SUCCESS_THRESHOLD = 3       # successes in half_open to close
     CB_WINDOW_SECONDS = 600        # 10min sliding window for failure counting
-    CB_OPEN_TIMEOUT_SECONDS = 300  # 5min before half_open attempt
+    CB_OPEN_TIMEOUT_SECONDS = 180  # 3min before half_open attempt
     CB_HALF_OPEN_MAX_REQUESTS = 3  # max concurrent requests in half_open
 
     # 429 tracking — providers with many recent 429s are deprioritized

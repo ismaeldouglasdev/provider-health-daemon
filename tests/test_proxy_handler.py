@@ -512,3 +512,50 @@ class TestCircuitBreakerForwarding:
         assert registry.acquired == ["ali", "groq"]
         assert registry.released == ["ali", "groq"]
         assert handler._record_race_failure.call_count == 2
+
+    def test_race_falls_back_to_global_chain_when_all_candidates_fail(self):
+        registry = self._RaceRegistry()
+        handler = self._handler(registry=registry)
+        handler._record_race_failure = MagicMock()
+        handler._global_fallback_chain = lambda force_refresh=False: ["fb/model-1"]
+
+        fb_called = [False]
+
+        def tracked(body, timeout):
+            if body.get("model") == "fb/model-1":
+                fb_called[0] = True
+                return 200, b"fallback ok", None, time.time()
+            return 503, b"failed", "http_error", time.time()
+
+        handler._forward_one_shot = tracked
+        handler.wfile = BytesIO()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler._record_upstream_health = MagicMock()
+
+        handler._race_forward(
+            {"model": "main-rr", "messages": []},
+            ["ali/qwen", "groq/llama-3.3-70b-versatile"],
+        )
+
+        assert fb_called[0] is True
+
+    def test_race_503_when_fallback_also_fails(self):
+        registry = self._RaceRegistry()
+        handler = self._handler(registry=registry)
+        handler._record_race_failure = MagicMock()
+        handler._forward_one_shot = lambda body, timeout: (
+            503,
+            b"failed",
+            "http_error",
+            time.time(),
+        )
+        handler._global_fallback_chain = lambda force_refresh=False: []
+
+        handler._race_forward(
+            {"model": "main-rr", "messages": []},
+            ["ali/qwen", "groq/llama-3.3-70b-versatile"],
+        )
+
+        assert handler._respond_unavailable.called

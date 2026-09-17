@@ -1305,6 +1305,35 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     log.debug(f"Race candidate {model_name} circuit-breaker release failed: {exc}")
 
         log.warning(f"Happy-eyeballs race exhausted: all {len(candidates)} candidates failed")
+        # Safety net: when all race candidates fail, try 1–2 models from
+        # the full catalog (single-shot, no race) before giving up.
+        # This prevents a degraded pool + bad candidates from 503ing
+        # when the broader catalog has a working provider.
+        fallback_chain = self._global_fallback_chain(force_refresh=False)
+        if fallback_chain:
+            safe = [m for m in fallback_chain if m not in candidates][:2]
+            if safe:
+                log.info(f"Race exhausted — trying {len(safe)} global fallback candidate(s)")
+                for fm in safe:
+                    fb_body = {**body, "model": fm, "_original_model": body.get("model", "")}
+                    status, resp, err, fstart = self._forward_one_shot(fb_body, UPSTREAM_TIMEOUT)
+                    if status == 200 and not _is_empty_chat_response(resp):
+                        try:
+                            self._record_upstream_health(
+                                fb_body, resp, fstart, None,
+                            )
+                        except Exception:
+                            pass
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(resp)))
+                        self.send_header("X-Happy-Eyeballs", fm)
+                        self.end_headers()
+                        self.wfile.write(resp)
+                        return
+                    if status != 200:
+                        self._record_race_failure(fb_body, status, resp, err or "http_error", fstart)
+
         self._respond_unavailable("happy-eyeballs race exhausted — all candidates failed")
 
     def _record_upstream_health(self, body, resp_body, start_time, ttft_ms=0):
@@ -1764,7 +1793,20 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 # Count unique healthy providers to detect degraded pool
                 healthy_providers = len(set(r[0].split("/")[0] for r in ranked))
                 if healthy_providers <= DEGRADED_POOL_THRESHOLD and len(ranked) >= 2:
-                    return [r[0] for r in ranked[:3]]
+                    # Diversify race candidates across providers: at most
+                    # 1 model/provider in race — racing 2 models from the
+                    # same provider wastes budget when the provider itself
+                    # is the bottleneck (e.g. gh 429 → both candidates fail).
+                    seen = set()
+                    diversified = []
+                    for r in ranked:
+                        p = r[0].split("/")[0]
+                        if p not in seen:
+                            diversified.append(r)
+                            seen.add(p)
+                            if len(diversified) >= 3:
+                                break
+                    return [r[0] for r in diversified]
                 return [ranked[0][0]]
             # rank_models found nothing usable (e.g. all remaining candidates
             # permanently blocked) — pass through instead of blindly returning

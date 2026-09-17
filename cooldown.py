@@ -1,5 +1,6 @@
-"""Cooldown calculation with exponential backoff."""
+"""Cooldown calculation with exponential backoff and jitter."""
 
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -111,6 +112,12 @@ class CooldownCalculator:
 
         if timedelta(seconds=0) < backoff_duration < timedelta(seconds=30):
             backoff_duration = timedelta(seconds=30)
+
+        # ±15% jitter: prevents thundering herd when many providers
+        # hit cooldown simultaneously (e.g. global rate limit → all
+        # models cooldown at once → all expire at once → stampede).
+        jitter = random.uniform(0.85, 1.15)
+        backoff_duration = timedelta(seconds=int(backoff_duration.total_seconds() * jitter))
 
         until = datetime.now(timezone.utc) + backoff_duration
 
