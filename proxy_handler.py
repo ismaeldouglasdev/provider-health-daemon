@@ -338,6 +338,19 @@ def _is_empty_chat_response(resp_body: bytes) -> bool:
     return True
 
 
+def _should_race(body: dict, candidate_count: int) -> bool:
+    """Decide whether a combo request should race multiple providers.
+
+    Streaming chat requests (stream=true) must NOT race: _forward_one_shot
+    buffers the whole upstream body via resp.read(), and a live SSE stream
+    would either hit the 1.5s socket timeout mid-generation or arrive fully
+    buffered — breaking chunked streaming for the client. Only the single
+    candidate path streams properly (_emit_upstream_response). Non-streaming
+    requests race whenever the degraded pool yields 2+ candidates.
+    """
+    return candidate_count >= 2 and not body.get("stream")
+
+
 def _normalize_sse_line(line: bytes) -> bytes:
     """Normalize one SSE data line (content blocks → string) in place."""
     if line.startswith(b"data: ") and b"[DONE]" not in line:
@@ -2197,7 +2210,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             if self.registry and ("combo" in model or "main-rr" in model):
                 candidates = self._filter_combo_providers(body)
                 if candidates:
-                    if len(candidates) == 1:
+                    if not _should_race(body, len(candidates)):
                         body["_original_model"] = model
                         body["model"] = candidates[0]
                         self._router_selected = True
