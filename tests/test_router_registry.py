@@ -160,3 +160,37 @@ def test_save_load_state(mock_registry, tmp_path, monkeypatch):
     rb = new_registry.get_router("router-b")
     assert rb.health_status == "cooldown"
     assert rb.failure_count >= 1
+
+
+
+def test_concurrent_registry_mutations_are_serialized(mock_registry):
+    """Concurrent health/model updates must not corrupt router state."""
+    import threading
+
+    errors = []
+
+    def worker(router_name, index):
+        try:
+            for _ in range(50):
+                mock_registry.mark_healthy(router_name, [f"model-{index}"])
+                mock_registry.mark_unhealthy(router_name, "timeout")
+                mock_registry.refresh_models_from_router(router_name, [f"model-{index}"])
+                mock_registry.get_model_catalog()
+                mock_registry.get_provider_aggregation()
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(f"router-{name}", i))
+        for i, name in enumerate(("a", "b", "c"))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    for name in ("router-a", "router-b", "router-c"):
+        router = mock_registry.get_router(name)
+        assert router is not None
+        assert isinstance(router.models, list)

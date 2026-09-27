@@ -13,9 +13,8 @@ def _load_opencode_api_key(provider: str) -> str:
     """Fallback: read a provider apiKey from opencode.json when env is unset.
 
     The daemon is often started via run.sh from a shell without the provider
-    keys exported (NINEROUTER_KEY / KRI_KEY). opencode.json always has them
-    under provider.<name>.options.apiKey — reuse that so the meta-router
-    never forwards an empty `Authorization: Bearer ` to upstream routers.
+    keys exported. Reuse the configured client key so the meta-router never
+    forwards an empty Authorization header.
     """
     try:
         cfg = json.loads(OPCODE_CONFIG.read_text())
@@ -24,12 +23,30 @@ def _load_opencode_api_key(provider: str) -> str:
         return ""
 
 
+def _load_kiro_gateway_api_key() -> str:
+    """Load the local Kiro Gateway proxy key without exposing it to logs.
+
+    The Kiro downstream router (:20129) is a separate local service from the
+    9Router Kiro provider. Its bearer credential lives in the gateway .env as
+    PROXY_API_KEY, so falling back to a 9Router key here would produce a
+    misleading 401 even while the gateway itself is healthy.
+    """
+    path = Path.home() / "kiro-gateway" / ".env"
+    try:
+        for line in path.read_text().splitlines():
+            if line.startswith("PROXY_API_KEY="):
+                return line.split("=", 1)[1].strip().strip(chr(34)).strip(chr(39))
+    except OSError:
+        pass
+    return ""
+
+
 # ── Network ──────────────────────────────────────────────────────────
 HEALTH_PROXY_PORT = int(os.environ.get("HEALTH_PROXY_PORT", "20131"))
 HEALTH_PROXY_HOST = os.environ.get("HEALTH_PROXY_HOST", "127.0.0.1")
 NINEROUTER_URL = os.environ.get("NINEROUTER_URL", "http://localhost:20128")
 NINEROUTER_KEY = os.environ.get("NINEROUTER_KEY", "").strip() or _load_opencode_api_key("9router")
-KRI_KEY = os.environ.get("KRI_KEY", "").strip() or _load_opencode_api_key("kiro")
+KRI_KEY = os.environ.get("KRI_KEY", "").strip() or _load_kiro_gateway_api_key() or _load_opencode_api_key("kiro") or _load_opencode_api_key("9r-kr") or _load_opencode_api_key("9r-kira")
 
 # Must stay BELOW typical client timeouts so the proxy can time out a slow
 # upstream, fall back, and still answer (regression guard: bugs-erros-opencode.md 2026-08-14).
@@ -45,6 +62,9 @@ UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "30"))
 # a genuinely stalled stream still times out per-read. Non-streaming keeps the
 # tighter UPSTREAM_TIMEOUT for fast failure on dead/empty upstreams.
 STREAM_UPSTREAM_TIMEOUT = float(os.environ.get("STREAM_UPSTREAM_TIMEOUT", "120"))
+# Combo requests use a shorter streaming idle cap so one flaky provider cannot
+# hold OpenCode for minutes before the global fallback chain gets a chance.
+COMBO_STREAM_TIMEOUT = float(os.environ.get("COMBO_STREAM_TIMEOUT", "15"))
 
 # SSE head-window (lines) drained before committing a streaming response.
 # Empty-200 upstreams finish inside the window (EOF → model fallback still
@@ -119,7 +139,7 @@ PROXY_MIN_POOL = 10                   # minimum alive proxies before applying a 
 PROXY_PROBE_MAX_WORKERS = 50          # thread pool for parallel proxy probes
 
 # ── Happy-Eyeballs race (parallel multi-provider) ───────────────────
-RACE_DEADLINE_SEC = 1.5        # max seconds to wait for the first 200 in a race
+RACE_DEADLINE_SEC = float(os.environ.get("RACE_DEADLINE_SEC", "3.0"))  # bounded first-success window for combo races
 DEGRADED_POOL_THRESHOLD = 5    # if healthy providers ≤ this, race top-2 instead of top-1
 
 # ── Global fallback (exhaust the full catalog on 5xx) ────────────────
@@ -136,11 +156,11 @@ RESPONSE_CACHE_MAX_BYTES = 8 * 1024 * 1024  # 8MB cap on total cached bytes
 _RAW_DOWNSTREAM_ROUTERS = [
     {
         "name": "OmniRoute",
-        "url": "http://localhost:20128",
+        "url": "http://127.0.0.1:20128",
         "priority": 1,
         "weight": 1,
-        "health_check_path": "/v1/models",
-        "timeout": 60.0,  # /v1/models mediu 19.7s/412KB em 2026-08-23; 30s causava probes falsos → "all routers unavailable"
+        "health_check_path": "/api/health",
+        "timeout": 5.0,  # lightweight liveness probe; model catalog is preserved from the last successful snapshot
         "auth": {"header": "Authorization", "value": f"Bearer {NINEROUTER_KEY}"},
     },
     {
@@ -148,7 +168,7 @@ _RAW_DOWNSTREAM_ROUTERS = [
         "url": "http://localhost:20129",
         "priority": 2,
         "weight": 1,
-        "health_check_path": "/v1/models",
+        "health_check_path": "/health",
         "timeout": 5.0,
         "auth": {"header": "Authorization", "value": f"Bearer {KRI_KEY}"},
     },

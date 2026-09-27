@@ -2,6 +2,8 @@ import pytest
 import json
 import threading
 import time
+
+from config import PROBER_INTERVAL_SECONDS
 from router_probe import RouterProbe
 from router_registry import RouterRegistry
 
@@ -41,14 +43,19 @@ def test_probe_all_timeout(registry):
     assert results["unhealthy"] == 2
 
 
-def test_probe_loop_stop():
-    """Probe loop should stop gracefully."""
+def test_probe_loop_stop_interrupts_wait(monkeypatch):
+    """stop() wakes the loop without waiting for the full probe interval."""
+    monkeypatch.setattr("router_probe.PROBER_INTERVAL_SECONDS", 60)
     reg = RouterRegistry([])
     probe = RouterProbe(reg)
-    assert probe._running is False
     t = threading.Thread(target=probe.probe_loop, daemon=True)
     t.start()
-    time.sleep(0.1)
+    time.sleep(0.05)
     assert probe._running is True
+    started = time.monotonic()
     probe.stop()
+    t.join(timeout=0.5)
+    elapsed = time.monotonic() - started
+    assert not t.is_alive()
     assert probe._running is False
+    assert elapsed < 0.5

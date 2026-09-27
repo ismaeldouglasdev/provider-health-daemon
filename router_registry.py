@@ -1,5 +1,6 @@
 import json
 import time
+import threading
 from config import ROUTER_STATE_FILE, ROUTER_UNHEALTHY_STRIKES, ROUTER_BACKOFF_CAP
 
 
@@ -30,6 +31,7 @@ class RouterState:
 
 class RouterRegistry:
     def __init__(self, routers_config):
+        self._lock = threading.RLock()
         self._routers = {}
         for cfg in routers_config:
             s = RouterState(
@@ -44,17 +46,24 @@ class RouterRegistry:
             self._routers[s.name] = s
 
     def get_router(self, name):
-        return self._routers.get(name)
+        with self._lock:
+            return self._routers.get(name)
 
     def get_all_routers(self):
-        return list(self._routers.values())
+        with self._lock:
+            return list(self._routers.values())
 
     def get_healthy_routers(self):
-        healthy = [r for r in self._routers.values() if r.health_status == "healthy"]
-        healthy.sort(key=lambda r: (r.priority, -r.weight))
-        return healthy
+        with self._lock:
+            healthy = [r for r in self._routers.values() if r.health_status == "healthy"]
+            healthy.sort(key=lambda r: (r.priority, -r.weight))
+            return healthy
 
     def mark_healthy(self, name, models):
+        with self._lock:
+            return self._mark_healthy(name, models)
+
+    def _mark_healthy(self, name, models):
         r = self._routers.get(name)
         if r is None:
             return
@@ -71,11 +80,24 @@ class RouterRegistry:
                 r.health_status = "healthy"
                 r.consecutive_probes_ok = 0
         else:
-            # First success after cooldown/unknown: set to probing, require 2nd probe
-            r.consecutive_probes_ok = 1
-            r.health_status = "probing"
+            # Lightweight liveness endpoints (/health, /api/health) already
+            # prove the router is reachable. Do not require a second probe:
+            # that creates a needless startup window where every downstream
+            # router is "probing" and MetaRouterSelector sees zero healthy.
+            if r.health_check_path in ("/health", "/v1/health", "/api/health"):
+                r.consecutive_probes_ok = 0
+                r.health_status = "healthy"
+            else:
+                # Full catalog probes remain conservative: unknown -> probing
+                # -> healthy after a second successful probe.
+                r.consecutive_probes_ok = 1
+                r.health_status = "probing"
 
     def mark_unhealthy(self, name, error_type=None):
+        with self._lock:
+            return self._mark_unhealthy(name, error_type)
+
+    def _mark_unhealthy(self, name, error_type=None):
         """Histerese: só entra em cooldown após ROUTER_UNHEALTHY_STRIKES falhas
         consecutivas. Uma falha isolada (timeout de /v1/models lento) mantém o
         router roteando — mark_healthy zera o contador em qualquer sucesso."""
@@ -96,30 +118,33 @@ class RouterRegistry:
         r.cooldown_until = r.last_failure + backoff
 
     def mark_probing(self, name):
-        r = self._routers.get(name)
-        if r is None:
-            return
-        r.health_status = "probing"
+        with self._lock:
+            r = self._routers.get(name)
+            if r is None:
+                return
+            r.health_status = "probing"
 
     def refresh_models_from_router(self, name, models):
-        r = self._routers.get(name)
-        if r is None:
-            return
-        r.models = list(models) if models else []
+        with self._lock:
+            r = self._routers.get(name)
+            if r is None:
+                return
+            r.models = list(models) if models else []
 
     def get_model_catalog(self):
-        catalog = {}
-        for r in self._routers.values():
-            for model_id in r.models:
-                if model_id in catalog:
-                    if r.name not in catalog[model_id]["router_origins"]:
-                        catalog[model_id]["router_origins"].append(r.name)
-                else:
-                    catalog[model_id] = {
-                        "model_id": model_id,
-                        "router_origins": [r.name],
-                    }
-        return catalog
+        with self._lock:
+            catalog = {}
+            for r in self._routers.values():
+                for model_id in r.models:
+                    if model_id in catalog:
+                        if r.name not in catalog[model_id]["router_origins"]:
+                            catalog[model_id]["router_origins"].append(r.name)
+                    else:
+                        catalog[model_id] = {
+                            "model_id": model_id,
+                            "router_origins": [r.name],
+                        }
+            return catalog
 
     def get_provider_aggregation(self):
         """Aggregate provider info across all router model catalogs.
@@ -130,6 +155,10 @@ class RouterRegistry:
         Returns a dict keyed by provider name:
           {provider_name: {provider, models: [{model_id, routers: [...]}], router_count, total_models}}
         """
+        with self._lock:
+            return self._build_provider_aggregation()
+
+    def _build_provider_aggregation(self):
         aggregated: dict[str, dict] = {}
 
         for r in self._routers.values():
@@ -168,9 +197,10 @@ class RouterRegistry:
         return result
 
     def save_state(self):
-        data = []
-        for r in self._routers.values():
-            data.append({
+        with self._lock:
+            data = []
+            for r in self._routers.values():
+                data.append({
                 "name": r.name,
                 "url": r.url,
                 "priority": r.priority,
@@ -182,15 +212,24 @@ class RouterRegistry:
                 "cooldown_until": r.cooldown_until,
                 "consecutive_probes_ok": r.consecutive_probes_ok,
                 "failure_count": r.failure_count,
-                "auth": r.auth,
+                # Authentication is runtime configuration, not router state.
+                # Never persist bearer/API credentials into router_state.json.
                 "health_check_path": r.health_check_path,
                 "timeout": r.timeout,
-            })
-        ROUTER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(ROUTER_STATE_FILE, "w") as f:
-            json.dump(data, f, indent=2, default=str)
+                })
+            ROUTER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(ROUTER_STATE_FILE, "w") as f:
+                json.dump(data, f, indent=2, default=str)
 
     def load_state(self):
+        # Tests and recovery tooling may instantiate via __new__ before loading
+        # persisted state; ensure the concurrency primitive still exists.
+        if not hasattr(self, "_lock"):
+            self._lock = threading.RLock()
+        with self._lock:
+            return self._load_state()
+
+    def _load_state(self):
         if not ROUTER_STATE_FILE.exists():
             return
         try:
@@ -202,10 +241,23 @@ class RouterRegistry:
         for r in self._routers.values():
             saved = restored.get(r.name)
             if saved:
-                r.health_status = saved.get("health_status", "unknown")
-                r.cooldown_until = saved.get("cooldown_until")
-                r.failure_count = saved.get("failure_count", 0)
-                r.consecutive_probes_ok = saved.get("consecutive_probes_ok", 0)
+                # Router health is ephemeral. Never resurrect a persisted
+                # cooldown for a lightweight /health router: that state may
+                # have been caused by an old /v1/models probe or a transient
+                # startup 404 and can otherwise make a live gateway invisible
+                # for the entire backoff window after every daemon restart.
+                if r.health_check_path in ("/health", "/v1/health", "/api/health"):
+                    r.health_status = "unknown"
+                    r.cooldown_until = None
+                    # Keep historical failures for observability/persistence;
+                    # health state itself is ephemeral for lightweight probes.
+                    r.failure_count = saved.get("failure_count", 0)
+                    r.consecutive_probes_ok = 0
+                else:
+                    r.health_status = saved.get("health_status", "unknown")
+                    r.cooldown_until = saved.get("cooldown_until")
+                    r.failure_count = saved.get("failure_count", 0)
+                    r.consecutive_probes_ok = saved.get("consecutive_probes_ok", 0)
                 r.last_success = saved.get("last_success")
                 r.last_failure = saved.get("last_failure")
                 r.models = saved.get("models", [])

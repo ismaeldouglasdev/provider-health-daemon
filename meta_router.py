@@ -1,8 +1,18 @@
-import threading
 from collections import defaultdict
+import logging
+import threading
+
+from data_policy import DataSensitivity, allowed, classify_model_policy
+from model_id_mapper import ModelIdMapper
+
+log = logging.getLogger(__name__)
 
 
 class ServiceUnavailable(Exception):
+    pass
+
+
+class PolicyUnavailable(ServiceUnavailable):
     pass
 
 
@@ -23,13 +33,52 @@ class MetaRouterSelector:
         self._successes: dict[str, int] = defaultdict(int)
         self._failures: dict[str, int] = defaultdict(int)
         self._streaks: dict[str, int] = defaultdict(int)
+        self._model_mapper = ModelIdMapper()
 
-    def _eligible_routers(self, model: str = None):
+    def _eligible_routers(self, model: str = None, sensitivity: DataSensitivity = DataSensitivity.PUBLIC):
         healthy = self._registry.get_healthy_routers()
+        if model and sensitivity != DataSensitivity.PUBLIC:
+            policy = classify_model_policy(model)
+            before = len(healthy)
+            healthy = [
+                r for r in healthy
+                if allowed(policy, sensitivity)
+            ]
+            if before != len(healthy):
+                log.info(
+                    "META_POLICY_FILTER model=%s sensitivity=%s policy=%s removed=%s",
+                    model, sensitivity.value, policy.value, before - len(healthy),
+                )
+            if not healthy:
+                raise PolicyUnavailable(
+                    f"no downstream route allowed for {sensitivity.value} data with policy {policy.value}"
+                )
+        log.info("META_ELIGIBLE model=%s sensitivity=%s routers=%s", model or "", sensitivity.value, [(r.name, r.health_status, len(r.models)) for r in healthy])
         if not healthy:
+            log.warning("META_EMPTY model=%s registry has no healthy routers", model or "")
             raise ServiceUnavailable("all routers unavailable")
         if model:
-            capable = [r for r in healthy if model in r.models]
+            canonical_model = self._model_mapper.to_canonical(model)
+            for router in healthy:
+                self._model_mapper.register_catalog(router.name, {m: m for m in router.models})
+
+            # `kr/*` is the public model namespace for the dedicated local
+            # Kiro Gateway. Prefer that downstream router over the direct
+            # 9Router Kiro catalog, whose quota/subscription state is separate
+            # from the gateway credential. The gateway advertises Kiro model
+            # ids without the `kr/` prefix.
+            if model.startswith("kr/"):
+                bare_model = model.split("/", 1)[1]
+                kiro = [r for r in healthy if r.name == "Kiro" and bare_model in r.models]
+                if kiro:
+                    healthy = kiro
+                    log.info("META_KIRO_ROUTE model=%s router=%s", model, [r.name for r in kiro])
+                    return healthy
+
+            capable = [
+                r for r in healthy
+                if any(self._model_mapper.to_canonical(m) == canonical_model for m in r.models)
+            ]
             if capable:
                 healthy = capable
             else:
@@ -43,7 +92,7 @@ class MetaRouterSelector:
                 # only to routers serving the same provider prefix or the bare
                 # model name (Kiro catalogs "minimax-m2.5" bare while requests
                 # use "kr/minimax-m2.5"); else fail with ServiceUnavailable.
-                provider, sep, rest = model.partition("/")
+                provider, sep, rest = canonical_model.partition("/")
                 serving = [
                     r for r in healthy
                     if any(
@@ -69,9 +118,24 @@ class MetaRouterSelector:
             self._current_weights[best.name] -= total
         return best
 
-    def select_router(self, model: str = None):
+    def model_for_router(self, model: str, router_name: str) -> str:
+        """Translate a client/canonical model ID to the selected router catalog ID."""
+        if not isinstance(model, str) or not model:
+            return model
+        router = self._registry.get_router(router_name)
+        if router is not None:
+            self._model_mapper.register_catalog(router.name, {m: m for m in router.models})
+        canonical = self._model_mapper.to_canonical(model)
+        return self._model_mapper.to_router_specific(canonical, router_name)
+
+    def select_router(self, model: str = None, sensitivity=DataSensitivity.PUBLIC, exclude=None):
         with self._lock:
-            healthy = self._eligible_routers(model)
+            healthy = self._eligible_routers(model, sensitivity)
+            excluded = set(exclude or ())
+            if excluded:
+                healthy = [r for r in healthy if r.name not in excluded]
+                if not healthy:
+                    raise ServiceUnavailable("all eligible routers excluded")
             threshold = self._failure_threshold
             flapping = [r for r in healthy if self._streaks[r.name] >= threshold]
             if flapping and len(flapping) < len(healthy):
@@ -86,15 +150,23 @@ class MetaRouterSelector:
             self._successes[router_name] += 1
             self._streaks[router_name] = 0
 
-    def on_failure(self, router_name, error_type=None):
+    def on_failure(self, router_name, error_type=None, model=None, sensitivity=DataSensitivity.PUBLIC):
+        """Record a router failure and return a model-aware fallback when possible."""
         with self._lock:
             self._failures[router_name] += 1
             self._streaks[router_name] += 1
             self._registry.mark_unhealthy(router_name, error_type)
-        return self._fallback()
+            return self._fallback(
+                model=model,
+                sensitivity=sensitivity,
+                exclude={router_name},
+            )
 
-    def _fallback(self):
-        healthy = self._registry.get_healthy_routers()
+    def _fallback(self, model=None, sensitivity=DataSensitivity.PUBLIC, exclude=None):
+        """Pick a healthy fallback, preserving model/policy eligibility."""
+        healthy = self._eligible_routers(model=model, sensitivity=sensitivity)
+        excluded = set(exclude or ())
+        healthy = [r for r in healthy if r.name not in excluded]
         if not healthy:
             raise ServiceUnavailable("all routers unavailable (after fallback)")
         return self._pick_weighted(healthy)

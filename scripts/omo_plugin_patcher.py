@@ -35,6 +35,22 @@ PATCHED_FN = (
     "}"
 )
 
+UNPATCHED_FN_DIRECT = (
+    "function resolveModelPipeline2(request) {\n"
+    "  return resolveModelPipeline(request, exports_connected_providers_cache);\n"
+    "}"
+)
+
+PATCHED_FN_DIRECT = (
+    "function resolveModelPipeline2(request) {\n"
+    "  const resolved = resolveModelPipeline(request, exports_connected_providers_cache);\n"
+    "  if (resolved && typeof resolved.model === \"string\") {\n"
+    "    resolved.model = resolved.model.replace(/\\.+$/, \"\");\n"
+    "  }\n"
+    "  return resolved;\n"
+    "}"
+)
+
 
 def main() -> int:
     # Path override via argv[1]: permite testar contra cópias em /tmp.
@@ -49,7 +65,12 @@ def main() -> int:
     if MARKER in content:
         return 0
 
-    if UNPATCHED_FN not in content:
+    if UNPATCHED_FN_DIRECT in content:
+        unpatched_fn, patched_fn = UNPATCHED_FN_DIRECT, PATCHED_FN_DIRECT
+    else:
+        unpatched_fn, patched_fn = UNPATCHED_FN, PATCHED_FN
+
+    if unpatched_fn not in content:
         print(
             "ERRO: formato da função resolveModelPipeline2 desconhecido — "
             "patch automático impossível, revisão manual necessária",
@@ -60,7 +81,7 @@ def main() -> int:
     backup = f"{plugin_path}.bak-patcher-{time.strftime('%Y%m%d-%H%M%S')}"
     shutil.copy2(plugin_path, backup)
 
-    patched = content.replace(UNPATCHED_FN, PATCHED_FN, 1)
+    patched = content.replace(unpatched_fn, patched_fn, 1)
     with open(plugin_path, "w", encoding="utf-8") as fh:
         fh.write(patched)
 

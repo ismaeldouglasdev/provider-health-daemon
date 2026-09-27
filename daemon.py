@@ -57,6 +57,7 @@ from dashboard import DashboardServer
 from metrics_store import MetricsStore, RequestRecord
 from metrics_persistence import MetricsPersistence
 from model_prober import start_model_prober
+from kilo_policy import refresh as refresh_kilo_policy
 
 try:
     from alerter import Alerter
@@ -94,20 +95,10 @@ def setup_logging(json_logs: bool = True, level: int = logging.INFO) -> None:
     root.handlers = []
     root.setLevel(level)
 
-    # Stdout
-    sh = logging.StreamHandler()
-    if json_logs:
-        sh.setFormatter(StructuredFormatter())
-    else:
-        sh.setFormatter(
-            logging.Formatter(
-                fmt="%(asctime)s HEALTH %(levelname)s %(message)s",
-                datefmt="%H:%M:%S",
-            )
-        )
-    root.addHandler(sh)
-
-    # Rotating file
+    # Rotating file. The daemon is normally launched with stdout redirected
+    # to this same file (nohup ... >> ~/.9router/health-daemon.log), so a
+    # second StreamHandler would write every record twice. Keep one canonical
+    # file handler; interactive operators can still tail the file.
     log_dir = Path.home() / ".9router"
     log_dir.mkdir(parents=True, exist_ok=True)
     fh = logging.handlers.RotatingFileHandler(
@@ -370,6 +361,12 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                     if status != "disabled" and entry.get("failures", 0) >= HealthRegistry.MAX_FAILURES:
                         continue  # don't probe permanently disabled
 
+                    # Capture the exact provider state after the disabled-probe
+                    # timestamp mutation. A network probe may take up to 60s;
+                    # refuse to promote a stale success if another thread has
+                    # changed this provider in the meantime.
+                    probe_token = registry.probe_token(provider)
+
                     # Resolve test models: prefer live combo cache, fall back
                     # to the models list stored in the health-registry entry.
                     # If empty, discover from 9router catalog (breaks the
@@ -439,6 +436,16 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                                             },
                                         )
                                         continue
+                                    if not registry.probe_token_matches(provider, probe_token):
+                                        log.warning(
+                                            "Auto-recovery: stale successful probe ignored",
+                                            extra={
+                                                "event": "stale_probe_ignored",
+                                                "provider": provider,
+                                                "model": test_model,
+                                            },
+                                        )
+                                        break
                                     log.info(
                                         "Auto-recovery: provider responded healthy",
                                         extra={
@@ -450,7 +457,11 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                                     registry.mark_healthy(provider)
                                     METRICS.cooldowns_promoted += 1
                                     break
-                        except (urllib.error.URLError, urllib.error.HTTPError):
+                        except (urllib.error.URLError, TimeoutError, OSError):
+                            # A single slow/downstream provider must not abort
+                            # the entire recovery cycle. In particular,
+                            # urllib raises TimeoutError directly for socket
+                            # timeouts, outside URLError on some Python builds.
                             pass
                         time.sleep(0.5)  # rate limit between probes (was 2s, faster recovery)
 
@@ -712,6 +723,22 @@ def proxy_loop():
 def main():
     setup_logging(json_logs=True, level=logging.INFO)
 
+    # Refresh Kilo's public data-policy catalog in the background. The catalog
+    # contains model IDs and mayTrainOnYourPrompts only; no prompt content is
+    # sent or stored by this integration.
+    def kilo_policy_loop():
+        first = True
+        while not shutdown_event.is_set():
+            try:
+                refresh_kilo_policy(force=first)
+            except Exception as exc:
+                log.warning("Kilo policy refresh failed: %s", exc)
+            first = False
+            if shutdown_event.wait(600):
+                break
+
+    threading.Thread(target=kilo_policy_loop, daemon=True, name="kilo-policy").start()
+
     # ── Single-instance lock (prevents EADDRINUSE crash-loop class) ───
     # A second daemon (e.g. spawned by systemd while an orphan holds the
     # ports) exits cleanly with code 0. NOTE: the unit uses Restart=on-failure
@@ -773,7 +800,7 @@ def main():
                 url = r["url"].rstrip("/") + r.get("health_check_path", "/v1/models")
                 req = _urlreq.Request(url, method="GET")
                 auth = r.get("auth")
-                if auth:
+                if auth and r.get("health_check_path", "/v1/models") not in ("/health", "/v1/health"):
                     req.add_header(auth["header"], auth["value"])
                 req.add_header("Accept", "application/json")
                 t0 = time.monotonic()
@@ -1198,6 +1225,7 @@ def main():
     server.registry = registry
     server.meta_registry = meta_registry
     server.meta_selector = meta_selector
+    server.model_catalog = model_catalog
     server.audit = METRICS
     proxy_thread = threading.Thread(target=server.run, daemon=False, name="proxy")
     proxy_thread.start()

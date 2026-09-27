@@ -133,6 +133,23 @@ class TestNormalizeResponse:
         result = normalize_response(resp)
         assert result["choices"][0]["message"]["content"] == "hello"
 
+    def test_canonical_model_id(self):
+        resp = {
+            "model": "groq/llama-3.3-70b-versatile",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        result = normalize_response(resp)
+        assert result["model"] == "llama-3.3-70b-versatile"
+
+    def test_router_level_model_id_passes_through(self):
+        resp = {
+            "model": "main-rr",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+        }
+        result = normalize_response(resp)
+        assert result["model"] == "main-rr"
+
     def test_no_usage(self):
         resp = {
             "id": "r2",
@@ -239,6 +256,11 @@ class TestNormalizeResponse:
 
 
 class TestNormalizeStreamingBody:
+    def test_streaming_model_id_is_canonical(self):
+        sse = 'data: {"id":"1","model":"groq/llama-3.3-70b-versatile","choices":[{"index":0,"text":"hello"}]}' + "\n"
+        result = normalize_streaming_body(sse)
+        assert '"model": "llama-3.3-70b-versatile"' in result
+
     def test_streaming_body(self):
         sse = (
             'data: {"id":"1","choices":[{"index":0,"text":"hello"}]}\n'

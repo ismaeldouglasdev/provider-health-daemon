@@ -60,6 +60,25 @@ class CooldownCalculator:
 
         failures = current_failures + 1
 
+        # Provider fetch/connect failures are transport-health signals, not
+        # evidence that a model/provider is dead. Keep their quarantine short
+        # and bounded; otherwise one transient network flap can exponentially
+        # poison the pool for hours.
+        if error_type in {"fetch_failed", "connect_timeout", "timeout", "provider_unavailable", "unknown_500", "generic_500"}:
+            failures = min(failures, 2)
+            base_duration = timedelta(seconds=30 if failures <= 1 else 60)
+            until = datetime.now(timezone.utc) + base_duration
+            return {
+                "until": until.isoformat(),
+                "duration_hours": base_duration.total_seconds() / 3600,
+                "type": error_type,
+                "permanent": False,
+                "model_specific": model_specific,
+                "backoff_applied": failures > 1,
+                "failures": failures,
+                "recheck": True,
+            }
+
         if failures >= self.max_failures:
             if error_type in self.RATE_LIMIT_TYPES:
                 until = datetime.now(timezone.utc) + timedelta(seconds=self.max_cooldown.total_seconds())

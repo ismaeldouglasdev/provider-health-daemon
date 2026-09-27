@@ -240,6 +240,9 @@ DEAD_MODELS = {
 # Expanded 2026-08-26: added rw (498 free models), gemini, llm7, openrouter, any
 PROVIDER_PRIORITY = {
     "ali": 5,        # Alibaba Cloud MaaS — MUITO rápido e confiável, provider mais rápido
+    "bzl": 15,       # BazaarLink — OpenAI-compatible multi-provider gateway; secondary lane
+    "persor": 26,    # PersorAI — free OpenAI-compatible pool; secondary free lane
+    "freeai": 28,   # Free.ai — token-metered/free daily pool; secondary lane
     # do pool. Verified 2026-09-03 via 20128: qwen3.8-flash (1.15s), qwen-plus (1.7s),
     # qwen3.8-max (2.5s). Key sk-ws-* adicionada hoje. Benigno: modelos qwen em pt-br ok.
     "kr": 8,         # Kiro — modelos RÁPIDOS e confiáveis comprovados: claude-haiku-4.5 (1.8s), minimax-m2.1 (1.9s), auto (8.7s). Melhor latência do pool (verified 2026-09-03). Mortos (opus-5/sonnet-5) bloqueados.
@@ -256,7 +259,7 @@ PROVIDER_PRIORITY = {
     "llm7": 37,      # LLM7 — 10 models, deepseek-v4-flash 200 OK (verified 2026-08-26)
     "any": 38,       # AnyAPI — 7 free nvidia models, free tier (verified 2026-08-26)
     "groq": 40,      # Groq — gpt-oss-120b OK, llama-3.3 429
-    "gh": 45,        # GitHub Copilot — only gpt-4o-mini-2024-07-18 verified OK
+    "gh": 12,        # GitHub Copilot — gpt-4-o-preview + gpt-4.1 verified live; keep a known-good fast safety lane near the top
     "cx": 55,        # Codex — gpt-5 morto (400), gpt-5.5 lento (~12s+). Rebaixado (verified 2026-09-03)
     "nvidia": 60,    # NVIDIA — 429/410 (minimax-m3 retired)
     "ollama": 75,    # Ollama Cloud — 429 weekly limit + gpt-oss:120b lento. Rebaixado (verified 2026-09-03)
@@ -892,9 +895,6 @@ class SmartRouter:
             provider = mid.split("/")[0]
             if provider.startswith("@"):
                 continue
-            # HARD BLOCK: permanently blocked providers are excluded at source
-            if provider in PERMANENTLY_BLOCKED:
-                continue
             if mid in SmartRouter._get_locked_model_ids():
                 continue  # actively locked by modelLock_* (rate-limited account)
             if provider in FREE_TIER_SUFFIX_ONLY and ":free" not in mid:
@@ -954,9 +954,6 @@ class SmartRouter:
                 continue
             provider = model_id.split("/")[0]
             if provider.startswith("@"):
-                continue
-            # HARD BLOCK: permanently blocked providers are excluded at source
-            if provider in PERMANENTLY_BLOCKED:
                 continue
             if model_id in SmartRouter._get_locked_model_ids():
                 continue  # actively locked by modelLock_* (rate-limited account)

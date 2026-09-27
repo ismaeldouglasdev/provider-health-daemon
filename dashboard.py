@@ -15,6 +15,7 @@ Endpoints:
 
 import csv
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from typing import Optional
 from socketserver import ThreadingMixIn
 
 from metrics_store import MetricsStore
+from daily_usage import CachedProviderUsage
 from config import DASHBOARD_PORT, DASHBOARD_HOST, POOL_DEGRADED_THRESHOLD
 
 log = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     health_registry = None
     router_registry = None  # for aggregated providers view
     metrics_persistence = None
+    daily_usage_cache: CachedProviderUsage | None = None
     webhook_url = ""
     sse_clients: list = []
     _sse_lock = threading.Lock()
@@ -60,6 +63,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # Silence default logging
     def log_message(self, fmt, *args):
         pass
+
+    def _is_local_admin_client(self) -> bool:
+        """Allow dashboard admin APIs only from loopback clients."""
+        try:
+            host = self.client_address[0]
+            return ipaddress.ip_address(host).is_loopback
+        except (AttributeError, IndexError, ValueError, TypeError):
+            return False
+
+    def _reject_remote_admin(self) -> bool:
+        """Reject /api/admin/* when the dashboard is reached remotely."""
+        if not self._is_local_admin_client():
+            self._send_json({"error": "admin endpoints are local-only"}, 403)
+            return True
+        return False
 
     def _send_json(self, data: dict, status: int = 200):
         body = json.dumps(data, indent=2, default=str).encode()
@@ -103,6 +121,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
 
+        # Admin APIs are intentionally local-only, even if DASHBOARD_HOST is widened.
+        if (path.startswith("/api/admin/") or path.startswith("/api/alert/webhook")) and self._reject_remote_admin():
+            return
+
         # ── Dashboard UI ─────────────────────────────────────────────
         if path == "/" or path == "/dashboard/" or path == "/dashboard":
             self._serve_file(TEMPLATES / "dashboard.html")
@@ -139,12 +161,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             healthy = summary.get("by_status", {}).get("healthy", 0)
             threshold = POOL_DEGRADED_THRESHOLD
+            usage = self.daily_usage_cache.get() if self.daily_usage_cache else {}
+            registered = set(summary.get("providers", {}).keys())
+            providers_zero_today = sum(
+                1 for provider in registered
+                if usage.get(provider, {}).get("requests", 0) == 0
+            )
             data = {
                 "ttft": ttft,
                 "providers": summary,
                 "healthy_count": healthy,
                 "pool_degraded_threshold": threshold,
                 "degraded": healthy < threshold,
+                "providers_zero_today": providers_zero_today,
             }
             self._send_json(data)
             return
@@ -488,6 +517,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
 
+        # Admin APIs are intentionally local-only, even if DASHBOARD_HOST is widened.
+        if (path.startswith("/api/admin/") or path.startswith("/api/alert/webhook")) and self._reject_remote_admin():
+            return
+
         if path == "/api/alert/webhook":
             content_len = int(self.headers.get("Content-Length", 0))
             if content_len > 0:
@@ -596,6 +629,7 @@ class DashboardServer:
         self.health_registry = None
         self.metrics_persistence = None
         self.router_registry = None  # RouterRegistry for aggregated providers
+        self.daily_usage_cache = CachedProviderUsage()
         self.server: Optional[ThreadingDashboardHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
 
@@ -604,6 +638,7 @@ class DashboardServer:
         hr = self.health_registry
         mp = self.metrics_persistence
         rr = self.router_registry
+        duc = self.daily_usage_cache
 
         class Handler(DashboardHandler):
             pass
@@ -612,6 +647,7 @@ class DashboardServer:
         Handler.health_registry = hr
         Handler.metrics_persistence = mp
         Handler.router_registry = rr
+        Handler.daily_usage_cache = duc
         return Handler
 
     def start(self):

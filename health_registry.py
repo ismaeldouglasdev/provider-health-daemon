@@ -568,6 +568,29 @@ class HealthRegistry:
 
     # ── Write API ────────────────────────────────────────────────────
 
+    def probe_token(self, provider: str) -> tuple:
+        """Return a stable token for a recovery-probe state snapshot.
+
+        The recovery prober can spend up to a minute outside the registry lock.
+        Comparing this token before promotion prevents a stale successful probe
+        from overwriting a newer error/state transition.
+        """
+        provider = normalize_provider(provider)
+        with self._lock:
+            entry = self._data[self.PROVIDERS].get(provider, {})
+            return (
+                entry.get("status"),
+                entry.get("until"),
+                entry.get("failures", 0),
+                entry.get("reason"),
+                entry.get("updated_at"),
+                entry.get("last_probe_at"),
+            )
+
+    def probe_token_matches(self, provider: str, token: tuple) -> bool:
+        """Whether provider state is unchanged since a recovery probe began."""
+        return self.probe_token(provider) == token
+
     def mark_healthy(self, provider: str, model: Optional[str] = None) -> None:
         """Record successful request."""
         provider = normalize_provider(provider)

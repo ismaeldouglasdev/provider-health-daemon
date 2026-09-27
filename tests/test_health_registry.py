@@ -19,6 +19,39 @@ def tmp_registry(tmp_path: Path) -> HealthRegistry:
 # ── Basic operations ────────────────────────────────────────────────
 
 
+def test_probe_token_changes_when_provider_state_changes(tmp_registry: HealthRegistry):
+    """A recovery probe token must invalidate after a newer state transition."""
+    tmp_registry.mark_error("sample-provider", {
+        "type": "rate_limit",
+        "status": 429,
+        "model_specific": False,
+        "cooldown": {"type": "rate_limit", "duration_hours": 1},
+    })
+    token = tmp_registry.probe_token("sample-provider")
+    assert tmp_registry.probe_token_matches("sample-provider", token)
+
+    tmp_registry.mark_error("sample-provider", {
+        "type": "rate_limit",
+        "status": 429,
+        "model_specific": False,
+        "cooldown": {"type": "rate_limit", "duration_hours": 2},
+    })
+    assert not tmp_registry.probe_token_matches("sample-provider", token)
+
+
+def test_probe_token_invalidated_by_recovery(tmp_registry: HealthRegistry):
+    """A provider recovered by another path must reject an older probe result."""
+    tmp_registry.mark_error("sample-provider", {
+        "type": "rate_limit",
+        "status": 429,
+        "model_specific": False,
+        "cooldown": {"type": "rate_limit", "duration_hours": 1},
+    })
+    token = tmp_registry.probe_token("sample-provider")
+    tmp_registry.mark_healthy("sample-provider")
+    assert not tmp_registry.probe_token_matches("sample-provider", token)
+
+
 def test_mark_healthy(tmp_registry: HealthRegistry):
     tmp_registry.mark_healthy("sample-provider")
     assert tmp_registry.is_provider_healthy("sample-provider")

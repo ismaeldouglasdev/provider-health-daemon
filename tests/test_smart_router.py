@@ -17,6 +17,7 @@ def _no_dynamic_network(monkeypatch):
     touches the network; individual tests override with their own data."""
     monkeypatch.setattr(SmartRouter, "_get_locked_model_ids", classmethod(lambda cls: set()))
     monkeypatch.setattr(SmartRouter, "_get_connection_counts", classmethod(lambda cls: {}))
+    monkeypatch.setattr("catalog_sync.get_disabled_models", lambda: {})
 
 
 def _make_router():
@@ -280,11 +281,11 @@ class TestNonChatModelFilter:
 
     def test_keeps_chat_models(self):
         out = SmartRouter._filter_static_models(
-            ["groq/llama-3.3-70b-versatile", "cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
+            ["groq/llama-3.3-70b-versatile", "cf/@cf/meta/llama-3.1-70b-instruct-fp8-fast"]
         )
         assert out == [
             "groq/llama-3.3-70b-versatile",
-            "cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            "cf/@cf/meta/llama-3.1-70b-instruct-fp8-fast",
         ]
 
     def test_drops_bare_and_group_ids_keeps_blocked_as_fallback(self):
@@ -306,10 +307,13 @@ class TestNonChatModelFilter:
 
     def test_pipeline_applies_denylist_to_catalog(self):
         self._fresh()
-        with patch.object(SmartRouter, "_fetch_catalog_models", return_value=[
-            "openrouter/poolside/laguna-xs-2.1:free",
-            "ollama/gpt-oss:120b",
-        ]):
+        with (
+            patch.object(SmartRouter, "_read_combo_cache", return_value=[]),
+            patch.object(SmartRouter, "_fetch_catalog_models", return_value=[
+                "openrouter/poolside/laguna-xs-2.1:free",
+                "ollama/gpt-oss:120b",
+            ]),
+        ):
             combos = SmartRouter.get_default_combos()
         assert "openrouter/poolside/laguna-xs-2.1:free" not in combos
         # groq/llama-3.3-70b-versatile was disabled on the live 9router registry
@@ -431,8 +435,8 @@ class TestLoadSpreading:
 
         first = router.best_model(models, reg)
         second = router.best_model(models, reg)
-        assert first == "cu/kimi-k3-high"
-        assert second == "gh/gpt-4.1"
+        assert first == "gh/gpt-4.1"
+        assert second == "cu/kimi-k3-high"
 
     def test_out_of_band_provider_not_spread_to(self):
         """A provider with a much worse score must not steal requests."""

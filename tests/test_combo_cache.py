@@ -38,7 +38,7 @@ class TestComboCache:
     def test_catalog_failure_uses_fresh_disk_cache(
         self, _reset_cache, tmp_path, monkeypatch
     ):
-        disk = ["cf/@cf/meta/llama-3.3-70b-instruct-fp8-fast"]
+        disk = ["cf/@cf/meta/llama-3.1-70b-instruct-fp8-fast"]
         (tmp_path / "combo_cache.json").write_text(json.dumps(disk))
         monkeypatch.setattr(SmartRouter, "_fetch_catalog_models", lambda: [])
 

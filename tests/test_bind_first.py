@@ -6,6 +6,7 @@ See TODO 3 in .omo/plans/provider-health-daemon-improvements.md.
 """
 
 import os
+from pathlib import Path
 import socket
 import subprocess
 import sys
@@ -29,6 +30,9 @@ def try_connect(host: str, port: int, timeout: float = 0.5, retries: int = 3) ->
     return False
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_bind_first():
     """Ensure servers bind within 5s of startup."""
     # Use unique ports for this test to avoid conflicts
@@ -48,7 +52,7 @@ def test_bind_first():
     }
     proc = subprocess.Popen(
         [sys.executable, "daemon.py"],
-        cwd="/home/ismaeldev/Desktop/code_study/MeusProjetos/provider-health-daemon",
+        cwd=REPO_ROOT,
         env={**subprocess.os.environ, **env},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -139,7 +143,7 @@ def test_binding_hosts():
 
     proc = subprocess.Popen(
         [sys.executable, "daemon.py"],
-        cwd="/home/ismaeldev/Desktop/code_study/MeusProjetos/provider-health-daemon",
+        cwd=REPO_ROOT,
         env={**subprocess.os.environ, **env},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

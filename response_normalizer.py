@@ -31,7 +31,10 @@ import logging
 import re
 from typing import Any, Optional
 
+from model_id_mapper import ModelIdMapper
+
 log = logging.getLogger(__name__)
+_MODEL_ID_MAPPER = ModelIdMapper()
 
 
 def _ts() -> int:
@@ -78,6 +81,13 @@ def _content_blocks_to_string(content) -> str:
     return "" if content is None else str(content)
 
 
+def _canonical_model_id(model_id: Any) -> Any:
+    """Return a stable client-visible model ID without router prefixes."""
+    if not isinstance(model_id, str):
+        return model_id
+    return _MODEL_ID_MAPPER.to_canonical(model_id)
+
+
 def normalize_sse_chunk(chunk: dict) -> dict:
     """Normalize a single SSE JSON chunk to OpenAI completion chunk shape.
 
@@ -103,6 +113,7 @@ def normalize_sse_chunk(chunk: dict) -> dict:
             # Some return {text: "..."} instead of {delta: {content: "..."}}
             elif "text" in c:
                 c["delta"] = {"content": _content_blocks_to_string(c.pop("text"))}
+        chunk["model"] = _canonical_model_id(chunk.get("model", ""))
         return chunk
 
     # HuggingFace TGI style: {"token": {"text": "...", "special": false}, ...}
@@ -203,12 +214,14 @@ def normalize_response(body: str | bytes | dict) -> dict:
     # Already standard shape
     if "choices" in data and isinstance(data["choices"], list) and "usage" in data:
         # Fix any non-standard fields in choices
+        data["model"] = _canonical_model_id(data.get("model", ""))
         for c in data["choices"]:
             _ensure_standard_choice(c)
         return data
 
     # May have choices but no usage, or choices with unusual shape
     if "choices" in data and isinstance(data["choices"], list):
+        data["model"] = _canonical_model_id(data.get("model", ""))
         for c in data["choices"]:
             _ensure_standard_choice(c)
         data["usage"] = data.get("usage", _extract_usage(data))
@@ -225,7 +238,7 @@ def normalize_response(body: str | bytes | dict) -> dict:
         "id": data.get("id", ""),
         "object": "chat.completion",
         "created": data.get("created", _ts()),
-        "model": data.get("model", ""),
+        "model": _canonical_model_id(data.get("model", "")),
         "choices": [
             {
                 "index": 0,

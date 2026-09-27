@@ -245,6 +245,74 @@ class TestRecordUsageTTFT:
         assert rec.ttft_ms == rec.duration_ms
 
 
+class TestOriginalModelForwardingMetadata:
+    """Internal routing metadata must survive recursive fallback without leaking upstream."""
+
+    class _Response:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class _Opener:
+        def __init__(self):
+            self.calls = []
+
+        def open(self, req, timeout=None):
+            self.calls.append((req, timeout))
+            return TestOriginalModelForwardingMetadata._Response()
+
+    @staticmethod
+    def _handler(opener):
+        from proxy_handler import HealthProxyHandler
+
+        handler = HealthProxyHandler.__new__(HealthProxyHandler)
+        handler.opener = opener
+        handler.meta_selector = None
+        handler.registry = None
+        handler.audit = None
+        handler.path = "/v1/chat/completions"
+        handler.command = "POST"
+        handler.headers = {}
+        handler._emit_upstream_response = MagicMock(return_value=(b'{"choices":[{"message":{"content":"ok"}}]}', 1))
+        handler._record_upstream_health = MagicMock()
+        handler._record_usage = MagicMock()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.wfile = MagicMock()
+        return handler
+
+    def test_original_model_metadata_survives_and_is_not_forwarded(self):
+        from config import COMBO_STREAM_TIMEOUT
+
+        opener = self._Opener()
+        handler = self._handler(opener)
+        body = {
+            "model": "groq/llama-3.3-70b-versatile",
+            "_original_model": "main-rr",
+            "_smart_routed": True,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        handler._forward(body)
+
+        assert body["_original_model"] == "main-rr"
+        assert body["_smart_routed"] is True
+        request, timeout = opener.calls[0]
+        import json
+        forwarded = json.loads(request.data)
+        assert "_original_model" not in forwarded
+        assert "_smart_routed" not in forwarded
+        assert forwarded["model"] == "groq/llama-3.3-70b-versatile"
+        assert timeout == COMBO_STREAM_TIMEOUT
+
+
 class TestFallbackRouterPenalty:
     """Regression: a dead fallback router must be penalized with on_failure()
     when its connection fails — otherwise the meta-selector keeps it
@@ -306,6 +374,28 @@ class TestFallbackRouterPenalty:
 
         assert ("primary", "connection_error") in selector.failures
         assert ("fallback", "connection_error") in selector.failures
+
+    def test_fallback_selection_excludes_failed_primary_router(self):
+        class Selector:
+            def __init__(self):
+                self.calls = []
+
+            def select_router(self, model="", sensitivity=None, exclude=None):
+                self.calls.append((model, sensitivity, exclude))
+                return None
+
+            def on_failure(self, router_name, error_type=None):
+                pass
+
+        handler = self._handler(Selector(), self._DeadOpener())
+        primary = self._FakeRouter("primary", "http://router-a:8000")
+        handler.meta_selector.select_router = lambda model="", sensitivity=None, exclude=None: (
+            handler.meta_selector.calls.append((model, sensitivity, exclude)) or None
+        )
+        handler.meta_selector.on_failure = lambda *args: None
+        handler.meta_selector._primary = primary
+        handler._select_router(model="groq/llama-3.3-70b-versatile", exclude={"primary"})
+        assert handler.meta_selector.calls[-1][2] == {"primary"}
 
 
 class TestDetectDegeneration:

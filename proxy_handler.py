@@ -8,6 +8,7 @@ Extends the basic forwarder with:
 """
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -24,7 +25,7 @@ from pathlib import Path
 # daemon.py inserts prompt-limiter at sys.path[0], which shadows our
 # local modules (smart_router.py, metrics_store.py, etc.).
 # Fix: put our directory at [0], prompt-limiter at [1].
-from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT, STREAM_UPSTREAM_TIMEOUT, STREAM_HEAD_WINDOW_LINES
+from config import PROMPT_LIMITER_DIR, UPSTREAM_TIMEOUT, STREAM_UPSTREAM_TIMEOUT, COMBO_STREAM_TIMEOUT, STREAM_HEAD_WINDOW_LINES
 
 _local_dir = str(Path(__file__).parent)
 _prompt_dir = str(PROMPT_LIMITER_DIR)
@@ -47,7 +48,9 @@ from catalog_sync import sync_disable_dead_model
 from metrics_store import MetricsStore, RequestRecord
 from smart_router import SmartRouter
 from router_registry import RouterRegistry
-from meta_router import MetaRouterSelector, ServiceUnavailable
+from model_catalog import ModelCatalog
+from meta_router import MetaRouterSelector, ServiceUnavailable, PolicyUnavailable
+from data_policy import DataSensitivity, classify_request, classify_model_policy, allowed
 from response_normalizer import normalize_response, normalize_error, normalize_sse_chunk, normalize_streaming_body
 
 # ── Rest of config (PROMPT_LIMITER_DIR already imported above) ────────
@@ -139,10 +142,20 @@ def _strip_anthropic_caching(obj):
             _strip_anthropic_caching(item)
 
 try:
-    from prompt_limiter import count_tokens, get_explicit_limits, truncate_prompt
-except ImportError:
+    # Load the shared OpenCode limiter by absolute path to avoid importing an
+    # unrelated module with the same name from another project/environment.
+    _LIMITER_PATH = Path.home() / ".config" / "opencode" / "scripts" / "prompt_limiter.py"
+    _limiter_spec = importlib.util.spec_from_file_location("opencode_prompt_limiter", _LIMITER_PATH)
+    if _limiter_spec is None or _limiter_spec.loader is None:
+        raise ImportError("cannot load shared prompt_limiter")
+    _limiter = importlib.util.module_from_spec(_limiter_spec)
+    _limiter_spec.loader.exec_module(_limiter)
+    count_tokens = _limiter.count_tokens
+    get_explicit_limits = _limiter.get_explicit_limits
+    truncate_prompt = _limiter.truncate_prompt
+except Exception:
     # Fallback: simple implementations
-    log.warning("prompt_limiter not available, using fallback token counter")
+    log.warning("shared prompt_limiter unavailable, using fallback token counter")
 
     def count_tokens(text: str) -> int:
         return len(text) // 4
@@ -348,6 +361,10 @@ def _should_race(body: dict, candidate_count: int) -> bool:
     candidate path streams properly (_emit_upstream_response). Non-streaming
     requests race whenever the degraded pool yields 2+ candidates.
     """
+    # Non-streaming combo requests are cheap to race and are exactly where
+    # intermittent provider stalls used to surface as "provider temporarily
+    # unavailable". Race the top candidates even when the pool is healthy;
+    # degraded-pool logic still limits this to two candidates.
     return candidate_count >= 2 and not body.get("stream")
 
 
@@ -377,6 +394,26 @@ class EmptyUpstreamResponse(Exception):
 
 
 class HealthProxyHandler(BaseHTTPRequestHandler):
+    def _select_router(self, model: str = "", sensitivity=DataSensitivity.PUBLIC, exclude=None):
+        """Select a downstream router while keeping lightweight test/dummy selectors compatible."""
+        if not self.meta_selector:
+            return None
+        try:
+            return self.meta_selector.select_router(model=model, sensitivity=sensitivity, exclude=exclude)
+        except TypeError as exc:
+            # Older test doubles / integrations may implement the pre-exclude signature.
+            if "exclude" in str(exc):
+                try:
+                    return self.meta_selector.select_router(model=model, sensitivity=sensitivity)
+                except TypeError as policy_exc:
+                    if "sensitivity" not in str(policy_exc):
+                        raise
+                    return self.meta_selector.select_router(model=model)
+            # Older integrations may implement only the pre-policy signature.
+            if "sensitivity" in str(exc):
+                return self.meta_selector.select_router(model=model)
+            raise
+
     """HTTP handler with health-aware routing + smart model selection."""
 
     protocol_version = "HTTP/1.1"
@@ -438,14 +475,16 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             return []
         return self.smart_router.fallback_chain(catalog, self.registry)
 
-    def _next_fallback_model(self, tried: set) -> str | None:
-        """Best catalog model not yet tried, or None when catalog exhausted.
+    def _next_fallback_model(self, tried: set, body: dict | None = None) -> str | None:
+        """Best policy-allowed catalog model not yet tried, or None when exhausted.
 
         Also skips models whose PROVIDER already failed in this request
         (a 503 from seek/kimi-k3 almost always means seek/host is down —
         retrying seek/gemini-3.8-flash just burns another UPSTREAM_TIMEOUT).
         """
         chain = self._global_fallback_chain()
+        if body is not None:
+            chain = self._policy_filter_models(body, chain)
         tried_providers = set(getattr(self, "_tried_providers", set()))
         for m in chain:
             if m in tried:
@@ -745,17 +784,20 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         elif NINEROUTER_KEY:
             headers["Authorization"] = f"Bearer {NINEROUTER_KEY}"
 
-        # Strip internal routing metadata before forwarding. These fields are
-        # injected by combo substitution / smart routing (see do_POST) and MUST
-        # NOT reach upstream providers: strict schemas (mistral, nvidia/glm-5.2)
-        # reject unknown fields with 400/422. Also strip Anthropic-style
-        # cache_control blocks (opencode AI SDK) — mistral 422 extra_forbidden.
-        if body:
-            body.pop("_original_model", None)
-            body.pop("_smart_routed", None)
-            _strip_anthropic_caching(body)
+        # Strip internal routing metadata from a forwarding COPY. Keep the
+        # original request body intact because recursive fallback calls need
+        # _original_model to preserve combo/main-rr timeout semantics and
+        # _smart_routed for routing/health bookkeeping. Strict upstream schemas
+        # must never see these internal fields.
+        _original_model = (body or {}).get("_original_model", "") if body else ""
+        forward_body = dict(body) if body else None
+        if forward_body:
+            forward_body.pop("_original_model", None)
+            forward_body.pop("_smart_routed", None)
+            _strip_anthropic_caching(forward_body)
 
-        data = json.dumps(body).encode() if body else None
+        data = json.dumps(forward_body).encode() if forward_body else None
+        data_sensitivity = classify_request(forward_body)
 
         # ── Router-of-routers: pick target via meta-router ─────────────
         target_router = None
@@ -763,7 +805,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if self.meta_selector:
             try:
                 model = (body or {}).get("model", "") if body else ""
-                target_router = self.meta_selector.select_router(model=model)
+                target_router = self._select_router(model=model, sensitivity=data_sensitivity)
+            except PolicyUnavailable as exc:
+                log.warning("Data-policy gate blocked request: %s", exc)
+                self._respond_unavailable(str(exc))
+                return
             except ServiceUnavailable:
                 self._respond_unavailable("all routers unavailable")
                 return
@@ -772,6 +818,12 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 url = target_router.url.rstrip("/") + path
                 if target_router.auth and target_router.auth.get("value"):
                     headers[target_router.auth["header"]] = target_router.auth["value"]
+                if forward_body and isinstance(forward_body.get("model"), str):
+                    mapped_model = getattr(self.meta_selector, "model_for_router", None)
+                    if callable(mapped_model):
+                        forward_body["model"] = mapped_model(forward_body["model"], target_router.name)
+                        data = json.dumps(forward_body).encode()
+                        data_sensitivity = classify_request(forward_body)
             else:
                 url = f"{NINEROUTER_URL}{path}"
         else:
@@ -784,17 +836,26 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if is_chat and body and "/" in (body.get("model", "") or ""):
             provider = body["model"].split("/")[0]
             acquire_cb = getattr(self.registry, "acquire_cb", None)
-            if callable(acquire_cb) and not acquire_cb(provider):
+            # `kr/*` is routed to the dedicated Kiro downstream gateway,
+            # whose credential/quota is independent of the direct 9Router Kiro
+            # lane. Do not let the latter's circuit breaker veto the gateway.
+            if callable(acquire_cb) and provider != "kr" and not acquire_cb(provider):
                 self._respond_unavailable(f"Provider '{provider}' circuit breaker is open")
                 return
-            cb_acquired = callable(acquire_cb)
+            cb_acquired = callable(acquire_cb) and provider != "kr"
 
         # Streaming chat requests get STREAM_UPSTREAM_TIMEOUT (generous idle
         # cap) so slow-but-real generation isn't killed by the 30s
         # UPSTREAM_TIMEOUT; non-streaming keeps the tighter timeout for fast
         # failure on dead/empty upstreams.
         _streaming = bool(body.get("stream")) if body else False
-        _sock_timeout = STREAM_UPSTREAM_TIMEOUT if _streaming else UPSTREAM_TIMEOUT
+        _original_model = (body or {}).get("_original_model", "") if body else ""
+        _is_combo_request = "combo" in _original_model or "main-rr" in _original_model
+        _sock_timeout = (
+            COMBO_STREAM_TIMEOUT if _streaming and _is_combo_request
+            else STREAM_UPSTREAM_TIMEOUT if _streaming
+            else UPSTREAM_TIMEOUT
+        )
 
         try:
             opener = self.opener if self.opener is not None else urllib.request.build_opener()
@@ -821,7 +882,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     tried = set(getattr(self, "_tried_models", set()))
                     tried.add(body.get("model", ""))
                     self._tried_models = tried
-                    next_model = self._next_fallback_model(tried)
+                    next_model = self._next_fallback_model(tried, body)
                     if next_model:
                         self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
                         log.warning(
@@ -851,16 +912,27 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             if target_router and self.meta_selector and not fallback_used:
                 fallback_router = None
                 try:
-                    fallback_router = self.meta_selector.select_router(model=(body or {}).get("model", "") if body else "")
-                    if fallback_router and fallback_router.name != target_router.name:
+                    fallback_router = self._select_router(
+                        model=(body or {}).get("model", "") if body else "",
+                        sensitivity=data_sensitivity,
+                        exclude={target_router.name},
+                    )
+                    if fallback_router:
                         fallback_url = fallback_router.url.rstrip("/") + path
-                        fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
+                        fallback_body = dict(forward_body) if forward_body else None
+                        mapped_model = getattr(self.meta_selector, "model_for_router", None)
+                        if fallback_body and isinstance(fallback_body.get("model"), str) and callable(mapped_model):
+                            original_client_model = (body or {}).get("_original_model") or (body or {}).get("model", "")
+                            fallback_body["model"] = mapped_model(original_client_model, fallback_router.name)
+                        fallback_data = json.dumps(fallback_body).encode() if fallback_body else None
+                        fallback_req = urllib.request.Request(fallback_url, data=fallback_data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
-                        fallback_resp = urllib.request.urlopen(fallback_req, timeout=_sock_timeout)
-                        is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
-                        fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
-                        if body and fallback_resp.status == 200:
-                            self._record_upstream_health(body, fb_body, start_time, fb_ttft)
+                        opener = self.opener if self.opener is not None else urllib.request.build_opener()
+                        with opener.open(fallback_req, timeout=_sock_timeout) as fallback_resp:
+                            is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
+                            fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
+                            if body and fallback_resp.status == 200:
+                                self._record_upstream_health(body, fb_body, start_time, fb_ttft)
                         return
                 except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse) as fb_err:
                     # Fallback router failed. Penalize it ONLY on connection
@@ -933,7 +1005,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                     tp = set(getattr(self, "_tried_providers", set()))
                     tp.add(fail_provider)
                     self._tried_providers = tp
-                next_model = self._next_fallback_model(tried)
+                next_model = self._next_fallback_model(tried, body)
                 if next_model:
                     self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
                     log.warning(
@@ -1035,7 +1107,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         tp = set(getattr(self, "_tried_providers", set()))
                         tp.add(fail_provider)
                         self._tried_providers = tp
-                    next_model = self._next_fallback_model(tried)
+                    next_model = self._next_fallback_model(tried, body)
                     if next_model:
                         self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
                         log.warning(
@@ -1085,18 +1157,45 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             if target_router and self.meta_selector and not fallback_used:
                 fallback_router = None
                 try:
-                    self.meta_selector.on_failure(target_router.name, "connection_error")
-                    fallback_router = self.meta_selector.select_router(model=(body or {}).get("model", "") if body else "")
+                    client_model = (body or {}).get("_original_model") or (body or {}).get("model", "")
+                    # on_failure() already marks the router unhealthy and now
+                    # returns a model-aware fallback. Reuse it directly so the
+                    # selector's model eligibility and weighted state are not
+                    # computed twice. Keep the select_router fallback for older
+                    # test doubles/integrations that still return None.
+                    try:
+                        fallback_router = self.meta_selector.on_failure(
+                            target_router.name,
+                            "connection_error",
+                            model=client_model,
+                            sensitivity=data_sensitivity,
+                        )
+                    except TypeError as selector_err:
+                        if "model" not in str(selector_err) and "sensitivity" not in str(selector_err):
+                            raise
+                        fallback_router = self.meta_selector.on_failure(target_router.name, "connection_error")
+                    if fallback_router is None:
+                        fallback_router = self._select_router(
+                            model=client_model,
+                            sensitivity=data_sensitivity,
+                            exclude={target_router.name},
+                        )
                     if fallback_router:
                         fallback_url = fallback_router.url.rstrip("/") + path
-                        fallback_req = urllib.request.Request(fallback_url, data=data, headers=headers, method=self.command)
+                        fallback_body = dict(forward_body) if forward_body else None
+                        mapped_model = getattr(self.meta_selector, "model_for_router", None)
+                        if fallback_body and isinstance(fallback_body.get("model"), str) and callable(mapped_model):
+                            original_client_model = (body or {}).get("_original_model") or (body or {}).get("model", "")
+                            fallback_body["model"] = mapped_model(original_client_model, fallback_router.name)
+                        fallback_data = json.dumps(fallback_body).encode() if fallback_body else None
+                        fallback_req = urllib.request.Request(fallback_url, data=fallback_data, headers=headers, method=self.command)
                         fallback_req.add_header("Accept", "text/event-stream, application/json")
                         opener = self.opener if self.opener is not None else urllib.request.build_opener()
-                        fallback_resp = opener.open(fallback_req, timeout=_sock_timeout)
-                        is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
-                        fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
-                        if body and fallback_resp.status == 200:
-                            self._record_upstream_health(body, fb_body, start_time, fb_ttft)
+                        with opener.open(fallback_req, timeout=_sock_timeout) as fallback_resp:
+                            is_chat = self.path in ("/v1/chat/completions", "/chat/completions")
+                            fb_body, fb_ttft = self._emit_upstream_response(fallback_resp, is_chat, fallback_used=True, start_time=start_time)
+                            if body and fallback_resp.status == 200:
+                                self._record_upstream_health(body, fb_body, start_time, fb_ttft)
                         return
                 except (urllib.error.URLError, urllib.error.HTTPError, ServiceUnavailable, EmptyUpstreamResponse) as fb_err:
                     # The fallback router failed too — penalize it on connection
@@ -1151,10 +1250,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             _strip_anthropic_caching(body)
 
         data = json.dumps(body).encode()
+        data_sensitivity = classify_request(body)
         url = f"{NINEROUTER_URL}{path}"
         if self.meta_selector:
             try:
-                target_router = self.meta_selector.select_router(model=body.get("model", ""))
+                target_router = self._select_router(model=body.get("model", ""), sensitivity=data_sensitivity)
                 if target_router:
                     url = target_router.url.rstrip("/") + path
                     if target_router.auth and target_router.auth.get("value"):
@@ -1326,10 +1426,18 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if fallback_chain:
             safe = [m for m in fallback_chain if m not in candidates][:2]
             if safe:
-                log.info(f"Race exhausted — trying {len(safe)} global fallback candidate(s)")
+                # Keep the race's latency bound for its fallback ladder too.
+                # Using the normal 30s upstream timeout here turned a bounded
+                # 3s race into a hidden 60s+ serial stall when the first two
+                # candidates were stale-but-healthy in the registry.
+                fallback_timeout = min(UPSTREAM_TIMEOUT, max(RACE_DEADLINE_SEC, 3.0))
+                log.info(
+                    f"Race exhausted — trying {len(safe)} global fallback candidate(s) "
+                    f"with {fallback_timeout:.1f}s timeout"
+                )
                 for fm in safe:
                     fb_body = {**body, "model": fm, "_original_model": body.get("model", "")}
-                    status, resp, err, fstart = self._forward_one_shot(fb_body, UPSTREAM_TIMEOUT)
+                    status, resp, err, fstart = self._forward_one_shot(fb_body, fallback_timeout)
                     if status == 200 and not _is_empty_chat_response(resp):
                         try:
                             self._record_upstream_health(
@@ -1418,6 +1526,12 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         duration_ms = int((time.time() - start_time) * 1000)
 
+        # Race-forward winners can have no TTFT measurement. Never let a
+        # missing metric turn a successful upstream response into an empty
+        # client reply.
+        if ttft_ms is None:
+            ttft_ms = 0
+
         # ttft_ms = real time-to-first-byte from _emit_upstream_response
         # (streaming only). Fall back to duration when it wasn't measured
         # (non-streaming buffered responses, error paths).
@@ -1472,6 +1586,22 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             error_type=error_type,
         )
         self.metrics_store.record_request(record)
+
+        # Structured context-routing telemetry. Keep this at INFO so a single
+        # production failure can be correlated without dumping prompt content.
+        requested = getattr(self, "_request_model", "") or (request_body or {}).get("model", "")
+        try:
+            estimated_in = self._prompt_tokens(request_body or {})
+        except Exception:
+            estimated_in = 0
+        bucket = "small" if estimated_in < 16000 else "medium" if estimated_in < 64000 else "large"
+        log.info(
+            "ROUTE_METRIC requested=%s selected=%s provider=%s success=%s "
+            "error=%s est_in=%d bucket=%s actual_in=%d actual_out=%d cache_in=%d "
+            "duration_ms=%d ttft_ms=%d",
+            requested, model, provider, success, error_type or "none", estimated_in,
+            bucket, tokens_in, tokens_out, tokens_cache, duration_ms, ttft_ms,
+        )
 
     def _handle_error(self, status: int, body_text: str, request_body: dict = None) -> dict:
         """Record error in health registry with smart routing awareness.
@@ -1671,7 +1801,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             return None
 
         # For combo models, use smart router to pick the best
-        combo_models = self._get_combo_models()
+        combo_models = self._policy_filter_models(body, self._get_combo_models())
         if combo_models:
             best = self.smart_router.best_model(
                 combo_models,
@@ -1684,8 +1814,34 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         return None
 
+    def _policy_filter_models(self, body: dict, models: list[str]) -> list[str]:
+        """Apply the local data-policy gate to concrete combo candidates.
+
+        PUBLIC requests keep the full pool. INTERNAL requests exclude models
+        whose provider may train on prompts. SENSITIVE requests require an
+        explicit safe/local policy. Unknown policy is therefore excluded for
+        sensitive data rather than silently treated as safe.
+        """
+        sensitivity = classify_request(body)
+        if sensitivity.value == "public":
+            return models
+        kept = []
+        blocked = []
+        for model in models:
+            policy = classify_model_policy(model)
+            if allowed(policy, sensitivity):
+                kept.append(model)
+            else:
+                blocked.append(f"{model}({policy.value})")
+        if blocked:
+            log.info(
+                "COMBO_POLICY_FILTER sensitivity=%s blocked=%d kept=%d blocked_models=%s",
+                sensitivity.value, len(blocked), len(kept), ", ".join(blocked[:8]),
+            )
+        return kept
+
     def _filter_combo_providers(self, body: dict) -> list[str] | None:
-        """Filter combo model to skip permanently disabled providers."""
+        """Filter combo model to skip permanently disabled providers and unsafe routes."""
         if not self.registry:
             return None
 
@@ -1697,20 +1853,51 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         forced = os.environ.get("OPENCODE_FALLBACK_MODEL", "").strip()
         if forced:
             provider = forced.split("/")[0]
-            if self.registry.is_provider_healthy(provider):
+            forced_allowed = allowed(
+                classify_model_policy(forced), classify_request(body)
+            )
+            if self.registry.is_provider_healthy(provider) and forced_allowed:
                 log.info(f"Watchdog forced fallback: {model} → {forced}")
                 return [forced]
+            if not forced_allowed:
+                log.warning(
+                    "Watchdog forced fallback blocked by data policy: %s sensitivity=%s policy=%s",
+                    forced, classify_request(body).value, classify_model_policy(forced).value,
+                )
             log.info(f"Watchdog forced fallback '{forced}' unavailable, using smart filter")
 
-        # Thinking combos must resolve to a reasoning model; the candidate
-        # list has none, so let the 9router pick one of its 300+.
-        if "thinking" in model:
-            log.info(f"Combo '{model}': thinking combo — no reasoning candidates, passing through")
+        # Thinking combos normally pass through to 9router's own reasoning
+        # pool. For INTERNAL/SENSITIVE requests that would bypass our local
+        # policy gate, so resolve them through the same filtered candidate
+        # pool instead. PUBLIC requests retain the legacy pass-through path.
+        if "thinking" in model and classify_request(body).value == "public":
+            log.info(f"Combo '{model}': thinking combo — public request, passing through")
             return None
 
-        combo_models = self._get_combo_models()
+        sensitivity = classify_request(body)
+        combo_models = self._policy_filter_models(body, self._get_combo_models())
+        if not combo_models and sensitivity.value != "public":
+            log.warning(
+                "Combo '%s': data-policy left no eligible models for %s data; refusing broad fallback",
+                model, sensitivity.value,
+            )
+            return None
         available = []
         skipped = []
+
+        # Large-context requests need a conservative proven pool. The local
+        # catalog does not expose reliable context limits for every provider,
+        # while the dashboard/logs show these routes successfully handling
+        # 100k+ input: Devin SWE, Cohere North, Gemini Flash, and our gh
+        # gpt-4o-mini lane. Do not let a random 8k/32k provider win a 64k+
+        # request just because its short-prompt health score is better.
+        large_context_pool = {
+            "devin/swe-1-6-slow",
+            "openrouter/cohere/north-mini-code:free",
+            "cu/gemini-3.7-flash-low",
+            "gh/gpt-4o-mini-2024-07-18",
+            "gh/gpt-4o-mini",
+        }
 
         # Prompt size in tokens: models whose REAL context window can't fit
         # the request must be skipped. The 9router catalog reports ctx 128000
@@ -1730,6 +1917,12 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
         for cm in combo_models:
             provider = cm.split("/")[0]
+            # At 64k+ input, use only routes we have direct evidence for.
+            # This is deliberately a preference/filter, not a claim that
+            # every other model has a small context window.
+            if prompt_tokens >= 64000 and cm not in large_context_pool:
+                skipped.append(f"{cm}(large_context_unverified)")
+                continue
             # Skip models whose real context can't hold the prompt: catalog
             # ctx is often inflated (samba → 8192 real vs 128000 catalog);
             # sending an oversized prompt → 400 → combo retry loop. Only
@@ -1745,11 +1938,19 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # (e.g. groq healthy but groq/openai/gpt-oss-120b in
             # context_length cooldown). Picking such a model → 503 → the
             # client retries the same combo → infinite retry loop.
+            entry = self.registry.get_model(cm) or self.registry.get_provider(provider)
+            # A model in recovery/probing has just failed a real health test.
+            # Treat it as unavailable for combo selection until the next
+            # successful probe; otherwise the recovery prober can immediately
+            # hand the same flaky model back to OpenCode and recreate the
+            # "provider temporarily unavailable" loop.
+            if entry and entry.get("status") == "probing":
+                skipped.append(f"{cm}(probing)")
+                continue
             if self.registry.is_model_available(cm):
                 available.append(cm)
             else:
-                entry = self.registry.get_model(cm) or self.registry.get_provider(provider)
-                skipped.append(f"{cm}({entry.get('status','?')})")
+                skipped.append(f"{cm}({entry.get('status','?') if entry else '?'})")
 
         if not available:
             log.warning(
@@ -1757,7 +1958,9 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 f"Skipped: {', '.join(skipped[:10])}"
             )
             # Try broad catalog with force_broad=True to bypass 9router disabled registry
-            broad_models = self._get_combo_models(force_broad=True)
+            broad_models = self._policy_filter_models(body, self._get_combo_models(force_broad=True))
+            if prompt_tokens >= 64000:
+                broad_models = [m for m in broad_models if m in large_context_pool]
             broad_available = [m for m in broad_models if self.registry.is_model_available(m)]
             if broad_available:
                 if self.smart_router:
@@ -1775,7 +1978,11 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # Global fallback: the combo's candidates are all dead — try the
             # FULL catalog before giving up (pass-through returns a 503 from
             # the 9router combo router, which the client retries in a loop).
-            chain = self._global_fallback_chain(force_refresh=True, force_broad=True)
+            chain = self._policy_filter_models(
+                body, self._global_fallback_chain(force_refresh=True, force_broad=True)
+            )
+            if prompt_tokens >= 64000:
+                chain = [m for m in chain if m in large_context_pool]
             if chain:
                 if self.smart_router:
                     ranked = self.smart_router.rank_models(
@@ -1803,13 +2010,15 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 {"prompt_tokens": prompt_tokens},
             )
             if ranked:
-                # Count unique healthy providers to detect degraded pool
-                healthy_providers = len(set(r[0].split("/")[0] for r in ranked))
-                if healthy_providers <= DEGRADED_POOL_THRESHOLD and len(ranked) >= 2:
-                    # Diversify race candidates across providers: at most
-                    # 1 model/provider in race — racing 2 models from the
-                    # same provider wastes budget when the provider itself
-                    # is the bottleneck (e.g. gh 429 → both candidates fail).
+                # Non-streaming combo requests use the happy-eyeballs race.
+                # Always provide two candidates from different providers when
+                # possible: with a single candidate, one slow 15–30s upstream
+                # failure serializes the whole fallback chain and makes a
+                # healthy combo look hung. The race is bounded by
+                # RACE_DEADLINE_SEC and only applies to non-streaming requests.
+                # Keep the old degraded-pool diversification rule's provider
+                # separation, but use it for the normal pool too.
+                if len(ranked) >= 2:
                     seen = set()
                     diversified = []
                     for r in ranked:
@@ -1817,10 +2026,20 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         if p not in seen:
                             diversified.append(r)
                             seen.add(p)
-                            if len(diversified) >= 3:
+                            if len(diversified) >= 2:
                                 break
-                    return [r[0] for r in diversified]
-                return [ranked[0][0]]
+                    if len(diversified) >= 2:
+                        return [r[0] for r in diversified]
+                healthy_providers = len(set(r[0].split("/")[0] for r in ranked))
+                selected = ranked[0][0]
+                log.info(
+                    "ROUTE_SELECT requested=%s selected=%s est_in=%d bucket=%s "
+                    "healthy_candidates=%d healthy_providers=%d",
+                    model, selected, prompt_tokens,
+                    "small" if prompt_tokens < 16000 else "medium" if prompt_tokens < 64000 else "large",
+                    len(available), healthy_providers,
+                )
+                return [selected]
             # rank_models found nothing usable (e.g. all remaining candidates
             # permanently blocked) — pass through instead of blindly returning
             # available[0]: that model may be in cooldown → 503 → retry loop.
@@ -2019,7 +2238,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
     _local_models_cache: list = []
     _local_models_cache_time: float = 0.0
     _LOCAL_MODELS_TTL: float = 60.0
-    _COMBO_VIRTUAL_IDS = ("combo-round-robin", "main-rr", "combo-fast", "combo-thinking", "free-combo")
+    _COMBO_VIRTUAL_IDS = ("combo-round-robin", "main-rr", "combo-fast", "combo-thinking", "free-combo", "kr/auto")
 
     def _load_local_catalog_ids(self) -> list[str]:
         """Read catalog ids from local snapshots, best-first.
@@ -2092,8 +2311,26 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         return ids
 
     def _respond_local_models(self):
-        """Serve the local catalog snapshot in OpenAI-list format (fast)."""
-        ids = self._load_local_catalog_ids()
+        """Serve the canonical live catalog, with snapshot fallback."""
+        # Prefer the live RouterRegistry catalog so /v1/models and MetaRouter
+        # selection share the same canonical model namespace. The persisted
+        # snapshot remains a fallback because it can be available before router
+        # probes have populated the registry.
+        ids = []
+        catalog = getattr(self, "model_catalog", None)
+        if catalog is not None:
+            try:
+                ids = catalog.get_model_ids()
+            except (AttributeError, TypeError, ValueError):
+                log.exception("Failed to build canonical downstream model catalog")
+        if not ids:
+            ids = self._load_local_catalog_ids()
+        if ids:
+            # Virtual router-level models are not downstream catalog entries,
+            # but they are part of the proxy's public model contract.
+            for virtual in self._COMBO_VIRTUAL_IDS:
+                if virtual not in ids:
+                    ids.append(virtual)
         if not ids:
             ids = self._get_combo_models()  # still fast, health-filtered
         if not ids:
@@ -2149,6 +2386,8 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         if "/chat/completions" in self.path or "/v1/chat/completions" in self.path:
             model = body.get("model", "")
             provider = model.split("/")[0] if "/" in model else model
+            self._request_model = model
+            self._request_provider = provider
 
             # Per-request state: reset global-fallback counter and compute the
             # response-cache key from the ORIGINAL body (pre-combo-substitution)
@@ -2201,8 +2440,15 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 try:
                     self.meta_selector.select_router()
                 except ServiceUnavailable:
-                    self._respond_unavailable("all routers unavailable")
-                    return
+                    # Router health is advisory. A transient/stale router
+                    # registry must not turn a live 9router gateway into an
+                    # immediate 503. Let _forward() use its direct downstream
+                    # fallback path instead; this is the exact failure mode
+                    # behind intermittent "provider temporarily unavailable".
+                    log.warning(
+                        "Meta-router reports no healthy downstream router; continuing via direct gateway fallback",
+                        extra={"event": "router_health_gate_bypass"},
+                    )
 
             # Combo provider filtering: skip permanently disabled providers.
             # Match on model name (combo-round-robin/combo-fast/combo-thinking/
@@ -2235,8 +2481,15 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # virtual router aliases — never gate them on provider/model health
             # (a phantom combo entry would 503 every request and freeze opencode).
             if self.registry and "/" in model:
-                m_ok = self.registry.is_model_available(model) if model else True
-                p_ok = self.registry.is_provider_healthy(provider) if provider else True
+                # Provider-health state for `kr/*` reflects the direct 9Router
+                # Kiro lane. Kiro is also a first-class downstream router
+                # (:20129), so a historical 9Router quota/subscription lock
+                # must not veto a request that can be served by that healthy
+                # downstream Kiro gateway. Let MetaRouterSelector choose the
+                # capable downstream route and handle its own health.
+                downstream_routed = model.startswith("kr/")
+                m_ok = True if downstream_routed else (self.registry.is_model_available(model) if model else True)
+                p_ok = True if downstream_routed else (self.registry.is_provider_healthy(provider) if provider else True)
 
                 if not m_ok:
                     # Smart routing: find healthy alternative
@@ -2278,6 +2531,12 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
 
     def _respond_unavailable(self, message: str):
         """Return 503 to OpenCode so it falls back via oh-my-openagent."""
+        log.warning(
+            "ROUTE_BLOCK status=503 model=%s provider=%s message=%s",
+            getattr(self, "_request_model", ""),
+            getattr(self, "_request_provider", ""),
+            message,
+        )
         if self.audit:
             self.audit.requests_blocked += 1
         payload = json.dumps({"error": {"message": message, "type": "provider_unavailable"}}).encode()
@@ -2384,6 +2643,7 @@ class HealthProxyServer:
         self.smart_router = SmartRouter(self.metrics_store, usage_cache=self.usage_cache)
         self.meta_registry = RouterRegistry(DOWNSTREAM_ROUTERS)
         self.meta_selector = MetaRouterSelector(self.meta_registry)
+        self.model_catalog = ModelCatalog(self.meta_registry)
         self.audit = None
         self._server = None
         self._opener = urllib.request.build_opener()
@@ -2395,6 +2655,7 @@ class HealthProxyServer:
         router = self.smart_router
         meta_registry = self.meta_registry
         meta_selector = self.meta_selector
+        model_catalog = self.model_catalog
         audit = self.audit
 
         class HandlerWithRegistry(HealthProxyHandler):
@@ -2405,6 +2666,7 @@ class HealthProxyServer:
         HandlerWithRegistry.smart_router = router
         HandlerWithRegistry.meta_registry = meta_registry
         HandlerWithRegistry.meta_selector = meta_selector
+        HandlerWithRegistry.model_catalog = model_catalog
         HandlerWithRegistry.audit = audit
         return HandlerWithRegistry
 

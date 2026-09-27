@@ -610,6 +610,7 @@
   <div class="summary-card"><div class="summary-value blue" id="sDisabled">-</div><div class="summary-label">Disabled</div></div>
   <div class="summary-card"><div class="summary-value" id="sRequests">-</div><div class="summary-label">Requests (5m)</div></div>
   <div class="summary-card"><div class="summary-value" id="sTokens">-</div><div class="summary-label">Tokens (5m)</div></div>
+  <div class="summary-card"><div class="summary-value" id="sZeroToday">-</div><div class="summary-label">Zero today</div></div>
 </div>
 
 <div class="tabs">
@@ -900,6 +901,11 @@ function updateDashboard(data) {
   }
   flashValue('sRequests', totalReqs);
   flashValue('sTokens', formatTokens(totalTokens));
+
+  // Daily quota rotation observability is supplied by /api/pool.
+  fetch('/api/pool').then(r => r.ok ? r.json() : null).then(pool => {
+    if (pool) flashValue('sZeroToday', pool.providers_zero_today ?? 0);
+  }).catch(() => {});
 
   // Update provider count badge and health summary
   document.getElementById('providerCount').textContent = providerCount;
