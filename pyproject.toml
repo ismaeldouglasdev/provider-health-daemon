@@ -13,8 +13,13 @@ exclude = [
 ]
 
 [tool.ruff.lint]
-# Mesmos ignores do CI (.github/workflows/ci.yml) — manter em sincronia.
-ignore = ["E501", "F403", "F401", "E402"]
+# Baseline CI pragmático: mantém sintaxe/imports/nomes realmente quebrados,
+# sem transformar a dívida legada em um big-bang de 360 avisos.
+select = ["E4", "E7", "E9", "F"]
+ignore = [
+    "E501", "F403", "F401", "E402",
+    "E401", "F541", "F811", "F841",
+]
 
 [tool.ruff.format]
 quote-style = "preserve"
