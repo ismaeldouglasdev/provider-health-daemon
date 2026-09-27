@@ -6,6 +6,7 @@ Task 8 evidence — CI audit
 - Root cause confirmed from gh run view logs.
 - Workflow fixed to create .venv with uv, install with uv pip --python .venv/bin/python, and invoke .venv/bin/ruff/mypy/pytest.
 - Local CI-equivalent validation on CPython 3.12.14: Ruff PASS; 574 pytest tests PASS.
-- Remote green run is NOT yet verified because no push was performed.
+- Final remote green run #36292085745 (2026-09-26) verified on Python 3.11 and 3.12: Ruff, mypy and pytest all passed.
+- Final pushed commit: 33826d6 (origin/master).
 
-Acceptance status: FIX APPLIED; remote-green verification remains pending.
+Acceptance status: PASS; remote-green verification complete.

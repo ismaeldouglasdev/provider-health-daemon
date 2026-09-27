@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "active_work_id": "provider-health-daemon-improvements",
+  "works": {
+    "provider-health-daemon-improvements": {
+      "work_id": "provider-health-daemon-improvements",
+      "active_plan": ".omo/plans/provider-health-daemon-improvements.md",
+      "plan_name": "provider-health-daemon-improvements",
+      "session_ids": ["codex:opencode-sisyphus-main"],
+      "status": "completed",
+      "worktree_path": null
+    }
+  }
+}
