@@ -36,6 +36,8 @@ jobs:
         run: .venv/bin/mypy . --ignore-missing-imports --exclude tests/ || true
 
       - name: Test with pytest
+        env:
+          PYTHONPATH: .
         run: .venv/bin/pytest tests/ --cov=. --cov-report=term-missing --cov-report=xml -v
 
       - name: Upload coverage
