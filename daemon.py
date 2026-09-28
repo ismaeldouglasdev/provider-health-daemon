@@ -317,6 +317,7 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
         disabled providers could never be probed because they were absent from
         the combo cache.
         """
+        provider_probe_cursors: dict[str, int] = {}
         interval = max(PROBER_INTERVAL_MINUTES * 60, 60)
         while not shutdown_event.is_set():
             if shutdown_event.wait(interval):
@@ -386,11 +387,16 @@ def monitor_logs(registry: HealthRegistry, router_names: set[str] | None = None)
                                 test_models = [
                                     m.get("id", "") for m in _all
                                     if m.get("id", "").startswith(provider + "/")
-                                ][:3]
+                                ]
                         except Exception:
                             pass
                     if not test_models:
                         continue  # truly no model to test
+                    # Provider-level recovery only needs one representative model per cycle.
+                    # Model-specific recovery is handled by model_prober; rotate here to avoid hammering one model.
+                    probe_idx = provider_probe_cursors.get(provider, 0) % len(test_models)
+                    test_models = [test_models[probe_idx]]
+                    provider_probe_cursors[provider] = probe_idx + 1
                     for test_model in test_models:
                         probe_body = _json.dumps({
                             "model": test_model,
