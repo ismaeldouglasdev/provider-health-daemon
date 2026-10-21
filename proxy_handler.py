@@ -474,7 +474,9 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 log.warning(f"Global fallback broad catalog failed: {e}")
         if not catalog:
             return []
-        return self.smart_router.fallback_chain(catalog, self.registry)
+        return self._router_served_models(
+            self.smart_router.fallback_chain(catalog, self.registry)
+        )
 
     def _router_served_models(self, models: list[str]) -> list[str]:
         """Keep only models a healthy downstream router can actually serve.
