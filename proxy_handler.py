@@ -2051,6 +2051,19 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             else:
                 skipped.append(f"{cm}({entry.get('status','?') if entry else '?'})")
 
+        # Local health can mark a model "available" while no healthy downstream
+        # router actually serves it (agnes/*, video-only models, etc.). The
+        # meta-router then rejects it with ServiceUnavailable, surfacing as the
+        # same generic 503 "all routers unavailable" (2026-10-21 lived case:
+        # combo-round-robin ranker picked agnes/agnes-video-2.5-flash, present
+        # in combo_cache but unserved by OmniRoute for chat). Gate the NORMAL
+        # pool too, not just the broad/global fallbacks.
+        if available:
+            served = set(self._router_served_models(available))
+            if 0 < len(served) < len(available):
+                skipped.extend(f"{m}(unserved)" for m in available if m not in served)
+                available = [m for m in available if m in served]
+
         if not available:
             log.warning(
                 f"Combo '{model}': ALL {len(combo_models)} models unavailable. "
