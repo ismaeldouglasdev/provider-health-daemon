@@ -132,25 +132,6 @@ BLOCKED_MODEL_SUBSTRINGS = {
     "gemini-3.7-flash-medium",  # ag: lento (~12.6s). Mesma causa. Verificado 2026-09-03.
     "gemini-3.1-pro",  # ag: lento (13.6s). Verificado 2026-09-03.
     "gemini-pro-agent",  # ag: resposta vazia em stress test. Verificado 2026-09-03.
-    # ── 2026-10-19: FAMÍLIAS de provider comprovadamente mortas (3/3 probes falharam
-    # em :20128). O pool do free-combo referenciava esses modelos (bzl/*, seek/*,
-    # glm/*, cerebras/*, mistral/*, plugsky/*) e cada seleção queimava o router:
-    # bzl (bazaarlink) → 402/404/400 em TODOS os modelos; seek → 403; glm/ →
-    # 429 rate-limit permanente; cerebras/ → 404 (descontinuado); mistral/ → 401;
-    # plugsky/ → 400. Bloqueio por prefixo de provider para pegar TODAS as variantes.
-    # (llm7/ foi testado e está VIVO 3/3 — NÃO bloquear.)
-    "bzl/",        # bazaarlink: 402 payment_required / 404 model_not_allowed
-    "seek/",       # 403 forbidden em todas as variantes
-    "glm/",        # 429 rate_limit persistente
-    "cerebras/",   # 404 (llama-3.3-70b descontinuado no cerebras)
-    "mistral/",    # 401 unauthorized
-    "plugsky/",    # 400 bad_request
-    # ── 2026-10-19: openrouter 100% morto (6/6 modelos, 3x cada = 0/3).
-    # 404 descontinuado (cohere/north-mini-code:free, inclusionai/ling-3.0-tiny:free)
-    # + 429 cota free estourada (nemotron-3-ultra/super/nano-30b, nano-omni).
-    # Cada seleção somava falha → disjuntor abriu ("circuit breaker is open").
-    # Prefixo pega todas as 6 variantes de uma vez.
-    "openrouter/",
 }
 
 # Per-provider allowlists: when a provider is listed, ONLY these model ids are
@@ -251,33 +232,6 @@ DEAD_MODELS = {
     "kira/mercury-2",           # 403 key1 / 402 keys 2-3
     "kira/mercury-2.5",         # 403 key1 / 402 keys 2-3
     "kira/qwen3.8-flash",       # 403 (só qwen3.8-flash-free)
-    # ── 2026-10-19: modelos "bare" (sem prefixo de provider real) que o
-    # catálogo do 9router expõe mas resolvem p/ conexões MORTAS
-    # (openai/anthropic/z-ai sem credencial). Vazavam no pool do free-combo
-    # → "No active credentials for provider: openai" e queimavam o router.
-    # Verificados ao vivo em :20128 (2026-10-19).
-    "gh/gpt-4o-mini",                 # No active credentials (provider openai)
-    "gh/gpt-4o-mini-2024-07-18",      # No active credentials (provider openai)
-    "gh/gpt-4o",                      # No active credentials (provider openai)
-    "gh/gpt-4o-2024-05-13",
-    "gh/gpt-4o-2024-08-06",
-    "gh/gpt-4o-2024-11-20",
-    "gh/gpt-4-o-preview",
-    "gh/gpt-4.1",
-    "gh/gpt-4.1-2025-04-14",
-    "gh/gpt-4-0125-preview",
-    "codestral-latest",               # No active credentials (provider openai)
-    "llama-3.3-70b",                  # No active credentials (provider openai)
-    "gpt-oss-20b",                    # No active credentials (provider openai)
-    "gpt-5.5",                        # provider openai sem credencial
-    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
-    "claude-sonnet-4.6",              # No active credentials (provider anthropic)
-    "glm-5", "glm-5.1", "glm-5.2",    # provider openai sem credencial (bzl/glm alias)
-    "bzl/claude-opus-4.7",            # 402 payment required (bzl)
-    "z-ai/glm-5.3-flash",             # No active credentials (provider z-ai)
-    "mimo-v2.5", "mimo-v2.5-pro",     # provider openai sem credencial
-    "minimax-m3", "minimax-m2.7", "minimax-m2.5",  # provider openai sem credencial
-    "kimi-k2.5", "kimi-k2.6",         # provider openai sem credencial
 }
 
 
