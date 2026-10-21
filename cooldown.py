@@ -21,6 +21,17 @@ class CooldownCalculator:
         "monthly_limit",
     })
 
+    # context_length means "this PROMPT was too big for this model", not
+    # "this model is dead". A global permanent disable would remove a working
+    # model from every future small prompt (the free-combo 503 cascade). Keep
+    # it as a short recheck cooldown instead: skipped for the oversized
+    # request, re-tested shortly after.
+    REQUEST_SCOPED_TYPES = frozenset({
+        "context_length",
+        "max_tokens_exceeded",
+        "input_too_long",
+    })
+
     def __init__(self, max_hours: int = 24, max_failures: int = 30):
         self.max_cooldown = timedelta(hours=max_hours)
         self.max_failures = max_failures
@@ -91,6 +102,18 @@ class CooldownCalculator:
                     "backoff_applied": False,
                     "failures": failures,
                     "recheck": False,
+                }
+            if error_type.startswith(tuple(self.REQUEST_SCOPED_TYPES)):
+                until = datetime.now(timezone.utc) + timedelta(seconds=120)
+                return {
+                    "until": until.isoformat(),
+                    "duration_hours": 120 / 3600,
+                    "type": f"{error_type} (max_failures)",
+                    "permanent": False,
+                    "model_specific": model_specific,
+                    "backoff_applied": False,
+                    "failures": failures,
+                    "recheck": True,
                 }
             return {
                 "until": None,

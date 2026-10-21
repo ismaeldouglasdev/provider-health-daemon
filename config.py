@@ -62,9 +62,15 @@ UPSTREAM_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT", "30"))
 # a genuinely stalled stream still times out per-read. Non-streaming keeps the
 # tighter UPSTREAM_TIMEOUT for fast failure on dead/empty upstreams.
 STREAM_UPSTREAM_TIMEOUT = float(os.environ.get("STREAM_UPSTREAM_TIMEOUT", "120"))
-# Combo requests use a shorter streaming idle cap so one flaky provider cannot
-# hold OpenCode for minutes before the global fallback chain gets a chance.
-COMBO_STREAM_TIMEOUT = float(os.environ.get("COMBO_STREAM_TIMEOUT", "15"))
+# Combo requests get a shorter streaming idle cap than generic streaming so
+# one flaky provider cannot hold OpenCode for minutes before the global
+# fallback chain gets a chance. 60s (was 15s, 2026-10-20): 9router's combo
+# selection routinely takes 7-12s TTFT and regularly exceeded 15s while
+# probing providers — every overshoot killed the client socket at exactly
+# 15s (VPS: "socket connection was closed unexpectedly"). 60s covers real
+# combo TTFT with headroom while staying far below STREAM_UPSTREAM_TIMEOUT;
+# even on expiry the client now gets a loud 504, never a silent close.
+COMBO_STREAM_TIMEOUT = float(os.environ.get("COMBO_STREAM_TIMEOUT", "60"))
 
 # SSE head-window (lines) drained before committing a streaming response.
 # Empty-200 upstreams finish inside the window (EOF → model fallback still
@@ -145,6 +151,13 @@ DEGRADED_POOL_THRESHOLD = 5    # if healthy providers ≤ this, race top-2 inste
 # ── Global fallback (exhaust the full catalog on 5xx) ────────────────
 MAX_FALLBACK_RETRIES = 2  # catalog fallback attempts per request (bounded: avoids latency bombs)
 GLOBAL_REFRESH_MIN_INTERVAL = 15.0  # seconds between forced catalog refetches (GET /v1/models is expensive)
+
+# Wall-clock budget for the WHOLE fallback ladder of one client request.
+# MAX_FALLBACK_RETRIES bounds the hop COUNT, but each hop can burn the full
+# per-attempt socket timeout, so nested fallbacks serialize into minutes of
+# upstream time (VPS: 110s hang, zero bytes). Keep below opencode's ~110s
+# client timeout so a response always reaches the client.
+REQUEST_DEADLINE_SEC = float(os.environ.get("REQUEST_DEADLINE_SEC", "100"))
 
 # ── Response cache (retry dedup) ─────────────────────────────────────
 RESPONSE_CACHE_TTL = 60  # seconds a cached response is served

@@ -68,6 +68,7 @@ from config import (
     DOWNSTREAM_ROUTERS,
     RACE_DEADLINE_SEC,
     DEGRADED_POOL_THRESHOLD,
+    REQUEST_DEADLINE_SEC,
 )
 
 log = logging.getLogger(__name__)
@@ -475,6 +476,30 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             return []
         return self.smart_router.fallback_chain(catalog, self.registry)
 
+    def _router_served_models(self, models: list[str]) -> list[str]:
+        """Keep only models a healthy downstream router can actually serve.
+
+        The health registry tracks provider/model status locally, but the
+        meta-router rejects any model missing from every healthy router's
+        catalog ("not served by any healthy router") — which surfaces as a
+        generic 503 "all routers unavailable". A broad/global fallback that
+        offers such a model therefore turns a recoverable combo into a hard
+        503 (2026-10-21: free-combo broad fallback picked agnes/agnes-3.0-flash,
+        absent from the OmniRoute catalog). Gate fallbacks on this so only
+        genuinely routable models reach the selector.
+        """
+        if not models or not self.meta_selector:
+            return models
+        served = getattr(self.meta_selector, "servable_models", None)
+        if not callable(served):
+            return models
+        try:
+            allowed = served(models)
+        except Exception as exc:
+            log.debug("Router-served capability filter failed: %s", exc)
+            return models
+        return allowed if allowed else models
+
     def _next_fallback_model(self, tried: set, body: dict | None = None) -> str | None:
         """Best policy-allowed catalog model not yet tried, or None when exhausted.
 
@@ -856,6 +881,13 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             else STREAM_UPSTREAM_TIMEOUT if _streaming
             else UPSTREAM_TIMEOUT
         )
+        _deadline = getattr(self, "_request_deadline", None)
+        if _deadline is not None:
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                self._respond_timeout("request deadline exceeded before upstream call")
+                return
+            _sock_timeout = min(_sock_timeout, _remaining)
 
         try:
             opener = self.opener if self.opener is not None else urllib.request.build_opener()
@@ -878,7 +910,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             # gate used for 5xx/access errors.
             if body:
                 self._record_upstream_health(body, e.body, start_time)
-                if getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES:
+                if self._may_fallback():
                     tried = set(getattr(self, "_tried_models", set()))
                     tried.add(body.get("model", ""))
                     self._tried_models = tried
@@ -992,7 +1024,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                         and 400 <= e.code <= 499
                     )
                 )
-                and getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES
+                and self._may_fallback()
             ):
                 tried = set(getattr(self, "_tried_models", set()))
                 tried.add(body.get("model", ""))
@@ -1096,61 +1128,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 reason is not None and "timed out" in str(reason).lower()
             )
             if is_pure_timeout:
-                if body and getattr(self, "_fallback_attempts", 0) < MAX_FALLBACK_RETRIES:
-                    tried = set(getattr(self, "_tried_models", set()))
-                    tried.add(body.get("model", ""))
-                    self._tried_models = tried
-                    # A timeout on one model ≈ provider-level slowness — exclude
-                    # its other models from this request's fallback chain too.
-                    fail_provider = (body.get("model") or "").split("/")[0]
-                    if fail_provider:
-                        tp = set(getattr(self, "_tried_providers", set()))
-                        tp.add(fail_provider)
-                        self._tried_providers = tp
-                    next_model = self._next_fallback_model(tried, body)
-                    if next_model:
-                        self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
-                        log.warning(
-                            f"Global fallback {self._fallback_attempts}/{MAX_FALLBACK_RETRIES}: "
-                            f"upstream timeout on '{body.get('model')}' → retrying with '{next_model}'"
-                        )
-                        body["model"] = next_model
-                        self._router_selected = True
-                        self._forward(body)
-                        return
-                # Loop guard: a timed-out model must NOT stay in rotation.
-                # opencode retries the same request on 5xx, and without a
-                # cooldown the retry hits the SAME slow model → infinite
-                # retry loop (access.log showed identical requests ×3/×7).
-                # First timeout → model-specific 5m cooldown. If we ALREADY
-                # fell back to another model and THAT also timed out
-                # (_fallback_attempts > 0), the whole provider is slow → widen
-                # to a provider-wide ~15m cooldown. Then fail loudly with 504
-                # (Gateway Timeout) instead of a retryable 503.
-                if body and self.registry:
-                    model = body.get("model", "")
-                    provider = model.split("/")[0] if "/" in model else model
-                    repeated = getattr(self, "_fallback_attempts", 0) > 0
-                    self.registry.mark_error(
-                        provider=provider,
-                        error_info={
-                            "minutes": 15 if repeated else 5,
-                            "type": "timeout",
-                            "model_specific": not repeated,
-                            "recheck": True,
-                        },
-                        model=model if not repeated else None,
-                    )
-                    log.warning(
-                        f"Timeout cooldown applied: {model} → "
-                        f"{'15m provider-wide' if repeated else '5m model'} (loop guard)",
-                        extra={"event": "timeout_cooldown", "provider": provider, "model": model, "repeated": repeated},
-                    )
-                self._respond_timeout(f"Upstream timeout after {_sock_timeout:.0f}s")
-                if body:
-                    model = body.get("model", "")
-                    provider = model.split("/")[0] if "/" in model else model
-                    self._record_usage(body, b"", start_time, provider, model, False, "timeout")
+                self._on_upstream_timeout(body, _sock_timeout, start_time)
                 return
 
             # Attempt fallback via meta-router
@@ -1219,11 +1197,132 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
                 provider = model.split("/")[0] if "/" in model else model
                 self._record_usage(body, b"", start_time, provider, model, False, "connection_error")
 
+        except TimeoutError as e:
+            # Python 3.10+ (verified on 3.14, 2026-10-20): urllib raises a RAW
+            # TimeoutError — NOT wrapped in URLError — when the upstream socket
+            # expires waiting for response HEADERS inside getresponse().
+            # This handler previously only caught URLError, so the raw
+            # TimeoutError escaped _forward → do_POST → killed the handler
+            # thread and closed the client socket with NO HTTP response. The
+            # VPS opencode saw exactly this as "Cannot connect to API: The
+            # socket connection was closed unexpectedly" at ~COMBO_STREAM_TIMEOUT
+            # (15s) on combo-round-robin/free-combo whenever 9router's first
+            # byte took longer than the socket timeout. Treat it as the pure
+            # upstream timeout it is: fallback → cooldown → loud 504.
+            log.warning(
+                "Raw upstream TimeoutError (unwrapped by urllib getresponse): %s",
+                e,
+                extra={"event": "raw_upstream_timeout", "model": (body or {}).get("model", "")},
+            )
+            self._on_upstream_timeout(body, _sock_timeout, start_time)
+            return
+
+        except OSError as e:
+            # Any remaining OS-level failure that urllib did NOT wrap (ECONNRESET
+            # from the upstream, etc.) must still fail loudly with an HTTP status
+            # instead of a silent socket close that opencode reports as
+            # "socket connection was closed unexpectedly".
+            log.warning(
+                "Unwrapped OSError in _forward: %r",
+                e,
+                extra={"event": "raw_upstream_oserror", "model": (body or {}).get("model", "")},
+            )
+            self._respond_unavailable(f"Connection error: {e}")
+            if body:
+                model = body.get("model", "")
+                provider = model.split("/")[0] if "/" in model else model
+                self._record_usage(body, b"", start_time, provider, model, False, "connection_error")
+            return
+
         finally:
             if cb_acquired:
                 release_cb = getattr(self.registry, "release_cb", None)
                 if callable(release_cb):
                     release_cb(provider)
+
+    def _may_fallback(self) -> bool:
+        """Whether another fallback hop is allowed for this request.
+
+        Two independent budgets: MAX_FALLBACK_RETRIES bounds the hop COUNT;
+        REQUEST_DEADLINE_SEC bounds total wall-clock across hops, so nested
+        fallbacks can't serialize into a multi-minute client-visible hang.
+        """
+        if getattr(self, "_fallback_attempts", 0) >= MAX_FALLBACK_RETRIES:
+            return False
+        deadline = getattr(self, "_request_deadline", None)
+        if deadline is not None and time.monotonic() >= deadline:
+            log.warning(
+                "Fallback skipped: request deadline (%.0fs) exceeded",
+                REQUEST_DEADLINE_SEC,
+                extra={"event": "fallback_deadline_exceeded"},
+            )
+            return False
+        return True
+
+    def _on_upstream_timeout(self, body, sock_timeout, start_time):
+        """Pure upstream timeout: model fallback → cooldown → 504.
+
+        Shared by the urllib.error.URLError(reason=timeout) path and the raw
+        TimeoutError path (Python 3.10+ urllib raises it unwrapped from
+        getresponse). Does NOT feed the router failure counter — a slow
+        provider is not a dead router (cooldown-cascade regression guard,
+        bugs-erros-opencode.md 2026-08-14).
+        """
+        if body and self._may_fallback():
+            tried = set(getattr(self, "_tried_models", set()))
+            tried.add(body.get("model", ""))
+            self._tried_models = tried
+            # A timeout on one model ≈ provider-level slowness — exclude
+            # its other models from this request's fallback chain too.
+            fail_provider = (body.get("model") or "").split("/")[0]
+            if fail_provider:
+                tp = set(getattr(self, "_tried_providers", set()))
+                tp.add(fail_provider)
+                self._tried_providers = tp
+            next_model = self._next_fallback_model(tried, body)
+            if next_model:
+                self._fallback_attempts = getattr(self, "_fallback_attempts", 0) + 1
+                log.warning(
+                    f"Global fallback {self._fallback_attempts}/{MAX_FALLBACK_RETRIES}: "
+                    f"upstream timeout on '{body.get('model')}' → retrying with '{next_model}'"
+                )
+                body["model"] = next_model
+                self._router_selected = True
+                self._forward(body)
+                return
+        # Loop guard: a timed-out model must NOT stay in rotation.
+        # opencode retries the same request on 5xx, and without a
+        # cooldown the retry hits the SAME slow model → infinite
+        # retry loop (access.log showed identical requests ×3/×7).
+        # First timeout → model-specific 5m cooldown. If we ALREADY
+        # fell back to another model and THAT also timed out
+        # (_fallback_attempts > 0), the whole provider is slow → widen
+        # to a provider-wide ~15m cooldown. Then fail loudly with 504
+        # (Gateway Timeout) instead of a retryable 503.
+        if body and self.registry:
+            model = body.get("model", "")
+            provider = model.split("/")[0] if "/" in model else model
+            repeated = getattr(self, "_fallback_attempts", 0) > 0
+            self.registry.mark_error(
+                provider=provider,
+                error_info={
+                    "minutes": 15 if repeated else 5,
+                    "type": "timeout",
+                    "model_specific": not repeated,
+                    "recheck": True,
+                },
+                model=model if not repeated else None,
+            )
+            log.warning(
+                f"Timeout cooldown applied: {model} → "
+                f"{'15m provider-wide' if repeated else '5m model'} (loop guard)",
+                extra={"event": "timeout_cooldown", "provider": provider, "model": model, "repeated": repeated},
+            )
+        self._respond_timeout(f"Upstream timeout after {sock_timeout:.0f}s")
+        if body:
+            model = body.get("model", "")
+            provider = model.split("/")[0] if "/" in model else model
+            self._record_usage(body, b"", start_time, provider, model, False, "timeout")
 
     def _forward_one_shot(
         self,
@@ -1959,6 +2058,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             )
             # Try broad catalog with force_broad=True to bypass 9router disabled registry
             broad_models = self._policy_filter_models(body, self._get_combo_models(force_broad=True))
+            broad_models = self._router_served_models(broad_models)
             if prompt_tokens >= 64000:
                 broad_models = [m for m in broad_models if m in large_context_pool]
             broad_available = [m for m in broad_models if self.registry.is_model_available(m)]
@@ -1981,6 +2081,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             chain = self._policy_filter_models(
                 body, self._global_fallback_chain(force_refresh=True, force_broad=True)
             )
+            chain = self._router_served_models(chain)
             if prompt_tokens >= 64000:
                 chain = [m for m in chain if m in large_context_pool]
             if chain:
@@ -2396,6 +2497,7 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             self._tried_models = set()
             self._tried_providers = set()
             self._router_selected = False
+            self._request_deadline = time.monotonic() + REQUEST_DEADLINE_SEC
             self._request_cache_key = "" if body.get("stream") else self._cache_key(body)
 
             # Fast-path: trivial single-word messages ("ping") answered by the
@@ -2527,7 +2629,26 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
             if limited:
                 body = limited
 
-        self._forward(body)
+        # Outermost guard. _forward has a recursive fallback ladder; an
+        # exception raised INSIDE one of its `except` blocks (e.g. the
+        # recursive self._forward global-fallback retry writing to a client
+        # that already gave up) is NOT caught by sibling except clauses of the
+        # same try. Such a BrokenPipeError escaped do_POST, killed the handler
+        # thread, and left the client with a silent socket close / 110s hang.
+        try:
+            self._forward(body)
+        except (BrokenPipeError, ConnectionResetError):
+            log.warning(
+                "Client disconnected before response (write-side error)",
+                extra={"event": "client_disconnect", "model": (body or {}).get("model", "")},
+            )
+        except Exception as e:  # noqa: BLE001 — last-resort guard against handler-thread death
+            log.error(
+                "Unhandled error in do_POST forward path: %r",
+                e,
+                exc_info=True,
+                extra={"event": "do_post_unhandled", "model": (body or {}).get("model", "")},
+            )
 
     def _respond_unavailable(self, message: str):
         """Return 503 to OpenCode so it falls back via oh-my-openagent."""
@@ -2621,6 +2742,33 @@ class HealthProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def handle_one_request(self):
+        # Outermost per-request guard for the whole HTTP dispatch (do_POST,
+        # do_GET, and the happy-eyeballs race path that returns before do_POST's
+        # own guard). BaseHTTPRequestHandler is not exception-safe: an escaping
+        # exception kills the handler thread and the client gets a silent
+        # socket close (opencode: "socket connection was closed unexpectedly",
+        # or a multi-minute hang with zero bytes). A BrokenPipeError while
+        # answering a client that already gave up (VPS retry over the
+        # reverse-SSH tunnel) is the common case — no response can be written
+        # to a dead socket anyway, so log and keep the thread alive.
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            log.warning(
+                "Client disconnected before response (write-side error)",
+                extra={"event": "client_disconnect", "path": getattr(self, "path", "")},
+            )
+            self.close_connection = True
+        except Exception as e:  # noqa: BLE001 — last-resort guard against handler-thread death
+            log.error(
+                "Unhandled error while serving request: %r",
+                e,
+                exc_info=True,
+                extra={"event": "request_unhandled", "path": getattr(self, "path", "")},
+            )
+            self.close_connection = True
 
     def log_message(self, fmt, *args):
         log.info(f"{self.client_address[0]} {fmt % args}")

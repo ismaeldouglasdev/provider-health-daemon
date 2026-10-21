@@ -35,6 +35,34 @@ class MetaRouterSelector:
         self._streaks: dict[str, int] = defaultdict(int)
         self._model_mapper = ModelIdMapper()
 
+    def servable_models(self, models: list[str]) -> list[str]:
+        """Subset of `models` that at least one healthy router's catalog serves.
+
+        Uses the same canonical/catalog matching as _eligible_routers so a
+        caller can pre-filter a fallback list and avoid asking the selector for
+        a model it would reject with ServiceUnavailable.
+        """
+        with self._lock:
+            healthy = self._registry.get_healthy_routers()
+            if not healthy:
+                return []
+            for router in healthy:
+                self._model_mapper.register_catalog(router.name, {m: m for m in router.models})
+            out = []
+            for model in models:
+                canonical = self._model_mapper.to_canonical(model)
+                provider, sep, rest = canonical.partition("/")
+                if any(
+                    any(self._model_mapper.to_canonical(m) == canonical for m in r.models)
+                    or any(
+                        (provider and m.startswith(provider + "/")) or (sep and m == rest)
+                        for m in r.models
+                    )
+                    for r in healthy
+                ):
+                    out.append(model)
+            return out
+
     def _eligible_routers(self, model: str = None, sensitivity: DataSensitivity = DataSensitivity.PUBLIC):
         healthy = self._registry.get_healthy_routers()
         if model and sensitivity != DataSensitivity.PUBLIC:
@@ -141,6 +169,15 @@ class MetaRouterSelector:
             if flapping and len(flapping) < len(healthy):
                 healthy = [r for r in healthy if r not in flapping]
             selected = self._pick_weighted(healthy)
+            if selected is None:
+                # Last-resort: a healthy router must always be usable. If the
+                # flapping filter left nothing (its streak is in-memory and can
+                # exceed the threshold from a burst of slow upstream timeouts
+                # while the on-disk RouterRegistry still reports the router
+                # healthy), fall back to the pre-filter list and pick a
+                # weighted router from it rather than 503ing the whole request
+                # with "all routers unavailable".
+                selected = self._pick_weighted(self._eligible_routers(model, sensitivity))
             if selected is None:
                 raise ServiceUnavailable("all routers unavailable")
             return selected

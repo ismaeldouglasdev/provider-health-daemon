@@ -167,25 +167,32 @@ class HealthRegistry:
                 "updated_at": str(raw.get("updated_at", ""))}
 
     def _migrate_disabled_rate_limits(self, data: dict) -> None:
-        """Self-heal wrongly-permanent disabled entries whose cause is a rate-limit.
+        """Self-heal wrongly-permanent disabled entries whose cause is transient.
 
         Before fix#1, rate-limit errors hitting MAX_FAILURES became permanent
         ``disabled`` with reason "<type> (max_failures)". Rate limits expire, so
-        promote those back to ``probing`` (semi-available) on load.
+        promote those back to ``probing`` (semi-available) on load. The same
+        applies to request-scoped types (``context_length``): an oversized
+        prompt is not evidence the model is dead, yet it used to disable the
+        model permanently and emptied the free-combo pool.
         """
         now = datetime.now(timezone.utc)
+        repairable = (
+            CooldownCalculator.RATE_LIMIT_TYPES
+            | CooldownCalculator.REQUEST_SCOPED_TYPES
+        )
         for bucket, kind in ((self.PROVIDERS, "provider"), (self.MODELS, "model")):
             for key in list(data.get(bucket, {})):
                 entry = data[bucket][key]
                 if entry.get("status") != "disabled":
                     continue
                 base = self._base_error_type(entry.get("reason"))
-                if base in CooldownCalculator.RATE_LIMIT_TYPES:
+                if base in repairable:
                     entry["status"] = "probing"
                     entry["reason"] = f"{base} (probing)"
                     entry["until"] = (now + timedelta(minutes=self.PROBING_WINDOW_MINUTES)).isoformat()
                     entry["updated_at"] = now.isoformat()
-                    log.info(f"Promoted disabled {kind} {key} -> probing (rate-limit {base})")
+                    log.info(f"Promoted disabled {kind} {key} -> probing (transient {base})")
 
     def _save(self) -> None:
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -559,7 +566,12 @@ class HealthRegistry:
         if entry.get("status") == "healthy":
             return True
         if entry.get("status") == "probing":
-            return True  # probing is semi-available
+            # 2026-10-19: probing NAO e saudavel. `probing` = provider que acabou
+            # de tomar cooldown e esta sendo re-testado. Trata-lo como disponivel
+            # o reinjetava no pool, ele falhava e REABRIA o disjuntor — ciclo
+            # vicioso cooldown->probing->falha->cooldown (openrouter contaminou
+            # sessoes assim). So 'healthy' (ou cooldown ja expirado) entra.
+            return False
         if entry.get("status") == "disabled":
             return False
         if entry.get("status") == "cooldown":
